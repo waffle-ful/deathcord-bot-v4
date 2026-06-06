@@ -1,0 +1,36 @@
+name: Post Daily Summary (日報投稿)
+
+# 日報投稿を性格分析パイプライン（daily_tasks.yml）から切り離した独立ワークフロー。
+# daily_tasks 側で analyze_* が空レスポンス→リトライ地獄で timeout-minutes を食い潰すと
+# 同一ジョブの post_summary がキャンセルされ日報が出なくなっていた（known-issues #1 の再発）。
+# post_summary.py は Gemini を使わず MongoDB の最新要約を読んで投稿するだけなので軽い。独立させれば必ず走る。
+
+on:
+  schedule:
+    - cron: '0 15 * * *'   # 毎日 UTC 15:00 = JST 深夜0:00
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: 日報をDiscordに投稿
+        env:
+          MONGODB_URI:        ${{ secrets.MONGODB_URI }}
+          DISCORD_BOT_TOKEN:  ${{ secrets.DISCORD_BOT_TOKEN }}
+          SUMMARY_CHANNEL_ID: ${{ secrets.SUMMARY_CHANNEL_ID }}
+        run: python batch/post_summary.py

@@ -1,0 +1,45 @@
+name: Daily Tasks (性格分析 + 非ブースター分析 + 記憶補完)
+
+on:
+  schedule:
+    - cron: '0 15 * * *'   # 毎日 UTC 15:00 = JST 深夜0:00
+  workflow_dispatch:
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: ブースター性格分析（conv_count >= 10 のユーザー対象）
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
+        run: python batch/analyze_personality.py
+
+      - name: 非ブースター簡易分析（要約ログから発言パターン抽出）
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
+        run: python batch/analyze_nonbooster.py
+
+      # 日報投稿は post_summary.yml に分離（独立ワークフロー化）。
+      # analyze_* のタイムアウトで日報がキャンセルされる問題を回避するため、このジョブからは外した。
+
+      - name: claims・memories補完（retroreportから長期記憶を補充）
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
+        run: python batch/enrich_memories.py

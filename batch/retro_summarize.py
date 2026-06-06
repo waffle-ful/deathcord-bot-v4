@@ -1,0 +1,293 @@
+import os
+import json
+import time
+import re
+from datetime import datetime, timezone, timedelta, date as date_cls
+
+import requests
+from pymongo import MongoClient, DESCENDING
+from google import genai
+from google.genai import types
+
+# --- 環境変数 ---
+TARGET_DATE_STR    = os.environ["TARGET_DATE"]           # YYYY-MM-DD
+DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_GUILD_ID   = int(os.environ["DISCORD_GUILD_ID"])
+CHANNEL_IDS_RAW    = os.environ.get("DISCORD_CHANNEL_IDS", "")
+CHANNEL_IDS        = [int(c.strip()) for c in CHANNEL_IDS_RAW.split(",") if c.strip()]
+EXCLUDE_IDS_RAW    = os.environ.get("EXCLUDE_CHANNEL_IDS", "")
+EXCLUDE_IDS        = set(int(c.strip()) for c in EXCLUDE_IDS_RAW.split(",") if c.strip())
+GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
+MONGODB_URI        = os.environ["MONGODB_URI"]
+SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
+MODEL              = "models/gemma-4-31b-it"
+MODEL_FALLBACK     = "models/gemma-4-26b-a4b-it"
+DB_NAME            = "discord_bot_db"
+JST                = timezone(timedelta(hours=9))
+CONTEXT_DAYS       = 2
+
+RETRO_SUMMARY_PROMPT = """\
+あなたはこのDiscordサーバーの古参メンバーです。
+指定された日付のチャットログと、その前後の要約（文脈）を読んで
+「過去の観察メモ」を書いてください。
+前置き・導入文は一切不要です。各セクションの見出しから即座に本文を書き始めてください。
+各セクションは3文以上で書いてください。
+
+## 全体の雰囲気・トーン
+## 主なトピック
+## 感情の波
+## 注目の発言・流れ
+## 今日の内輪ネタ・キーワード
+## メンバーの人間関係・関係性
+## ユーザーの感情状態
+## 直近の話題（最後の30分）
+## 会話の特徴・パターン
+"""
+
+SECTION_ICONS = {
+    "全体の雰囲気":       "🌡️",
+    "主なトピック":       "📌",
+    "感情の波":           "🎢",
+    "注目の発言":         "💬",
+    "今日の内輪ネタ":     "🔑",
+    "メンバーの人間関係": "🤝",
+    "ユーザーの感情状態": "😊",
+    "直近の話題":         "🔥",
+    "会話の特徴":         "✨",
+}
+
+BASE_URL     = "https://discord.com/api/v10"
+REST_HEADERS = {
+    "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+    "Content-Type":  "application/json",
+}
+
+def _api_get(path: str, params: dict = None):
+    url = BASE_URL + path
+    for attempt in range(5):
+        resp = requests.get(url, headers=REST_HEADERS, params=params, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "1"))
+            print(f"[fetch] Rate limited. Waiting {retry_after:.1f}s...")
+            time.sleep(retry_after + 0.5)
+            continue
+        if resp.status_code in (403, 404):
+            return None
+        time.sleep(1)
+    return None
+
+def _datetime_to_snowflake(dt: datetime) -> int:
+    discord_epoch = 1420070400000
+    return (int(dt.timestamp() * 1000) - discord_epoch) << 22
+
+def is_excluded(channel: dict) -> bool:
+    if channel.get("nsfw", False):
+        return True
+    return int(channel["id"]) in EXCLUDE_IDS
+
+def fetch_day_logs(target_date: date_cls) -> list[dict]:
+    """指定日のDiscordログをREST APIで取得"""
+    after_dt  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
+    before_dt = after_dt + timedelta(days=1)
+    after_sf  = _datetime_to_snowflake(after_dt)
+    before_sf = _datetime_to_snowflake(before_dt)
+
+    # 1. チャンネル一覧取得
+    all_channels = _api_get(f"/guilds/{DISCORD_GUILD_ID}/channels") or []
+    TEXT_TYPES   = {0, 5}  # GUILD_TEXT, GUILD_ANNOUNCEMENT
+    THREAD_TYPES = {11, 12} # PUBLIC_THREAD, PRIVATE_THREAD
+
+    if CHANNEL_IDS:
+        id_set = set(CHANNEL_IDS)
+        base = [ch for ch in all_channels if int(ch["id"]) in id_set and ch["type"] in TEXT_TYPES]
+    else:
+        base = [ch for ch in all_channels if ch["type"] in TEXT_TYPES]
+
+    targets = []
+    parent_ids = set()
+    for ch in base:
+        if is_excluded(ch):
+            continue
+        targets.append(ch)
+        parent_ids.add(int(ch["id"]))
+
+    # 2. アクティブなスレッドも取得対象に含める
+    thread_resp = _api_get(f"/guilds/{DISCORD_GUILD_ID}/threads/active") or {}
+    for t in thread_resp.get("threads", []):
+        if int(t.get("parent_id", 0)) in parent_ids and not is_excluded(t) and t["type"] in THREAD_TYPES:
+            targets.append(t)
+
+    print(f"[debug] Starting log fetch for {len(targets)} targets (including threads)...")
+
+    all_messages = []
+    seen_ids = set()  # 重複排除用：これで16000件ループを防ぐ
+
+    for ch in targets:
+    
+        ch_id   = int(ch["id"])
+        ch_name = ch.get("name", str(ch_id))
+        print(f"[fetch] Reading #{ch_name}...")
+
+        last_id = after_sf
+
+        for _ in range(50):
+            params = {"limit": 100, "after": str(last_id), "before": str(before_sf)}
+            batch  = _api_get(f"/channels/{ch_id}/messages", params=params)
+
+            if not batch or not isinstance(batch, list):
+                break
+
+            # ID昇順にソート
+            batch_sorted = sorted(batch, key=lambda x: int(x["id"]))
+
+            for msg in batch_sorted:
+                m_id = msg["id"]
+                if m_id in seen_ids:
+                    continue
+
+                seen_ids.add(m_id)
+                author = msg.get("author", {})
+
+                if author.get("bot") or msg.get("webhook_id"):
+                    continue
+
+                all_messages.append({
+                    "channel":   ch_name,
+                    "author":    author.get("global_name") or author.get("username", ""),
+                    "timestamp": msg.get("timestamp", ""),
+                    "content":   msg.get("content", ""),
+                })
+
+            # 取得件数に関わらず必ずlast_idを最新IDに進める
+            new_last_id = int(batch_sorted[-1]["id"])
+
+            # IDが進まない or 100件未満（ページ末尾）ならbreak
+            if new_last_id <= last_id or len(batch) < 100:
+                break
+
+            last_id = new_last_id
+            time.sleep(0.4)
+
+        time.sleep(0.2)  # チャンネル間のレート制限対策
+
+    # 全チャンネルのメッセージを時系列順に並び替え
+    all_messages.sort(key=lambda m: m["timestamp"])
+    print(f"[fetch] Final unique messages count: {len(all_messages)}")
+    return all_messages
+
+def fetch_context_summaries(col, target_date: date_cls, days: int) -> str:
+    start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc) - timedelta(days=days)
+    end   = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc) + timedelta(days=days+1)
+    docs  = list(col.find({"created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}}).sort("created_at", 1).limit(20))
+    if not docs: return ""
+    return "\n\n".join([f"【{d.get('created_at', '')[:10]}の要約抜粋】\n{d.get('summary', '')[:500]}" for d in docs])
+
+def _extract_retry_wait(err: str) -> float:
+    m = re.search(r"retry in ([\d.]+)s", err)
+    return float(m.group(1)) + 2.0 if m else 60.0
+
+def generate_summary(client_ai: genai.Client, log_text: str, context: str) -> str:
+    user_prompt = RETRO_SUMMARY_PROMPT.strip() + "\n\n以下のチャットログの観察メモを書いてください。\n前置きは一切不要です。\n\n"
+    if context:
+        user_prompt += f"【前後の文脈】\n{context}\n\n---\n\n"
+    user_prompt += f"【対象日のログ】\n{log_text}"
+
+    for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
+        for attempt in range(5):
+            try:
+                resp = client_ai.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=4000),
+                )
+                text = getattr(resp, "text", None)
+                if text and text.strip():
+                    print(f"[retro] {label} 成功 ({len(text)}文字)")
+                    return text.strip()
+                time.sleep(5)
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    wait = _extract_retry_wait(err)
+                    print(f"[WARN] 429 {label} attempt{attempt+1}, {wait:.1f}s待機...")
+                    time.sleep(wait)
+                else:
+                    print(f"[ERROR] {label}: {e}")
+                    break
+    raise RuntimeError("要約生成失敗")
+
+def save_to_mongodb(col, summary: str, target_date: date_cls, msg_count: int):
+    col.create_index([("created_at", DESCENDING)], background=True)
+    col.delete_many({"retro_date": target_date.isoformat()})
+    col.insert_one({
+        "summary": summary,
+        "message_count": msg_count,
+        "created_at": datetime(target_date.year, target_date.month, target_date.day, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+        "retro_date": target_date.isoformat(),
+        "is_retro": True,
+    })
+    print(f"[mongodb] 保存完了")
+
+def parse_sections(summary: str) -> list[tuple[str, str]]:
+    parts = re.split(r"\n##\s+", "\n" + summary)
+    sections = []
+    for part in parts:
+        if not part.strip(): continue
+        split = part.strip().split("\n", 1)
+        if len(split) > 1: sections.append((split[0].strip(), split[1].strip()))
+    return sections
+
+def post_to_discord(summary: str, target_date: date_cls, msg_count: int):
+    date_str = target_date.strftime("%Y年%m月%d日")
+    sections = parse_sections(summary)
+    fields = []
+    for title, body in sections:
+        icon = next((v for k, v in SECTION_ICONS.items() if k in title), "📋")
+        fields.append({"name": f"{icon} {title}", "value": body[:1020], "inline": False})
+    fields.append({"name": "📊 集計", "value": f"対象日: {target_date.isoformat()} / {msg_count:,}件", "inline": False})
+
+    embed = {
+        "title": f"📜 {date_str} の過去日報（遡及作成）",
+        "color": 0x8B4513,
+        "fields": fields,
+        "footer": {"text": "空気くん遡及日報"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    url = f"https://discord.com/api/v10/channels/{SUMMARY_CHANNEL_ID}/messages"
+    requests.post(url, headers=REST_HEADERS, json={"embeds": [embed]}, timeout=10)
+    print("[post] Discord投稿完了")
+
+def main():
+    try:
+        target_date = date_cls.fromisoformat(TARGET_DATE_STR)
+    except ValueError:
+        print(f"[ERROR] 日付フォーマット不正: {TARGET_DATE_STR}")
+        return
+
+    print(f"[retro] 対象日: {target_date.isoformat()}")
+    print(f"[debug] Fetching channels for guild {DISCORD_GUILD_ID}...")
+
+    messages = fetch_day_logs(target_date)
+    if not messages:
+        print("[retro] メッセージなし。")
+        return
+
+    log_text = "\n".join([f"[{m['timestamp'][11:16]}] #{m['channel']} {m['author']}: {m['content']}" for m in messages])[:40000]
+
+    mongo = MongoClient(MONGODB_URI)
+    col = mongo[DB_NAME]["summaries"]
+    context = fetch_context_summaries(col, target_date, CONTEXT_DAYS)
+
+    print("[retro] 要約生成中...")
+    client_ai = genai.Client(api_key=GEMINI_API_KEY)
+    summary = generate_summary(client_ai, log_text, context)
+
+    save_to_mongodb(col, summary, target_date, len(messages))
+    post_to_discord(summary, target_date, len(messages))
+    print("[retro] 完了！")
+
+if __name__ == "__main__":
+    main()

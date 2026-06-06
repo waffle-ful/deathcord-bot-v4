@@ -1,0 +1,29 @@
+name: Personality Analyzer
+
+on:
+  workflow_dispatch:
+    # schedule は daily_tasks.yml に統合済みのため削除（重複実行でタイムアウトが発生していた）
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: Analyze personality
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
+        run: python batch/analyze_personality.py

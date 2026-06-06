@@ -1,0 +1,5 @@
+# Batch processing dependencies
+# discord.py は削除済み。fetch_discord_logs.py が REST API (requests) に移行したため不要。
+requests>=2.31.0
+google-genai>=1.10.0
+pymongo[srv]==4.7.3

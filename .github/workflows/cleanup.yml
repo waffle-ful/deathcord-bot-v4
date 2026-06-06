@@ -1,0 +1,23 @@
+name: Intro Cleanup Bot
+on:
+  schedule:
+    # 毎日 UTC 15:00 (日本時間 0:00) に実行
+    - cron: '0 15 * * *'
+  workflow_dispatch: # 手動で実行したい時用
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install discord.py
+      - name: Run Cleanup Bot
+        env:
+          CLEANUP_BOT_TOKEN: ${{ secrets.CLEANUP_BOT_TOKEN }}
+          INTRO_CHANNEL_ID: ${{ secrets.INTRO_CHANNEL_ID }}
+        run: python cleanup_bot.py

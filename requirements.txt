@@ -1,0 +1,10 @@
+# Discord Bot (Render.com)
+discord.py==2.5.2
+motor==3.6.0
+pymongo==4.9.2
+flask==3.0.3
+google-genai>=1.10.0
+dnspython
+waitress
+
+aiohttp

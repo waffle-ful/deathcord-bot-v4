@@ -1,0 +1,19 @@
+claude.md
+.env
+.env.*
+
+# runtime state / 自動生成（公開リポに混入させない）
+bump_db.json
+
+# python / tooling caches
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Claude Code 個人ツール（秘伝のたれ・公開しない）
+.claude/
+
+# 実行時データ（本来は /tmp 出力。将来うっかり repo 直下に書き出しても commit させない安全網）
+logs.json
+summary_result.json
+dashboard.png

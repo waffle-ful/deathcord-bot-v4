@@ -1,0 +1,52 @@
+name: AI News Summary
+
+on:
+  schedule:
+    - cron: '0 1,4,7,10,13 * * *'
+  workflow_dispatch: # 手動実行用ボタンを表示
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 履歴ファイル(last_url.txt)をリポジトリに保存するために必須
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # 2026年最新のSDK「google-genai」をインストール
+          pip install feedparser google-genai requests
+
+      - name: Run AI News Bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEWS_WEBHOOK_URL: ${{ secrets.NEWS_WEBHOOK_URL }}
+        run: python ai_news_bot.py
+
+      - name: Commit and push history
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # 【重要】Pythonコードの履歴ファイル名(last_top_url.txt)と完全に一致させる
+          if [ -f last_top_url.txt ]; then
+            git add last_top_url.txt
+            
+            # 変更があればコミット、なければ正常終了
+            git commit -m "Update history [skip ci]" || exit 0
+            
+            # 【魔法の1行】Push前にリモートの最新状態を取り込んで結合する
+            git pull --rebase origin main
+            
+            # 最終的なPush
+            git push origin main
+          fi
+

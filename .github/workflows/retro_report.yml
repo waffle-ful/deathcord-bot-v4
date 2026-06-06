@@ -1,0 +1,39 @@
+name: 過去日報作成（遡及）
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD形式)'
+        required: true
+        type: string
+
+jobs:
+  retro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: 過去日報を生成・保存・投稿
+        env:
+          TARGET_DATE:         ${{ github.event.inputs.target_date }}
+          DISCORD_BOT_TOKEN:   ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID:    ${{ secrets.DISCORD_GUILD_ID }}
+          DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
+          EXCLUDE_CHANNEL_IDS: ${{ secrets.EXCLUDE_CHANNEL_IDS }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
+          SUMMARY_CHANNEL_ID:  ${{ secrets.SUMMARY_CHANNEL_ID }}
+        run: python batch/retro_summarize.py

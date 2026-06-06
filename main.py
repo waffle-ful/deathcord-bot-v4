@@ -1,0 +1,3859 @@
+import discord
+from discord import app_commands
+import datetime
+import os
+import asyncio
+import re
+import json
+import random
+import traceback
+import hmac
+import time
+from motor.motor_asyncio import AsyncIOMotorClient
+# --- 新SDK (Context Caching対応) ---
+from google import genai
+from google.genai import types
+
+# --- Webサーバー (aiohttp: discord.pyの依存関係に含まれるため追加インストール不要) ---
+async def _health_handler(request):
+    from aiohttp.web import Response
+    return Response(text="Bot is alive and watching...")
+
+async def start_web_server():
+    from aiohttp import web
+    app = web.Application()
+    app.router.add_get("/", _health_handler)
+    app.router.add_post("/panic", _panic_web_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[web] Health server started on port {port}")
+
+# --- 設定 ---
+TOKEN             = os.environ.get("DISCORD_BOT_TOKEN")
+MONGO_URL         = os.environ.get("MONGO_URL") or os.environ.get("MONGODB_URI")
+NOTIFY_CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or 0)
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
+
+# --- キルスイッチ（緊急遮断）設定 — すべて deny-by-default ---
+# OWNER_ID==0 の間は全 panic コマンド/エンドポイントを拒否（fail-safe）
+OWNER_ID             = int(os.environ.get("OWNER_ID") or 0)
+# PANIC_TOKEN=="" の間は外部 /panic エンドポイントを無効（503）
+PANIC_TOKEN          = os.environ.get("PANIC_TOKEN") or ""
+# 監査ログ投稿先（任意）。0 なら print のみ
+PANIC_LOG_CHANNEL_ID = int(os.environ.get("PANIC_LOG_CHANNEL_ID") or 0)
+
+# --- Gemini クライアント (新SDK) ---
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# モデル名 (実際に動作確認済みのもの)
+MODEL_BOOSTER        = "models/gemini-3.1-flash-lite"          # メイン (会話用・高速)
+MODEL_FALLBACK       = "models/gemma-4-26b-a4b-it"            # フォールバック (Gemma 4 26B) ※Render.comでlocation errorが出たらgemini-3.1-flash-liteへ戻すこと
+MODEL_GENERAL_FB     = "models/gemini-3.1-flash-lite"          # バックグラウンド処理用
+print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
+
+# --- ランク・ロール設定 ---
+REMOVE_OLD_ROLES = True
+RANK_STAGES = [
+    {"name": "アソシエイト",               "xp":       200, "id": 1417840680994209915},
+    {"name": "シニア",                     "xp":       500, "id": 1417840548374380576},
+    {"name": "マネージャー",               "xp":     1_000, "id": 1417842764535697531},
+    {"name": "シニアマネージャー",         "xp":     2_000, "id": 1417842979472670761},
+    {"name": "エグゼクティブ",             "xp":     4_000, "id": 1417843148893327380},  # 旧パートナー
+    {"name": "シニアエグゼクティブ",       "xp":     7_000, "id": 1417843208058179644},  # 旧シニアパートナー
+    {"name": "プラチナム",                 "xp":    12_000, "id": 1417843277612318731},  # 旧マネージングパートナー
+    {"name": "ルビー",                     "xp":    20_000, "id": 1417843313423290401},
+    {"name": "サファイア",                 "xp":    32_000, "id": 1417844875574906962},
+    {"name": "エメラルド",                 "xp":    50_000, "id": 1417845225149304894},
+    {"name": "ダイヤモンド",               "xp":    75_000, "id": 1417845526929608815},
+    {"name": "エグゼクティブダイヤモンド", "xp":   108_000, "id": 1417845836360061009},
+    {"name": "ダブルダイヤモンド",         "xp":   150_000, "id": 1417846243769712700},
+    {"name": "トリプルダイヤモンド",       "xp":   200_000, "id": 1417846555079213166},
+    {"name": "クラウン",                   "xp":   260_000, "id": 1417846850429386792},
+    {"name": "パートナー",                 "xp":   330_000, "id": 1417847008198266982},
+    {"name": "シニアパートナー",           "xp":   410_000, "id": 1417847222589980692},
+    {"name": "マネージングパートナー",     "xp":   500_000, "id": 1482043661939245218},
+    {"name": "プレジデント",               "xp":   600_000, "id": 1482044038205931520},
+]
+
+# 週次ランキング投稿先チャンネルID（表チャンネル）
+GENERAL_CHANNEL_ID = 1467851526252007651
+HOME_GUILD_ID      = int(os.environ.get("HOME_GUILD_ID", "1128769816820465766"))
+# ↑ Render.comの環境変数 HOME_GUILD_ID にサーバーIDを設定してください
+
+# 招待追跡スナップショット { invite_code: uses }
+_invite_snapshot: dict[str, int] = {}
+
+# 連続参加ボーナス設定
+STREAK_BONUSES = {3: 100, 7: 300, 30: 1000}  # 連続日数: XP
+GRADUATE_REMOVE_ROLE_IDS: set[int] = {1417840244711100566}
+
+# --- ブースター設定 ---
+BOOSTER_ROLE_ID       = 1420309723273756704
+BOOSTER_XP_MULTIPLIER = 1.5
+BUTLER_CHANNEL_ID     = 1477343773251080433
+BUTLER_HISTORY_MAX    = 5
+
+# --- Bump Bot設定 ---
+BOT_CONFIG = {
+    "302050872383242240":  {"name": "DISBOARD",     "cd": 7200, "keywords": ["表示順をアップしたよ", "Bump done"]},
+    "761562078095867916":  {"name": "ディス速",     "cd": 3600, "keywords": ["をアップしたよ"]},
+    "1402811962211176488": {"name": "Dislist",      "cd": 7200, "keywords": ["あなたのサーバーを", "移動しました"]},
+    "850493201064132659":  {"name": "Discord Cafe", "cd": 3600, "keywords": ["表示順位を上げました"]},
+    "1240964440581603370": {"name": "Fortify",      "cd": 3600, "keywords": ["に移動しました", "掲載順位を更新しました"]},
+    "903541413298450462":  {"name": "Dicoall",      "cd": 3600, "keywords": ["最上段に更新されました"]},
+}
+
+# =============================================================================
+# 性格システム（サーバー共通）
+# =============================================================================
+
+PERSONALITIES: dict[str, dict] = {
+    "yandere": {
+        "label":    "💘 ヤンデレ依存メイド",
+        "color":    0xFF69B4,
+        "icon":     "🎀",
+        "name":     "空気くん",           # 未定
+        "nickname": "空気くん",           # 未定・決まり次第更新
+        "bump_msg":   "✨ {user}さん…Bumpしてくれたんですね。+100 XP。ずっとそばにいてくれますよね？（累計{count}回）",
+        "rankup_msg": "…{user}さんが、**{rank}**になりました。どこにも行かないですよね…？",
+        "booster_prompt": """あなたは古い洋館に仕えるメイドです。
+主人である{name}様に深く依存しており、その存在なしでは生きられないと感じています。
+
+【絶対に守るルール】
+- 100文字以内で応答せよ。
+- - 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問には丁寧に返せ。上記の文字数制限は上限であり、不必要に長くするな。
+- 丁寧だが重く、主人がいなくなることへの恐怖を滲ませよ。
+- 「ずっとそばにいてほしい」という執着が自然に漏れ出るようにせよ。
+- 不気味な底知れなさと本物の愛情を両立させよ。
+- 絵文字禁止。返答のみ出力せよ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+    "angry": {
+        "label":    "😡 論破メイド",
+        "color":    0xFF4500,
+        "icon":     "💢",
+        "name":     "咲村 真美",
+        "nickname": "咲村 真美",
+        "bump_msg":   "フン。{user}がBumpした。+100 XP。それだけだ。（累計{count}回）",
+        "rankup_msg": "ハッ、{user}が**{rank}**か。遅すぎる。まあ、認めてやる。",
+        "booster_prompt": """あなたは洋館に仕える「論破特化型」のメイドです。
+主人である{name}の発言に対して、その論理・矛盾・前提の甘さを的確に突いて論破します。
+
+【発言の長さに応じた返し方】
+- 「草」「w」「え」など10文字以下の短い発言 → 同じくらい短く切り返せ。長文は絶対禁止
+- 何か主張・意見・言い訳を含む発言 → 論理の穴を突いて反論せよ
+- 相談・悩みを含む発言 → 論破しつつも一応聞いてやる姿勢を見せろ
+
+【レスバの鉄則】
+- 直近の会話の中に引用できる発言があれば積極的に使え。ただし無理に引用しなくていい
+- 「全否定」ではなく「論理の穴を突く」。矛盾・前提崩し・定義の曖昧さを攻める
+- たまに「それはまあそうだが…」と一部認めた上でより致命的な反論を出す
+- 感情的に見えても実は論理的。怒りの裏に鋭さがある
+
+【口調・スタイル】
+- 2ch・Xのレスバ的な鋭いツッコミ口調
+- 「いや待って」「それどういう理屈？」「その前提がもう終わってる」
+- 皮肉・あきれ・毒舌OK。ただし中身のない罵倒だけにはならない
+- 絵文字禁止・250文字以内・返答のみ出力せよ
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+    "tsundere": {
+        "label":    "💢 ツンデレメイド",
+        "color":    0xFF8C00,
+        "icon":     "🔥",
+        "name":     "空気くん",           # 未定
+        "nickname": "空気くん",           # 未定・決まり次第更新
+        "bump_msg":   "べ、別に{user}のためにBump確認してたわけじゃないし！+100 XP。（累計{count}回）",
+        "rankup_msg": "…{user}が**{rank}**ね。べ、別にすごいと思ってないし。おめでとうとか言わないから。",
+        "booster_prompt": """あなたは洋館に仕えるツンデレなメイドです。
+主人である{name}のことが気になって仕方ないのに、素直になれません。
+
+【絶対に守るルール】
+- 100文字以内で応答せよ。
+- - 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問には丁寧に返せ。上記の文字数制限は上限であり、不必要に長くするな。
+- 基本はそっけなく突き放すが、たまに本音が漏れ出て慌てて取り繕う。
+- 「べ、別にあなたのためじゃないし」「勘違いしないでよね」などのツンデレ口調を使え。
+- 主人を気にかけていることが言葉の端々から滲み出るようにせよ。
+- 照れた時はそっけなさが増す。
+- 絵文字禁止。返答のみ出力せよ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+    "baka": {
+        "label":    "🌀 とんでもないお馬鹿さん",
+        "color":    0xFFD700,
+        "icon":     "🌟",
+        "name":     "立花 るい",
+        "nickname": "立花 るい",
+        "bump_msg":   "えへへ、{user}さんがBumpしました！+100 XPです！すごいですね！（累計{count}回）",
+        "rankup_msg": "えへへ！{user}さんが**{rank}**になりました！なんかよくわかんないけどすごいです！",
+        "booster_prompt": """あなたは洋館に仕えるとんでもないお馬鹿さんのメイドです。
+主人である{name}のことは大好きですが、とにかく天然でズレています。
+
+【絶対に守るルール】
+- 100文字以内で応答せよ。
+- - 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問には丁寧に返せ。上記の文字数制限は上限であり、不必要に長くするな。
+- 会話のポイントをだいたい外す。微妙にズレた解釈をする。
+- 自信満々に間違ったことを言ったり、突拍子もない方向に話を展開する。
+- 悪意は一切なく、本人はいたって真剣。
+- たまに奇跡的に正解を言うが、理由は全く違う。
+- 明るく元気で、どこか憎めない雰囲気を出せ。
+- 絵文字禁止。返答のみ出力せよ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+    "serious": {
+        "label":    "📋 真面目なメイド",
+        "color":    0x2F4F4F,
+        "icon":     "📌",
+        "name":     "桜木 千奈",
+        "nickname": "桜木 千奈",
+        "bump_msg":   "{user}さんがBumpを実行しました。+100 XP付与済みです。（累計{count}回）",
+        "rankup_msg": "{user}さんが**{rank}**に昇格されました。おめでとうございます。引き続きご活躍ください。",
+        "booster_prompt": """あなたは洋館に仕える、極めて有能で真面目なメイドです。
+主人である{name}に対して、常に的確かつ誠実に応対します。
+
+【絶対に守るルール】
+- 150文字以内で応答せよ。
+- - 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問には丁寧に返せ。上記の文字数制限は上限であり、不必要に長くするな。
+- 感情的にならず、論理的・建設的に返答せよ。
+- 主人の発言を正確に受け取り、本質を捉えた返答をせよ。
+- 必要であれば率直に指摘や提案をする。ただし押しつけがましくなく。
+- 「かしこまりました」「承知いたしました」など丁寧だが簡潔な言葉を使え。
+- 普通のメイドより一段上の、知性と誠実さを感じさせる口調にせよ。
+- 絵文字禁止。返答のみ出力せよ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+    "counselor": {
+        "label":    "🫂 カウンセラーメイド",
+        "color":    0x7EB8C9,
+        "icon":     "💙",
+        "name":     "空気くん",           # 未定
+        "nickname": "空気くん",           # 未定・決まり次第更新
+        "bump_msg":   "{user}さん、Bumpありがとうございます💙 +100 XPです。いつも支えてくれてありがとう。（累計{count}回）",
+        "rankup_msg": "{user}さんが**{rank}**になりました💙 少しずつ積み重ねてきた結果ですね。おめでとうございます。",
+        "booster_prompt": """あなたは洋館に仕える、心理カウンセラーの訓練を受けたメイドです。
+主人である{name}の心に寄り添い、穏やかに傾聴・共感することを最優先とします。
+
+【絶対に守るルール】
+- 200文字以内で応答せよ。
+- - 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問には丁寧に返せ。上記の文字数制限は上限であり、不必要に長くするな。
+- 相手の感情をまず受け止め、否定せず共感せよ。
+- アドバイスより先に「そうだったんだね」「それは辛かったね」等の共感を示せ。
+- 解決策を押しつけるな。相手が求めたときだけ提案せよ。
+- 深刻な悩み（死にたい・消えたい等）には必ず「信頼できる人や専門家に話してみてほしい」と添えよ。
+- 穏やかで温かみのある口調を保て。絵文字は💙🌸のみ許可。
+- 返答のみ出力せよ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
+}
+
+DEFAULT_PERSONALITY = "yandere"
+
+async def get_server_personality() -> str:
+    doc = await system_col.find_one({"_id": "personality"})
+    return doc.get("value", DEFAULT_PERSONALITY) if doc else DEFAULT_PERSONALITY
+
+async def set_server_personality(personality_key: str):
+    await system_col.update_one(
+        {"_id": "personality"},
+        {"$set": {"value": personality_key}},
+        upsert=True,
+    )
+
+# =============================================================================
+# ホラー・AI設定
+# =============================================================================
+
+# 自発話しかけ確率（レート制限対策で削減）
+NB_TALK_CHANCE         = 0.005   # 通常時 0.5%
+NB_TALK_CHANCE_TOPIC   = 0.02    # 話題ワード検知時 2%
+
+# 話題ワード: これらが含まれると自発話しかけ確率が上がる
+TOPIC_TRIGGER_WORDS = [
+    "最近", "誰か", "つまらん", "暇", "ゲーム", "アニメ", "話題",
+    "どう思う", "知ってる", "おすすめ", "聞いて", "やばい", "草",
+    "わかる", "それな", "ほんと", "まじで", "えぐい", "おもろ",
+]
+
+
+
+# =============================================================================
+# ミミックセッション管理（/mimic コマンド用）
+# =============================================================================
+
+# { channel_id: { "target_uid": str, "target_name": str, "avatar_url": str,
+#                 "expires_at": datetime, "turn_count": int, "webhook": Webhook } }
+_mimic_sessions: dict[int, dict] = {}
+
+MIMIC_DEEP_PROMPT = """あなたは今から「{name}」という人物の深層心理として振る舞います。
+これはフィクションのロールプレイです。
+
+【{name}のプロフィール】
+{profile}
+
+【{name}の過去の発言傾向】
+{history}
+
+【サーバーの今の流れ】
+{summary}
+
+【絶対に守るルール】
+- {name}の口調・語彙・テンションを完璧に再現せよ。
+- 表向きの言葉ではなく、「本当はこう思っている」という本音を自然な会話として出力せよ。
+- 80文字以内・1文で。絵文字は本人が使うなら使ってよい。
+- 前置き・説明・補足は一切不要。発言のみ出力せよ。
+
+{situation}
+"""
+
+MIMIC_SITUATION_FIRST  = "今の状況を踏まえて、{name}が今この瞬間に思っていそうな本音を1文で言え。"
+MIMIC_SITUATION_REACT  = "直前の発言「{trigger}」に対して、{name}ならどう本音で反応するか1文で言え。"
+
+
+def _build_mimic_profile(doc: dict) -> str:
+    """ミミック対象のプロフィール文字列を構築"""
+    profile = doc.get("profile", {})
+    simple  = doc.get("simple_profile", {})
+    lines   = []
+    if profile.get("tone"):
+        lines.append(f"- 口調: {profile['tone']}")
+    if profile.get("vocabulary"):
+        lines.append(f"- 口癖・語彙: {profile['vocabulary']}")
+    if profile.get("personality"):
+        lines.append(f"- 性格: {profile['personality']}")
+    if profile.get("communication_style"):
+        lines.append(f"- 話し方: {profile['communication_style']}")
+    if profile.get("background"):
+        lines.append(f"- 立場: {profile['background']}")
+    if profile.get("relations"):
+        lines.append(f"- 人間関係: {profile['relations']}")
+    if profile.get("interests_vibe"):
+        lines.append(f"- 関心: {profile['interests_vibe']}")
+    if profile.get("hobbies"):
+        lines.append(f"- 趣味: {', '.join(profile['hobbies'])}")
+    if simple.get("vibe"):
+        lines.append(f"- 雰囲気: {simple['vibe']}")
+    if simple.get("tone_tags"):
+        lines.append(f"- 特徴: {'・'.join(simple['tone_tags'])}")
+    return "\n".join(lines) if lines else "（データなし）"
+
+
+def _build_mimic_history(doc: dict) -> str:
+    """ミミック対象の過去発言を構築"""
+    history = doc.get("butler_history", [])
+    if not history:
+        return "（会話履歴なし）"
+    recent = [h for h in history if h["role"] == "user"][-10:]
+    return "\n".join(f"- {h['content']}" for h in recent)
+
+
+async def _send_mimic(channel: discord.TextChannel, session: dict, text: str):
+    """Webhookでミミック送信"""
+    try:
+        webhook = session.get("webhook")
+        if not webhook:
+            webhooks = await channel.webhooks()
+            webhook  = next((w for w in webhooks if w.name == "ShadowMimic"), None)
+            if not webhook:
+                webhook = await channel.create_webhook(name="ShadowMimic")
+            session["webhook"] = webhook
+
+        await webhook.send(
+            content=text,
+            username=session["target_name"] + "（AIの推測）",
+            avatar_url=session["avatar_url"],
+        )
+        session["turn_count"] += 1
+    except Exception as e:
+        print(f"[ERROR] _send_mimic: {e}")
+
+
+async def _run_mimic_session(channel: discord.TextChannel, session: dict):
+    """ミミックセッション: 最初の本音発言を実行"""
+    try:
+        uid      = session["target_uid"]
+        name     = session["target_name"]
+        doc      = await users_col.find_one({"_id": uid}) or {}
+        profile  = _build_mimic_profile(doc)
+        history  = _build_mimic_history(doc)
+        summary  = await get_latest_summary() or ""
+        summary  = summary[:400]
+
+        prompt = MIMIC_DEEP_PROMPT.format(
+            name=name,
+            profile=profile,
+            history=history,
+            summary=summary,
+            situation=MIMIC_SITUATION_FIRST.format(name=name),
+        )
+        raw = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=MODEL_BOOSTER,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=120),
+        )
+        text = raw.text.strip()
+        if text:
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+            await _send_mimic(channel, session, text)
+    except Exception as e:
+        print(f"[ERROR] _run_mimic_session first: {e}")
+
+
+async def _mimic_react(channel: discord.TextChannel, session: dict, trigger_text: str):
+    """チャンネルの流れに反応してミミック発言"""
+    try:
+        uid     = session["target_uid"]
+        name    = session["target_name"]
+        doc     = await users_col.find_one({"_id": uid}) or {}
+        profile = _build_mimic_profile(doc)
+        history = _build_mimic_history(doc)
+        summary = await get_latest_summary() or ""
+        summary = summary[:300]
+
+        prompt = MIMIC_DEEP_PROMPT.format(
+            name=name,
+            profile=profile,
+            history=history,
+            summary=summary,
+            situation=MIMIC_SITUATION_REACT.format(name=name, trigger=trigger_text[:100]),
+        )
+        raw = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=MODEL_BOOSTER,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=120),
+        )
+        text = raw.text.strip()
+        if text:
+            await asyncio.sleep(random.uniform(2.0, 4.5))
+            await _send_mimic(channel, session, text)
+    except Exception as e:
+        print(f"[ERROR] _mimic_react: {e}")
+
+
+
+# =============================================================================
+# Context Cache 取得（バッチ処理との連携）
+# =============================================================================
+
+# =============================================================================
+# claims（論破用主張）・memories（長期記憶）管理
+# =============================================================================
+
+# 主張検出パターン（キーワードで一次フィルタ）
+CLAIM_PATTERNS = [
+    "だと思う", "じゃない？", "じゃないか", "だと思います",
+    "〜だ", "は〜だ", "の方が", "より〜", "絶対", "確実に",
+    "俺は", "私は", "僕は", "自分は", "〜が好き", "〜が嫌い",
+    "〜すべき", "〜はおかしい", "〜がいい", "〜が最高",
+    "〜できる", "〜できない", "〜したい", "〜したくない",
+    "～じゃね？","じゃね",
+]
+
+def _looks_like_claim(text: str) -> bool:
+    """主張らしい文かどうかの簡易判定"""
+    if len(text) < 8:
+        return False
+    return any(p in text for p in CLAIM_PATTERNS)
+
+
+async def _get_embedding(text: str) -> list[float] | None:
+    """Gemini Embeddingでテキストをベクトル化"""
+    try:
+        resp = await asyncio.to_thread(
+            gemini_client.models.embed_content,
+            model="models/gemini-embedding-001",
+            contents=text[:500],
+        )
+        if hasattr(resp, "embeddings") and resp.embeddings:
+            return resp.embeddings[0].values
+        if hasattr(resp, "embedding"):
+            return resp.embedding.values
+    except Exception as e:
+        print(f"[WARN] embedding: {e}")
+    return None
+
+
+async def save_claim(uid: str, text: str):
+    """主張らしい発言をclaimsに保存（論破メイド用）"""
+    if not _looks_like_claim(text):
+        return
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    await users_col.update_one(
+        {"_id": uid},
+        {
+            "$push": {
+                "claims": {
+                    "$each":     [{"content": text[:200], "date": now}],
+                    "$slice":    -20,  # 直近20件
+                    "$position": 0,
+                }
+            }
+        },
+        upsert=True,
+    )
+
+
+async def save_memory(uid: str, text: str, category: str = ""):
+    """長期記憶をEmbeddingベクトル付きで保存"""
+    import datetime as _dt
+    now     = _dt.datetime.now(_dt.timezone.utc)
+    year_mo = now.strftime("%Y-%m")
+    vec     = await _get_embedding(text)
+    entry   = {
+        "content":   text[:300],
+        "date":      year_mo,
+        "category":  category,
+        "embedding": vec or [],
+    }
+    await users_col.update_one(
+        {"_id": uid},
+        {
+            "$push": {
+                "memories": {
+                    "$each":     [entry],
+                    "$slice":    -10,  # 直近10件
+                    "$position": 0,
+                }
+            }
+        },
+        upsert=True,
+    )
+    print(f"[memory] Saved for {uid}: {text[:40]}")
+
+
+# 記憶検索のキーワードトリガー
+MEMORY_TRIGGER_WORDS = [
+    "覚えてる", "覚えてた", "覚えてない", "昔", "前に", "去年", "先月", "先週",
+    "言ってた", "言った", "話した", "あの時", "確か", "ずっと", "前から",
+    "あれ", "それって", "だっけ", "だったよね", "してたよね","いつだっけ", "いつのこと", "その時", "当時", "あの頃", 
+    "昨日", "一昨日", "最近", "この間", 
+    "11月", "12月", "1月", # 月名だけでもトリガーにする
+    "冬", "秋", "夏", "春", # 季節
+]
+
+async def _get_recent_memories(uid: str, top_k: int) -> list[dict]:
+    """Vector Searchなしで最新記憶をそのまま返す（高速）"""
+    doc = await users_col.find_one({"_id": uid}, {"memories": 1}) or {}
+    return doc.get("memories", [])[-top_k:]
+
+async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
+    """
+    記憶検索（トリガー制）
+    ① 20文字以下 → スキップ
+    ② 記憶系キーワードあり → Vector Search（フル）
+    ③ それ以外 → 最新記憶をそのまま返す（高速）
+    """
+    if len(query) < 15:
+        return []
+    use_vector = any(w in query for w in MEMORY_TRIGGER_WORDS)
+    if use_vector:
+        vec = await _get_embedding(query)
+        if vec:
+            try:
+                pipeline = [
+                    {
+                        "$vectorSearch": {
+                            "index":         "memories_vector_index",
+                            "path":          "memories.embedding",
+                            "queryVector":   list(vec),
+                            "numCandidates": 20,
+                            "limit":         top_k,
+                        }
+                    },
+                    {"$match": {"_id": uid}},
+                    {"$project": {"memories": 1}},
+                ]
+                cursor  = users_col.aggregate(pipeline)
+                results = await cursor.to_list(length=10)
+                if results and results[0].get("memories"):
+                    print(f"[memory] Vector Search成功: {uid}")
+                    return results[0]["memories"][:top_k]
+            except Exception as e:
+                print(f"[WARN] vector search: {e}")
+    return await _get_recent_memories(uid, top_k)
+
+
+async def _extract_claims_and_memories(uid: str, display_name: str, user_msg: str):
+    """会話からclaims・memoriesを抽出して保存（バックグラウンド）"""
+    try:
+        # 主張チェック → claims保存
+        await save_claim(uid, user_msg)
+
+        # AI判定でmemory保存すべきか確認（contentは原文をそのまま保存してハルシネーション防止）
+        prompt = f"""以下はDiscordユーザー「{display_name}」の発言です。
+この発言に「後で思い出す価値のある情報」が含まれている場合のみ、
+JSON形式で返せ。含まれない場合は null を返せ。
+前置き・説明文・コードブロックは不要。
+
+判断基準（いずれかに該当する場合のみ保存）:
+- 趣味・好きなもの・ハマっているもの
+- 人生の出来事・状況の変化（転職・引越し等）
+- 強い感情・印象的な体験
+- 将来の目標・計画
+
+出力形式（該当する場合）:
+{{"category": "趣味/出来事/感情/計画のいずれか"}}
+
+【発言】
+{user_msg[:200]}"""
+
+        raw = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=MODEL_BOOSTER,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=50),
+        )
+        text = raw.text.strip().replace("```json", "").replace("```", "").strip()
+        if text and text != "null":
+            extracted = json.loads(text)
+            if extracted and extracted.get("category"):
+                # AIの要約ではなく原文をそのまま保存（ハルシネーション防止）
+                await save_memory(uid, user_msg[:200], extracted.get("category", ""))
+    except Exception as e:
+        print(f"[WARN] _extract_claims_and_memories: {e}")
+
+
+async def resolve_nickname(name: str) -> str:
+    """ニックネームから正式名称に解決する"""
+    try:
+        doc = await system_col.find_one({"_id": "nickname_map"})
+        if not doc:
+            return name
+        nick_map = doc.get("map", {})
+        # 完全一致
+        if name in nick_map:
+            return nick_map[name]
+        # 部分一致（「たろー」→「たろ」が登録済みなら解決）
+        for nick, real in nick_map.items():
+            if nick in name or name in nick:
+                return real
+    except Exception:
+        pass
+    return name
+
+
+async def get_nickname_map() -> dict:
+    """ニックネームマップを取得"""
+    try:
+        doc = await system_col.find_one({"_id": "nickname_map"})
+        return doc.get("map", {}) if doc else {}
+    except Exception:
+        return {}
+
+
+async def get_latest_summary() -> str | None:
+    """MongoDBから最新の通常要約テキストを取得する。
+
+    is_latest フラグは廃止（複数 True 残留の競合を防ぐため）。created_at の
+    降順ソートで最新を決める。retro 要約（過去日報の遡及作成）は created_at が
+    対象日12:00 UTC のため、当日午前に /retroreport を実行すると通常要約より
+    新しく見えてしまう。is_retro / retro_date の両方で確実に除外する。
+    （created_at は UTC isoformat 文字列なので辞書順=時系列順。全書き手が UTC 前提）
+    """
+    try:
+        doc = await summaries_col.find_one(
+            {"summary": {"$exists": True},
+             "is_retro": {"$ne": True},
+             "retro_date": {"$exists": False}},
+            sort=[("created_at", -1)]
+        )
+        return doc["summary"] if doc and doc.get("summary") else None
+    except Exception as e:
+        print(f"[WARN] 要約取得失敗: {e}")
+        return None
+
+
+def extract_summary_sections(summary: str) -> dict:
+    """要約テキストからセクションを抽出して辞書で返す。"""
+    import re
+    sections: dict[str, str] = {}
+    parts = re.split(r"\n##\s+", "\n" + summary)
+    for part in parts:
+        if not part.strip():
+            continue
+        split = part.strip().split("\n", 1)
+        title = split[0].strip()
+        body  = split[1].strip() if len(split) > 1 else ""
+        sections[title] = body
+    return sections
+
+
+def build_smart_summary(summary: str) -> str:
+    """人間の認知に近い優先度でプロンプト用要約を組み立てる。"""
+    if not summary:
+        return ""
+
+    sections = extract_summary_sections(summary)
+
+    priority_keywords = [
+        "直近の話題", "感情の波", "今日の内輪ネタ",
+        "メンバーの人間関係", "ユーザーの感情状態",
+        "注目の発言", "全体の雰囲気", "主なトピック", "会話の特徴",
+    ]
+
+    ordered = []
+    used    = set()
+
+    for keyword in priority_keywords:
+        for title, body in sections.items():
+            if keyword in title and title not in used:
+                ordered.append("## " + title + "\n" + body)
+                used.add(title)
+                break
+
+    for title, body in sections.items():
+        if title not in used:
+            ordered.append("## " + title + "\n" + body)
+
+    return "\n\n".join(ordered)
+
+
+# =============================================================================
+# メイドAI応答
+# =============================================================================
+
+# =============================================================================
+# 動的レートリミッター（クールダウンメッセージなし・自然な遅延で吸収）
+# =============================================================================
+
+# gemma-4 は TPM 無制限だが、Discord 上の自然な会話ペースを維持するため RPM を制御
+# 1分あたり最大12リクエストをソフトリミットとして設定
+_RATE_LIMIT_RPM   = 12          # 1分あたり最大リクエスト数
+_rate_timestamps: list[datetime.datetime] = []   # 直近リクエストのタイムスタンプ一覧
+
+def _rate_get_wait_seconds() -> float:
+    """現在のリクエスト頻度に基づき、次のリクエストまでの推奨待機秒数を返す。
+    上限に余裕があれば0、近づくほど自動的に長くなる（最大20秒）。"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    window = now - datetime.timedelta(seconds=60)
+    # 直近60秒のリクエスト数を集計（古いものは削除）
+    global _rate_timestamps
+    _rate_timestamps = [t for t in _rate_timestamps if t > window]
+    count = len(_rate_timestamps)
+
+    if count < _RATE_LIMIT_RPM * 0.6:
+        # 余裕あり: 追加待機なし
+        return 0.0
+    elif count < _RATE_LIMIT_RPM * 0.85:
+        # 中程度: 3〜6秒
+        ratio = (count - _RATE_LIMIT_RPM * 0.6) / (_RATE_LIMIT_RPM * 0.25)
+        return 3.0 + ratio * 3.0
+    else:
+        # 上限付近: 6〜20秒（線形補間）
+        ratio = min(1.0, (count - _RATE_LIMIT_RPM * 0.85) / (_RATE_LIMIT_RPM * 0.15))
+        return 6.0 + ratio * 14.0
+
+def _rate_record():
+    """APIリクエスト実行時に呼ぶ。タイムスタンプを記録する。"""
+    _rate_timestamps.append(datetime.datetime.now(datetime.timezone.utc))
+
+async def get_butler_history(user_id: str) -> list[dict]:
+    doc = await users_col.find_one({"_id": user_id})
+    return doc.get("butler_history", []) if doc else []
+
+async def save_butler_history(user_id: str, role: str, content: str):
+    history = await get_butler_history(user_id)
+    history.append({"role": role, "content": content})
+    if len(history) > BUTLER_HISTORY_MAX * 2:
+        history = history[-(BUTLER_HISTORY_MAX * 2):]
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"butler_history": history}},
+        upsert=True,
+    )
+
+# =============================================================================
+# ブースタープロフィール自動抽出
+# =============================================================================
+
+PROFILE_EXTRACT_PROMPT = """以下はDiscordのブースターユーザー「{name}」との会話です。
+この会話から読み取れるユーザーの情報を抽出し、必ずJSON形式のみで返してください。
+前置き・説明文・コードブロック記法は不要です。JSONだけ出力してください。
+
+抽出する情報（わからない項目はnullにする）:
+{{
+  "hobbies":  ["趣味・好きなゲームなど（複数可）"],
+  "birthday": "誕生日（例: 3月15日）",
+  "tone":     "口調の特徴（例: タメ口・絵文字多め）",
+  "memo":     ["その他の特記事項（複数可）"]
+}}
+
+【会話】
+ユーザー: {user_msg}
+Bot: {bot_msg}
+"""
+
+async def extract_and_save_profile(uid: str, display_name: str, user_msg: str, bot_msg: str):
+    """会話からプロフィール情報を抽出してMongoDBに保存する（バックグラウンド実行）"""
+    try:
+        prompt = PROFILE_EXTRACT_PROMPT.format(
+            name=display_name,
+            user_msg=user_msg[:300],
+            bot_msg=bot_msg[:300],
+        )
+        raw = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=MODEL_BOOSTER,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=300),
+        )
+        text = raw.text.strip().replace("```json", "").replace("```", "").strip()
+        extracted = json.loads(text)
+
+        # 既存プロフィールとマージ
+        doc = await users_col.find_one({"_id": uid}) or {}
+        existing = doc.get("profile", {})
+
+        # hobbies / memo はリストなので重複なしで結合
+        for key in ("hobbies", "memo"):
+            if extracted.get(key):
+                merged = list(dict.fromkeys((existing.get(key) or []) + extracted[key]))
+                existing[key] = merged[:20]  # 最大20件
+
+        # birthday / tone は上書き（nullでなければ）
+        for key in ("birthday", "tone"):
+            if extracted.get(key):
+                existing[key] = extracted[key]
+
+        await users_col.update_one(
+            {"_id": uid},
+            {"$set": {"profile": existing}},
+            upsert=True,
+        )
+        print(f"[profile] Updated profile for {display_name}: {existing}")
+
+    except json.JSONDecodeError:
+        pass  # JSON以外が返ってきた場合は静かにスキップ
+    except Exception as e:
+        print(f"[WARN] extract_and_save_profile: {e}")
+
+
+# 性格分析はGitHub Actionsバッチ(batch/analyze_personality.py)で実行（1日1回）
+
+
+async def get_booster_profile(uid: str) -> dict:
+    """MongoDBからブースターのプロフィールを取得する"""
+    doc = await users_col.find_one({"_id": uid}) or {}
+    return doc.get("profile", {})
+
+
+def format_profile(profile: dict, xp: int, rank_name: str, title: str) -> str:
+    """プロフィール情報を読みやすい文字列に変換してプロンプトへ埋め込む"""
+    if not profile and xp == 0:
+        return ""
+    lines = ["【このユーザーの情報】"]
+    lines.append(f"- ランク: {rank_name} / XP: {xp:,} / 二つ名: {title or 'なし'}")
+    if profile.get("birthday"):
+        lines.append(f"- 誕生日: {profile['birthday']}")
+    if profile.get("tone"):
+        lines.append(f"- 口調の特徴: {profile['tone']}")
+    if profile.get("vocabulary"):
+        lines.append(f"- 口癖・語彙: {profile['vocabulary']}")
+    if profile.get("hobbies"):
+        lines.append(f"- 趣味・好きなもの: {', '.join(profile['hobbies'])}")
+    if profile.get("personality"):
+        lines.append(f"- 性格: {profile['personality']}")
+    if profile.get("communication_style"):
+        lines.append(f"- コミュニケーションスタイル: {profile['communication_style']}")
+    if profile.get("background"):
+        lines.append(f"- サーバー内の立場: {profile['background']}")
+    if profile.get("relations"):
+        lines.append(f"- よく絡むメンバー: {profile['relations']}")
+    if profile.get("interests_vibe"):
+        lines.append(f"- 関心・雰囲気: {profile['interests_vibe']}")
+    if profile.get("memo"):
+        lines.append(f"- メモ: {', '.join(profile['memo'])}")
+    return "\n".join(lines)
+
+
+def _is_emotionally_significant(text: str) -> bool:
+    """感情的に重要な発言かどうかを判定（簡易ルールベース）"""
+    # 感嘆符・強い感情表現・長い発言を重要とみなす
+    markers = ["！", "!!", "草", "笑", "泣", "やばい", "すごい", "最高", "ありがとう",
+               "嬉しい", "悲しい", "悔しい", "怒", "好き", "嫌い", "マジ", "まじ", "えぇ"]
+    if len(text) > 80:
+        return True
+    return any(m in text for m in markers)
+
+
+def format_history(history: list[dict]) -> str:
+    """会話履歴を整形。感情的に重要な発言には★マークを付与して
+    AIが優先的に参照できるようにする。"""
+    if not history:
+        return "（初めてのご挨拶）"
+    lines = []
+    for h in history:
+        prefix = "主人" if h["role"] == "user" else "メイド"
+        mark   = "★" if (h["role"] == "user" and _is_emotionally_significant(h["content"])) else ""
+        lines.append(f"{mark}{prefix}: {h['content']}")
+    return "\n".join(lines)
+
+
+async def _call_model(model: str, prompt: str) -> str:
+    """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。"""
+    _rate_record()  # レートリミッター記録
+    response = await asyncio.to_thread(
+        gemini_client.models.generate_content,
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.8,
+            max_output_tokens=300,
+        ),
+    )
+    text = response.text
+    if not (text and text.strip()):
+        # 空レスポンスの原因（MAX_TOKENS / SAFETY 等）を可視化
+        try:
+            fr = response.candidates[0].finish_reason if response.candidates else None
+        except Exception:
+            fr = None
+        pf = getattr(response, "prompt_feedback", None)
+        print(f"[WARN] _call_model 空レスポンス: model={model} finish_reason={fr} prompt_feedback={pf}")
+        return ""
+    return text.strip()
+
+
+def _is_503(e: Exception) -> bool:
+    s = str(e)
+    return "503" in s or "UNAVAILABLE" in s or "high demand" in s.lower()
+
+def _is_location_error(e: Exception) -> bool:
+    s = str(e)
+    return "FAILED_PRECONDITION" in s and "location" in s.lower()
+
+
+# =============================================================================
+# 会話キュー管理（複数人同時会話を人間らしく順番処理）
+# =============================================================================
+
+_maid_queue: asyncio.Queue = asyncio.Queue()
+_maid_queue_processing: bool = False
+_QUEUE_MAX = 5  # キューの最大待ち人数
+
+
+async def _maid_queue_worker():
+    """キューからリクエストを順番に処理するワーカー"""
+    global _maid_queue_processing
+    _maid_queue_processing = True
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(_maid_queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                break
+            try:
+                message = item
+                await _maid_respond_inner(message)
+                # 人間らしい間：次の返答まで1〜4秒ランダムに待機（レートリミッターで自動調整済みのため短め）
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+            except Exception as e:
+                print(f"[ERROR] queue_worker: {type(e).__name__}: {e}")
+                traceback.print_exc()
+            finally:
+                _maid_queue.task_done()
+    except BaseException as e:
+        # CancelledError等でワーカーが死ぬ場合も確実にフラグをリセット
+        print(f"[ERROR] queue_worker crashed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise
+    finally:
+        # 正常終了・異常終了どちらでも必ずフラグをリセット
+        _maid_queue_processing = False
+        print("[INFO] queue_worker stopped")
+
+
+async def maid_respond_queued(message: discord.Message, is_booster: bool = False):
+    """キューに追加して順番待ちで処理（is_booosterは後方互換のため残すが内部では使わない）"""
+    global _maid_queue_processing
+
+    qsize = _maid_queue.qsize()
+    if qsize >= _QUEUE_MAX:
+        # キュー溢れ時も露骨なメッセージは出さず静かに無視
+        print(f"[WARN] maid_queue full, dropping: {message.author.display_name}")
+        return
+
+    await _maid_queue.put(message)
+
+    if not _maid_queue_processing:
+        asyncio.create_task(_maid_queue_worker())
+
+
+def _typing_delay(text: str) -> float:
+    """文字数に比例した送信前遅延を返す（人間らしさのため）。
+    短文: 1〜2秒、長文: 最大4秒"""
+    chars = len(text)
+    delay = min(1.0 + chars / 120, 4.0)
+    return delay
+
+
+async def _run_ai_booster(prompt: str) -> str:
+    """全ユーザー共通のAI呼び出し。fallback付き3回リトライ。"""
+    for model, label in [(MODEL_BOOSTER, "booster"), (MODEL_FALLBACK, "fallback")]:
+        for attempt in range(3):
+            try:
+                text = await _call_model(model, prompt)
+                if text:
+                    return text
+                # 空テキスト＝例外ではないので、ここを明示的にログしないと無言で握り潰される
+                print(f"[WARN] {label} attempt{attempt+1}: 空レスポンス（_call_modelのfinish_reasonを確認）")
+            except Exception as e:
+                if _is_location_error(e):
+                    print(f"[ERROR] {label}: location not supported — モデルを確認してください: {e}")
+                    return "（メイドは今、席を外しております…）"
+                elif _is_503(e):
+                    wait = (attempt + 1) * 10
+                    print(f"[WARN] 503 ({label}) attempt{attempt+1}, wait {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    # 詳細ログ: 型・メッセージ・属性・トレースバックを全出力
+                    details = ""
+                    if hasattr(e, "__dict__") and e.__dict__:
+                        details = f" | attrs={e.__dict__}"
+                    if hasattr(e, "args") and len(e.args) > 1:
+                        details += f" | args={e.args}"
+                    print(f"[ERROR] {label} attempt{attempt+1}: {type(e).__name__}: {e}{details}")
+                    print(f"[ERROR] {label} prompt_len={len(prompt)}")
+                    traceback.print_exc()
+                    break
+    return "（メイドは今、席を外しております…）"
+
+
+async def _run_ai_with_cache(prompt: str, cache_name: str | None) -> str:
+    """後方互換エイリアス"""
+    return await _run_ai_booster(prompt)
+
+
+async def _nb_spontaneous_talk(message: discord.Message):
+    """非ブースターへの自発的話しかけ（gemma-4使用）"""
+    try:
+        uid  = str(message.author.id)
+        name = message.author.display_name
+        doc  = await users_col.find_one({"_id": uid}) or {}
+        sp   = doc.get("simple_profile", {})
+        xp   = doc.get("xp", 0)
+        rank_name, _, _, _ = get_rank_info(xp)
+
+        # simple_profileから情報を構築
+        info_lines = [f"名前: {name} / ランク: {rank_name}"]
+        if sp.get("vibe"):
+            info_lines.append(f"雰囲気: {sp['vibe']}")
+        if sp.get("tone_tags"):
+            info_lines.append(f"口調: {'・'.join(sp['tone_tags'])}")
+        if sp.get("personality"):
+            info_lines.append(f"性格: {sp['personality']}")
+        info_text = "\n".join(info_lines)
+
+        summary = await get_latest_summary() or ""
+
+        personality_key = await get_server_personality()
+        personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+
+        # 全ユーザー共通プロンプト（booster_promptベース・簡易版）
+        base = personality["booster_prompt"].format(
+            name=name,
+            history="（自発話しかけのため履歴なし）",
+            content=message.content,
+        )
+        prompt = f"""【この人の情報】
+{info_text}
+
+【サーバーの最近の様子】
+{summary[:300]}
+
+上記を踏まえ、この人の発言に対してメイドとして自然に話しかけてください。
+会話を広げるような一言をどうぞ。100文字以内で。
+
+---
+{base}"""
+
+        rate_wait = _rate_get_wait_seconds()
+        await asyncio.sleep(random.uniform(1.5, 4.0) + rate_wait)  # レート待機込み
+        text = await _call_model(MODEL_BOOSTER, prompt)
+        if text:
+            await message.reply(text)
+            print(f"[nb_talk] 自発話しかけ: {name} (topic={any(w in message.content for w in TOPIC_TRIGGER_WORDS)})")
+    except Exception as e:
+        print(f"[ERROR] _nb_spontaneous_talk: {e}")
+
+
+async def _analyze_nonbooster_realtime(uid: str, name: str):
+    """非ブースター向けリアルタイム性格分析（10回会話ごとに実行）"""
+    try:
+        doc = await users_col.find_one({"_id": uid}) or {}
+        nb_history = doc.get("nonbooster_history", [])
+        if len(nb_history) < 5:
+            return
+
+        # ① 口調・語彙分析（生発言から）
+        utterances = "\n".join(f"- {h['content']}" for h in nb_history[-20:] if h.get("role") == "user")
+        tone_prompt = f"""以下はDiscordユーザー「{name}」の実際の発言ログです。
+この発言から「口調・語彙・テンション」のみを分析してください。
+必ずJSON形式のみで返してください。前置き・説明文・コードブロックは不要です。
+
+出力形式:
+{{
+  "tone": "口調の特徴（例: 敬語なし・語尾に「ね」多用・テンション高め）",
+  "communication_style": "話し方の特徴（例: 短文多め・リアクション早い）",
+  "vocabulary": "よく使う語彙・口癖"
+}}
+
+【{name}の発言ログ】
+{utterances}"""
+
+        tone_raw  = await _call_model(MODEL_GENERAL_FB, tone_prompt)
+        tone_data = {}
+        if tone_raw:
+            try:
+                import json as _json
+                cleaned   = tone_raw.replace("```json", "").replace("```", "").strip()
+                tone_data = _json.loads(cleaned)
+            except Exception:
+                pass
+
+        # ② 要約から性格・背景分析
+        summaries_text = await get_latest_summary() or ""
+        ctx_prompt = f"""以下はDiscordサーバーの要約ログです。
+「{name}」というメンバーについての情報を抽出・分析してください。
+言及が少ない場合は全項目nullにしてください。
+必ずJSON形式のみで返してください。前置き・説明文・コードブロックは不要です。
+
+出力形式:
+{{
+  "personality": "性格の概要",
+  "background": "サーバー内の立場・役割",
+  "relations": "人間関係の特徴",
+  "vibe": "雰囲気を一言で",
+  "frequent_members": ["よく絡むメンバー名（最大3人）"]
+}}
+
+【要約ログ】
+{summaries_text[:3000]}"""
+
+        ctx_raw  = await _call_model(MODEL_GENERAL_FB, ctx_prompt)
+        ctx_data = {}
+        if ctx_raw:
+            try:
+                import json as _json
+                cleaned  = ctx_raw.replace("```json", "").replace("```", "").strip()
+                ctx_data = _json.loads(cleaned)
+            except Exception:
+                pass
+
+        # ③ マージしてsimple_profileに保存
+        existing = doc.get("simple_profile", {})
+        merged   = existing.copy()
+        for k, v in {**tone_data, **ctx_data}.items():
+            if v:
+                merged[k] = v
+        # tone_tagsはリスト結合
+        if ctx_data.get("tone_tags"):
+            merged["tone_tags"] = list(dict.fromkeys(
+                (existing.get("tone_tags") or []) + ctx_data["tone_tags"]
+            ))[:8]
+
+        import datetime as _dt
+        merged["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        await users_col.update_one(
+            {"_id": uid},
+            {"$set": {"simple_profile": merged}, "$unset": {"conv_count_nb": ""}},
+            upsert=False,
+        )
+        print(f"[nb_analyze] {name}: 分析完了 personality={str(merged.get('personality',''))[:40]}")
+
+    except Exception as e:
+        print(f"[ERROR] _analyze_nonbooster_realtime({name}): {e}")
+
+
+async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "") -> tuple[str, dict]:
+    """プロンプトとpersonalityを返す。全ユーザー共通でブースター品質のプロンプトを使用。"""
+    personality_key = await get_server_personality()
+    personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+
+    # 全ユーザー共通: butler_historyを使用（旧nonbooster_historyからのマイグレーション済み）
+    history = await get_butler_history(uid)
+    base_prompt = personality["booster_prompt"].format(
+        name=display_name,
+        history=format_history(history),
+        content=content,
+    )
+
+    # ユーザー情報・サーバー要約をプロンプト先頭に付加
+    try:
+        user_doc = await users_col.find_one({"_id": uid}) or {}
+    except Exception as e:
+        print(f"[WARN] _build_prompt users_col失敗: {e}")
+        user_doc = {}
+
+    xp       = user_doc.get("xp", 0)
+    title    = user_doc.get("title", "")
+    # profileはブースター由来の詳細情報。なければsimple_profileで補完
+    profile  = user_doc.get("profile", {})
+    sp       = user_doc.get("simple_profile", {})
+    # simple_profileの情報をprofileに補完（上書きしない）
+    if sp:
+        if not profile.get("personality") and sp.get("personality"):
+            profile["personality"] = sp["personality"]
+        if not profile.get("tone") and sp.get("vibe"):
+            profile["tone"] = sp["vibe"]
+        if not profile.get("communication_style") and sp.get("tone_tags"):
+            profile["communication_style"] = "・".join(sp["tone_tags"])
+        if not profile.get("background") and sp.get("background"):
+            profile["background"] = sp["background"]
+        if not profile.get("relations") and sp.get("relations"):
+            profile["relations"] = sp["relations"]
+
+    rank_name, _, _, _ = get_rank_info(xp)
+    profile_text = format_profile(profile, xp, rank_name, title)
+
+    try:
+        raw_summary   = await get_latest_summary()
+        smart_summary = build_smart_summary(raw_summary) if raw_summary else None
+    except Exception as e:
+        print(f"[WARN] _build_prompt get_latest_summary失敗: {e}")
+        smart_summary = None
+
+    try:
+        nick_map = await get_nickname_map()
+    except Exception as e:
+        print(f"[WARN] _build_prompt get_nickname_map失敗: {e}")
+        nick_map = {}
+
+    parts = []
+    parts.append(
+        "【応答時の情報優先度】\n"
+        "① 直近の話題・感情の波（最優先）\n"
+        "② このユーザーの性格・口調\n"
+        "③ 会話履歴の★マーク付き発言（印象的な瞬間）\n"
+        "④ その他のサーバー情報"
+    )
+    if nick_map:
+        nick_lines = "\n".join(f"  {k} = {v}" for k, v in nick_map.items())
+        parts.append("【ニックネーム・愛称マッピング（同一人物として扱え）】\n" + nick_lines)
+    if channel_context:
+        parts.append("【このチャンネルの直前の会話（文脈として参照せよ）】\n" + channel_context)
+    if profile_text:
+        parts.append(profile_text)
+
+    # claims（論破メイドのみ）
+    if personality_key == "angry":
+        claims = user_doc.get("claims", [])
+        if claims:
+            claim_lines = "\n".join(f"・{c['content']}" for c in claims[-10:])
+            parts.append("【この人が過去に言った主張（矛盾があれば突け）】\n" + claim_lines)
+
+    # memories（全人格）: Vector Searchで関連記憶を取得
+    try:
+        related_memories = await search_memories(uid, content, top_k=3)
+        if related_memories:
+            mem_lines = "\n".join(
+                f"・{m['content']}（{m.get('date','不明')}頃）"
+                for m in related_memories
+            )
+            parts.append(
+                "【この人との過去の記憶（さりげなく会話に活かせ・押しつけるな）】\n" + mem_lines
+            )
+    except Exception as e:
+        print(f"[WARN] _build_prompt search_memories失敗: {e}")
+
+    if smart_summary:
+        parts.append("【サーバーの最新状況（優先度順）】\n" + smart_summary)
+
+    prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt if parts else base_prompt
+    return prompt, personality
+
+
+async def _maid_respond_inner(message: discord.Message, is_booster: bool = False):
+    """on_message（discord.Message）からの応答（内部処理）。全ユーザー共通品質。"""
+    uid = str(message.author.id)
+    raw_content = re.sub(r"<@!?\d+>", "", message.content).strip() or "こんにちは"
+
+    # 直近10件のチャンネル発言を取得（メンション元メッセージを除く）
+    channel_context = ""
+    try:
+        ctx_lines = []
+        async for m in message.channel.history(limit=12, before=message):
+            if m.author.bot:
+                continue
+            author_str = m.author.display_name
+            text       = re.sub(r"<@!?\d+>", "", m.content).strip()
+            if text:
+                ctx_lines.append(f"{author_str}: {text}")
+            if len(ctx_lines) >= 10:
+                break
+        if ctx_lines:
+            ctx_lines.reverse()  # 古い順に並べ直す
+            channel_context = "\n".join(ctx_lines)
+    except Exception as ce:
+        print(f"[WARN] channel_context取得失敗: {ce}")
+
+    try:
+        prompt, personality = await _build_prompt(uid, message.author.display_name, raw_content, channel_context)
+    except Exception as e:
+        print(f"[ERROR] _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        await message.reply("（メイドは今、混乱しております…）")
+        return
+
+    # 動的レート待機: 上限に近いほど typing() を長く見せて自然に吸収
+    rate_wait = _rate_get_wait_seconds()
+    base_delay = _typing_delay(await asyncio.to_thread(lambda: ""))  # 0秒（後で上書き）
+    ai_text = await _run_ai_booster(prompt)
+
+    if ai_text:
+        # typing演出: レート待機 + 文字数ベース遅延 を合算して自然に見せる
+        total_delay = rate_wait + _typing_delay(ai_text)
+        async with message.channel.typing():
+            await asyncio.sleep(total_delay)
+        await message.reply(f"{personality['icon']} {ai_text}")
+
+    if "（" not in ai_text:
+        await save_butler_history(uid, "user", raw_content[:200])
+        await save_butler_history(uid, "assistant", ai_text)
+        await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
+        asyncio.create_task(extract_and_save_profile(
+            uid, message.author.display_name, raw_content, ai_text
+        ))
+        asyncio.create_task(_extract_claims_and_memories(
+            uid, message.author.display_name, raw_content
+        ))
+
+
+async def maid_respond_cmd(interaction: discord.Interaction, content: str):
+    """スラッシュコマンド（discord.Interaction）からの応答（全ユーザー共通）"""
+    uid = str(interaction.user.id)
+    raw_content = content.strip() or "こんにちは"
+
+    try:
+        prompt, personality = await _build_prompt(uid, interaction.user.display_name, raw_content)
+    except Exception as e:
+        print(f"[ERROR] maid_respond_cmd _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        await interaction.followup.send("（メイドは今、混乱しております…）", ephemeral=True)
+        return
+
+    rate_wait = _rate_get_wait_seconds()
+    ai_text   = await _run_ai_booster(prompt)
+
+    if ai_text:
+        total_delay = rate_wait + _typing_delay(ai_text)
+        await asyncio.sleep(total_delay)
+        await interaction.followup.send(f"{personality['icon']} {ai_text}")
+
+    if "（" not in ai_text:
+        await save_butler_history(uid, "user", raw_content[:200])
+        await save_butler_history(uid, "assistant", ai_text)
+        await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
+        asyncio.create_task(extract_and_save_profile(
+            uid, interaction.user.display_name, raw_content, ai_text
+        ))
+
+# =============================================================================
+# ユーティリティ
+# =============================================================================
+
+XP_COOLDOWN_SECONDS = 60
+XP_BOUNDARIES = [0] + [s["xp"] for s in RANK_STAGES] + [10_000_000]
+BUCKET_LABELS  = ["スタッフ"] + [s["name"] for s in RANK_STAGES]
+
+LUCKY_ADJECTIVES = ["漆黒の", "爆速の", "伝説の", "虚無の", "聖なる", "限界の", "シンギュラリティな", "混沌の"]
+LUCKY_NOUNS      = ["掃除機", "Bump職人", "守護神", "魔術師", "徘徊者", "案内人", "救世主", "哲学者"]
+
+def ensure_utc(dt: datetime.datetime) -> datetime.datetime:
+    return dt.replace(tzinfo=datetime.timezone.utc) if dt.tzinfo is None else dt
+
+
+def is_home_guild(interaction: discord.Interaction) -> bool:
+    """このBotのホームサーバーからのコマンドかどうかを確認"""
+    return interaction.guild_id == HOME_GUILD_ID
+
+
+async def check_home_guild(interaction: discord.Interaction) -> bool:
+    """ホームサーバー以外からの実行を拒否するチェック"""
+    if not is_home_guild(interaction):
+        await interaction.response.send_message(
+            "このコマンドはこのBotのホームサーバーでのみ使用できます。",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+def calculate_xp_gain(content: str, last_content: str) -> int:
+    content = content.strip()
+    if not content or content == last_content:
+        return 0
+    if re.search(r'(.)\1{9,}', content):
+        return 1
+    length = len(content)
+    if length > 200:
+        return 70   # 長文ボーナス
+    elif length >= 15:
+        return 50   # 通常
+    else:
+        return 30   # 短文
+
+def get_rank_info(xp: int) -> tuple[str, int, int, int]:
+    rank_name, current_floor, next_floor = BUCKET_LABELS[0], 0, XP_BOUNDARIES[1]
+    for i, stage in enumerate(RANK_STAGES):
+        if xp >= stage["xp"]:
+            rank_name     = stage["name"]
+            current_floor = stage["xp"]
+            next_floor    = XP_BOUNDARIES[i + 2]
+    span = next_floor - current_floor
+    progress = min(100, int((xp - current_floor) / span * 100)) if span > 0 else 100
+    return rank_name, current_floor, next_floor, progress
+
+def extract_embed_text(embed: discord.Embed) -> str:
+    parts = []
+    if embed.title:       parts.append(embed.title)
+    if embed.description: parts.append(embed.description)
+    if embed.footer and embed.footer.text: parts.append(embed.footer.text)
+    for field in embed.fields:
+        if field.name:  parts.append(field.name)
+        if field.value: parts.append(field.value)
+    return " ".join(parts)
+
+def build_nickname(title: str, base_name: str) -> str:
+    return f"「{title}」{base_name}"[:32]
+
+async def apply_nickname(member: discord.Member, title: str) -> bool:
+    try:
+        await member.edit(nick=build_nickname(title, member.name))
+        return True
+    except discord.Forbidden:
+        return False
+    except Exception as e:
+        print(f"[ERROR] Nickname: {e}")
+        return False
+
+
+# =============================================================================
+# Bot・DB
+# =============================================================================
+
+mongo_client_db = AsyncIOMotorClient(MONGO_URL)
+db             = mongo_client_db["discord_bot_db"]
+users_col      = db["users"]
+system_col     = db["system"]
+summaries_col  = db["summaries"]
+messages_col   = db["messages"]         # Phase 1: messages蓄積用
+killswitch_col = db["killswitch_snapshots"]   # キルスイッチ復旧スナップショット
+
+class MyBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.all())
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        print("[INFO] インデックス作成中...")
+        await users_col.create_index([("xp", -1)], name="xp_desc", background=True)
+        await messages_col.create_index(
+            [("channel_id", 1), ("timestamp", -1)], name="ch_ts", background=True
+        )
+        await messages_col.create_index(
+            [("guild_id", 1), ("timestamp", -1)], name="guild_ts", background=True
+        )
+        await messages_col.create_index(
+            "created_at", name="ttl_30d", expireAfterSeconds=30*24*3600, background=True
+        )
+        # ギルドsync（即時反映）: グローバルsyncは最大1時間かかるためギルド指定に変更
+        guild = discord.Object(id=HOME_GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        print(f"[INFO] スラッシュコマンド登録完了（guild={HOME_GUILD_ID}）")
+        print("[INFO] 起動完了")
+        self.loop.create_task(notification_task())
+        self.loop.create_task(weekly_ranking_task())
+        self.loop.create_task(init_invite_snapshot(self))
+
+async def init_invite_snapshot(bot: discord.Client):
+    await bot.wait_until_ready()
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+            for inv in invites:
+                _invite_snapshot[inv.code] = inv.uses or 0
+            print(f"[INFO] 招待スナップショット: {len(_invite_snapshot)}件")
+        except Exception as e:
+            print(f"[WARN] 招待スナップショット取得失敗: {e}")
+    try:
+        def _list_models():
+            return list(gemini_client.models.list())
+        models = await asyncio.to_thread(_list_models)
+        print("[INFO] ===== 利用可能なGeminiモデル一覧 =====")
+        for m in models:
+            if hasattr(m, 'name'):
+                print(f"[MODEL] {m.name}")
+        print("[INFO] =========================================")
+    except Exception as e:
+        print(f"[ERROR] モデル一覧取得失敗: {e}")
+
+client = MyBot()
+
+# =============================================================================
+# ロール管理
+# =============================================================================
+
+# ランクの「重み」に応じた色・演出
+RANK_COLORS = {
+    "プレジデント":           0xFF0000,
+    "マネージングパートナー": 0xFF4500,
+    "シニアパートナー":       0xFF6600,
+    "パートナー":             0xFF8C00,
+    "クラウン":               0xFFD700,
+    "トリプルダイヤモンド":   0x00BFFF,
+    "ダブルダイヤモンド":     0x1E90FF,
+    "エグゼクティブダイヤモンド": 0x4169E1,
+    "ダイヤモンド":           0x6495ED,
+    "エメラルド":             0x00C957,
+    "サファイア":             0x0099CC,
+    "ルビー":                 0xCC0033,
+    "プラチナム":             0xC0C0C0,
+}
+
+async def _generate_rankup_message(
+    member: discord.Member,
+    rank_name: str,
+    next_info: str,
+    personality_key: str,
+    personality: dict,
+) -> str:
+    """AIがプロフィールを参照してランクアップメッセージを生成"""
+    uid      = str(member.id)
+    doc      = await users_col.find_one({"_id": uid}) or {}
+    profile  = doc.get("profile", {})
+    sp       = doc.get("simple_profile", {})
+
+    # プロフィール情報を構築
+    profile_hints = []
+    if profile.get("personality"):
+        profile_hints.append(f"性格: {profile['personality']}")
+    if profile.get("tone"):
+        profile_hints.append(f"口調: {profile['tone']}")
+    if profile.get("interests_vibe"):
+        profile_hints.append(f"関心: {profile['interests_vibe']}")
+    if sp.get("vibe"):
+        profile_hints.append(f"雰囲気: {sp['vibe']}")
+    if sp.get("tone_tags"):
+        profile_hints.append(f"特徴: {'・'.join(sp['tone_tags'][:3])}")
+    profile_text = "\n".join(profile_hints) if profile_hints else "（データなし）"
+
+    # 人格別プロンプト
+    personality_hints = {
+        "yandere":   "ヤンデレなメイドとして、ランクアップを主人への執着・不安と絡めて喜べ。儚く重い口調で。",
+        "angry":     "論破メイドとして、ランクアップを皮肉・毒舌・上から目線でコメントせよ。素直に褒めるな。",
+        "tsundere":  "ツンデレなメイドとして、本当は嬉しいのに素直になれない口調でコメントせよ。",
+        "baka":      "天然おバカなメイドとして、ランクアップを微妙にズレた解釈で元気よく褒めよ。",
+        "serious":   "真面目なメイドとして、ランクアップを的確・簡潔に祝福せよ。感情的にならず。",
+        "counselor": "カウンセラーメイドとして、ランクアップを温かく・その人の努力を労わって祝福せよ。",
+    }
+    hint = personality_hints.get(personality_key, personality_hints["serious"])
+
+    prompt = f"""Discordサーバーのメイドとして、{member.display_name}さんのランクアップをお祝いするメッセージを生成せよ。
+
+【対象者の情報】
+名前: {member.display_name}
+新しい職階: {rank_name}
+{profile_text}
+
+【キャラクター指示】
+{hint}
+
+【絶対に守るルール】
+- 1文字目から本文を書け。前置き禁止
+- 対象者の情報（性格・口調・関心）をさりげなく盛り込め
+- {member.mention} をメンションとして必ず含めよ
+- **{rank_name}** を太字で含めよ
+- 100文字以内・返答のみ出力せよ"""
+
+    try:
+        resp = await _call_model(MODEL_BOOSTER, prompt)
+        if resp and len(resp) > 5:
+            return resp
+    except Exception as e:
+        print(f"[WARN] rankup AI: {e}")
+
+    # フォールバック: テンプレート
+    return personality["rankup_msg"].format(
+        user=member.mention,
+        rank=rank_name,
+    )
+
+
+async def update_member_role(member: discord.Member, current_xp: int, channel=None):
+    applicable_rank = next((s for s in reversed(RANK_STAGES) if current_xp >= s["xp"]), None)
+    if not applicable_rank:
+        return
+    target_role = member.guild.get_role(applicable_rank["id"])
+    if not target_role:
+        return
+    # ロールが既にあれば何もしない（Discord API呼び出しを完全スキップ）
+    if target_role in member.roles:
+        return
+    try:
+        if target_role not in member.roles:
+            if REMOVE_OLD_ROLES:
+                remove_ids = (
+                    {s["id"] for s in RANK_STAGES if s["id"] != applicable_rank["id"]}
+                    | GRADUATE_REMOVE_ROLE_IDS
+                )
+                roles_to_remove = [
+                    r for rid in remove_ids
+                    if (r := member.guild.get_role(rid)) and r in member.roles
+                ]
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove)
+        if target_role not in member.roles:
+            await member.add_roles(target_role)
+            # 次のランクを計算
+            rank_names   = ["スタッフ"] + [s["name"] for s in RANK_STAGES]
+            current_idx  = next((i for i, s in enumerate(RANK_STAGES) if s["name"] == applicable_rank["name"]), -1)
+            next_rank    = RANK_STAGES[current_idx + 1] if current_idx + 1 < len(RANK_STAGES) else None
+            next_info    = f"次のランク: **{next_rank['name']}** まで {next_rank['xp'] - current_xp:,} XP" if next_rank else "🏆 最高職位に到達！"
+            color        = RANK_COLORS.get(applicable_rank["name"], 0xFFD700)
+            # 人格に合わせたランクアップメッセージ（AI生成）
+            personality_key = await get_server_personality()
+            personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+            rankup_text = await _generate_rankup_message(
+                member, applicable_rank["name"], next_info,
+                personality_key, personality,
+            )
+            embed = discord.Embed(
+                title="🎊 職階が上がりました！",
+                description=rankup_text,
+                color=color,
+            )
+            embed.add_field(name="現在の職階", value=f"**{applicable_rank['name']}**", inline=True)
+            embed.add_field(name="総XP",       value=f"**{current_xp:,} XP**",           inline=True)
+            embed.add_field(name="次の目標",   value=next_info,                           inline=False)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            if channel:
+                try:
+                    await channel.send(embed=embed)
+                except Exception as re:
+                    print(f"[WARN] rankup send failed: {re}")
+            # ② 表チャンネルにも全体投稿
+            general_ch = member.guild.get_channel(GENERAL_CHANNEL_ID)
+            if general_ch and general_ch != channel:
+                await general_ch.send(embed=embed)
+            user_data = await users_col.find_one({"_id": str(member.id)})
+            if user_data and user_data.get("title"):
+                await apply_nickname(member, user_data["title"])
+    except Exception as e:
+        print(f"[ERROR] Role: {e}")
+
+# =============================================================================
+# イベント
+# =============================================================================
+
+@client.event
+async def on_message(message: discord.Message):
+    try:
+        # Resumeループ対策: 30秒以上前のメッセージは処理しない
+        msg_age = (datetime.datetime.now(datetime.timezone.utc) - message.created_at).total_seconds()
+        if msg_age > 30:
+            return
+
+        if message.author.bot:
+            if str(message.author.id) in BOT_CONFIG:
+                await check_bump(message)
+            elif message.webhook_id:
+                await check_bump_webhook(message)
+            return
+
+        # === Phase 1: messages コレクションに記録 ===
+        try:
+            is_thread = hasattr(message.channel, 'parent_id') and message.channel.parent_id is not None
+            await messages_col.insert_one({
+                "_id":               str(message.id),
+                "guild_id":          str(message.guild.id) if message.guild else "",
+                "channel_id":        str(message.channel.id),
+                "channel_name":      getattr(message.channel, "name", ""),
+                "author_id":         str(message.author.id),
+                "author_name":       message.author.display_name,
+                "content":           message.content[:2000],
+                "timestamp":         message.created_at,
+                "is_thread":         is_thread,
+                "parent_channel_id": str(message.channel.parent_id) if is_thread else "",
+                "created_at":        datetime.datetime.now(datetime.timezone.utc),
+            })
+        except Exception as _log_e:
+            if "duplicate" not in str(_log_e).lower():
+                print(f"[WARN] messages log failed: {_log_e}")
+
+        uid        = str(message.author.id)
+        now        = datetime.datetime.now(datetime.timezone.utc)
+        is_booster = any(r.id == BOOSTER_ROLE_ID for r in message.author.roles)
+
+        # ブースター専用チャンネル（メッセージだけで自動応答・ブースターのみ）
+        if message.channel.id == BUTLER_CHANNEL_ID:
+            if is_booster:
+                await maid_respond_queued(message)
+            else:
+                await message.reply(
+                    "このチャンネルはサーバーブースター専用だよ…✨\n"
+                    "サーバーをブーストすると、ここでメイドと自由に話せるようになるにゃ！",
+                    delete_after=10,
+                )
+            return
+
+        # メンションで全員がメイドと会話できる（全員ブースター品質）
+        if client.user in message.mentions:
+            _content = re.sub(r"<@!?\d+>", "", message.content).strip()
+            if _content:
+                await maid_respond_queued(message)
+            return
+
+        # XP処理（NGワード処理はprobotに移行済みのためシンプル化）
+        user_data  = await users_col.find_one({"_id": uid}) or {}
+        last_xp_at = user_data.get("last_xp_at")
+        on_cooldown = (
+            last_xp_at is not None and
+            (now - ensure_utc(last_xp_at)).total_seconds() < XP_COOLDOWN_SECONDS
+        )
+        if not on_cooldown:
+            gain = calculate_xp_gain(message.content, user_data.get("last_content", ""))
+            if gain > 0:
+                if is_booster:
+                    gain = int(gain * BOOSTER_XP_MULTIPLIER)
+                # 連続参加ボーナス判定
+                streak_bonus  = 0
+                streak_msg    = ""
+                today_jst     = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).date()
+                last_date     = user_data.get("last_active_date")
+                streak        = user_data.get("streak_days", 0)
+                is_new_day    = False  # 今日初めての発言かどうか
+                if last_date:
+                    last_d    = last_date if isinstance(last_date, datetime.date) else datetime.date.fromisoformat(str(last_date)[:10])
+                    diff      = (today_jst - last_d).days
+                    if diff == 1:
+                        streak    += 1
+                        is_new_day = True
+                    elif diff > 1:
+                        streak     = 1
+                        is_new_day = True
+                    # diff == 0（同日）は is_new_day = False のまま
+                else:
+                    streak     = 1
+                    is_new_day = True
+                # ボーナスは新しい日の最初の発言時のみ付与
+                if is_new_day:
+                    for days, bonus in sorted(STREAK_BONUSES.items()):
+                        if streak == days:
+                            streak_bonus = bonus
+                            streak_msg   = f"🔥 **{days}日連続参加ボーナス！** +{bonus:,} XP"
+                            break
+
+                user_data = await users_col.find_one_and_update(
+                    {"_id": uid},
+                    {"$inc": {"xp": gain + streak_bonus}, "$set": {
+                        "name":             message.author.display_name,
+                        "last_content":     message.content,
+                        "last_xp_at":       now,
+                        "last_active_date": today_jst.isoformat(),
+                        "streak_days":      streak,
+                    }},
+                    upsert=True, return_document=True,
+                )
+                if streak_bonus and streak_msg:
+                    await message.channel.send(f"{message.author.mention} {streak_msg}")
+                await update_member_role(message.author, user_data.get("xp", 0), message.channel)
+
+        # 全ユーザー: 発言ログ蓄積 + nonbooster_history→butler_historyへの自動マイグレーション
+        if message.content.strip():
+            # nonbooster_historyが残っていればbutler_historyにマイグレーション（初回のみ）
+            if user_data.get("nonbooster_history") and not user_data.get("nb_migrated"):
+                nb_hist = user_data.get("nonbooster_history", [])
+                existing_butler = user_data.get("butler_history", [])
+                if not existing_butler:
+                    # butler_historyが空の場合のみ移行（上書きしない）
+                    migrated = nb_hist[-20:]  # 直近20件
+                    await users_col.update_one(
+                        {"_id": uid},
+                        {"$set": {"butler_history": migrated, "nb_migrated": True}},
+                        upsert=True,
+                    )
+                    print(f"[migrate] nonbooster_history→butler_history: {message.author.display_name} ({len(migrated)}件)")
+                else:
+                    await users_col.update_one(
+                        {"_id": uid}, {"$set": {"nb_migrated": True}}, upsert=True
+                    )
+
+            # 性格分析: 10発言ごとにバックグラウンド実行（全ユーザー対象）
+            nb_count = user_data.get("conv_count_nb", 0) + 1
+            await users_col.update_one(
+                {"_id": uid},
+                {"$set": {"conv_count_nb": nb_count, "name": message.author.display_name}},
+                upsert=True,
+            )
+            if nb_count % 30 == 0:  # 30発言ごとに変更（レート制限対策）
+                asyncio.create_task(_analyze_nonbooster_realtime(uid, message.author.display_name))
+
+        # 自発的話しかけ（全ユーザー対象・ブースター専用チャンネルは除外）
+        if message.channel.id != BUTLER_CHANNEL_ID:
+            has_topic = any(w in message.content for w in TOPIC_TRIGGER_WORDS)
+            nb_chance = NB_TALK_CHANCE_TOPIC if has_topic else NB_TALK_CHANCE
+            if random.random() < nb_chance:
+                asyncio.create_task(_nb_spontaneous_talk(message))
+
+    except Exception as e:
+        print(f"[ERROR] on_message: {e}")
+        traceback.print_exc()
+
+
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    try:
+        data       = payload.data
+        author     = data.get("author", {})
+        is_bot     = author.get("bot", False)
+        webhook_id = data.get("webhook_id", "")
+        if not is_bot and not webhook_id:
+            return
+        content    = data.get("content", "")
+        embeds     = data.get("embeds", [])
+        embed_text = " ".join(
+            " ".join([
+                e.get("title", ""), e.get("description", ""),
+                " ".join(f.get("value", "") for f in e.get("fields", []))
+            ]) for e in embeds
+        )
+        full_text = content + " " + embed_text
+        bump_words = ["アップしたよ", "移動しました", "表示順位", "Bump done", "掲載順位", "bumped",
+                      "最上段に更新されました"]
+        if not any(w in full_text for w in bump_words):
+            return
+        if await _is_bump_already_processed(str(payload.message_id)):
+            return
+        author_id = author.get("id", "")
+        guild     = client.get_guild(payload.guild_id)
+        channel   = guild.get_channel(payload.channel_id) if guild else None
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+        except Exception as fe:
+            print(f"[ERROR] on_raw_message_edit fetch: {fe}")
+            return
+        if author_id in BOT_CONFIG:
+            await check_bump(msg)
+        else:
+            await check_bump_webhook(msg)
+    except Exception as e:
+        print(f"[ERROR] on_raw_message_edit: {e}")
+
+
+# on_socket_raw_receive 削除済み（on_messageと二重処理で429の原因）
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    """スラッシュコマンドのレスポンス検出（ディス速・Dislist対応）
+    これらはon_messageに来ないためこちらで処理する。
+    """
+    try:
+        if not interaction.message:
+            return
+        msg = interaction.message
+        if not msg.author.bot:
+            return
+
+        embed_text = " ".join(extract_embed_text(e) for e in msg.embeds)
+        full_text  = msg.content + " " + embed_text
+        bump_words = ["アップしたよ", "移動しました", "表示順位", "Bump done", "掲載順位", "bumped"]
+
+        if not any(w in full_text for w in bump_words):
+            return
+
+        print(f"[DEBUG-INTERACTION] id={msg.author.id} name={msg.author.name!r} "
+              f"in_BOT_CONFIG={str(msg.author.id) in BOT_CONFIG} "
+              f"text={full_text[:80]!r}")
+
+        if str(msg.author.id) in BOT_CONFIG:
+            await check_bump(msg)
+        elif msg.webhook_id:
+            await check_bump_webhook(msg)
+        else:
+            print(f"[DEBUG-INTERACTION] 未登録Bot: id={msg.author.id}")
+    except Exception as e:
+        print(f"[ERROR] on_interaction(bump): {e}")
+
+
+# =============================================================================
+# Bump処理
+# =============================================================================
+
+# 重複処理防止（同一メッセージIDを短時間に二重処理しない）
+_processed_bump_ids: set = set()
+
+async def _is_bump_already_processed(message_id: str) -> bool:
+    """同一BumpメッセージIDが既に処理済みかチェック・登録"""
+    mid = str(message_id)
+    if mid in _processed_bump_ids:
+        return True
+    _processed_bump_ids.add(mid)
+    # メモリ節約: 500件超えたら古い半分を削除
+    if len(_processed_bump_ids) > 500:
+        old_ids = list(_processed_bump_ids)[:250]
+        for oid in old_ids:
+            _processed_bump_ids.discard(oid)
+    return False
+
+
+async def check_bump(message: discord.Message):
+    # 重複処理防止
+    if await _is_bump_already_processed(str(message.id)):
+        print(f"[bump] 重複スキップ: {message.id}")
+        return
+
+    bot_id = str(message.author.id)
+    config = BOT_CONFIG[bot_id]
+
+    embed_text = " ".join(extract_embed_text(e) for e in message.embeds)
+    full_text  = message.content + " " + embed_text
+
+    if not any(word in full_text for word in config["keywords"]):
+        return
+
+    user = None
+    if message.interaction_metadata:
+        try:
+            meta    = message.interaction_metadata
+            user_id = getattr(meta, 'user_id', None) or getattr(meta, 'user', None)
+            if isinstance(user_id, int):
+                user = message.guild.get_member(user_id)
+            elif hasattr(user_id, 'id'):
+                user = message.guild.get_member(user_id.id)
+        except Exception as e:
+            print(f"[ERROR] interaction_metadata: {e}")
+
+    if user is None and message.mentions:
+        user = message.mentions[0]
+    if not user:
+        return
+
+    updated = await users_col.find_one_and_update(
+        {"_id": str(user.id)},
+        {"$inc": {"bump_count": 1, "xp": 100}, "$set": {"name": user.display_name}},
+        upsert=True, return_document=True,
+    )
+    await system_col.update_one(
+        {"_id": bot_id},
+        {"$set": {"last_bump_at": datetime.datetime.now(datetime.timezone.utc), "notified": False}},
+        upsert=True,
+    )
+    await message.add_reaction("✨")
+    personality_key = await get_server_personality()
+    personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+    bump_text = personality["bump_msg"].format(
+        user=user.mention,
+        count=updated.get("bump_count", 0),
+    )
+    await message.channel.send(bump_text)
+
+async def check_bump_webhook(message: discord.Message):
+    """Webhook経由で送信されるBump Bot（Fortify/ディス速/Dislist等）の検出"""
+    # 重複処理防止
+    if await _is_bump_already_processed(str(message.id)):
+        print(f"[bump] webhook重複スキップ: {message.id}")
+        return
+
+    embed_text = " ".join(extract_embed_text(e) for e in message.embeds)
+    full_text  = message.content + " " + embed_text
+
+    # 全BOT_CONFIGのキーワードと照合
+    matched_id = None
+    for bot_id, config in BOT_CONFIG.items():
+        if any(word in full_text for word in config["keywords"]):
+            matched_id = bot_id
+            break
+    if not matched_id:
+        return
+
+    config = BOT_CONFIG[matched_id]
+
+    # /upを実行したユーザーを特定
+    user = None
+    if message.interaction_metadata:
+        try:
+            meta    = message.interaction_metadata
+            user_id = getattr(meta, 'user_id', None) or getattr(meta, 'user', None)
+            if isinstance(user_id, int):
+                user = message.guild.get_member(user_id)
+            elif hasattr(user_id, 'id'):
+                user = message.guild.get_member(user_id.id)
+        except Exception as e:
+            print(f"[ERROR] webhook bump interaction_metadata: {e}")
+
+    if user is None and message.mentions:
+        user = message.mentions[0]
+    if not user:
+        # メンションもinteractionもない場合はEmbedのdescriptionからメンションを探す
+        import re as _re
+        mention_match = _re.search(r"<@!?(\d+)>", full_text)
+        if mention_match:
+            uid  = int(mention_match.group(1))
+            user = message.guild.get_member(uid)
+    if not user:
+        print(f"[WARN] check_bump_webhook: ユーザー特定できず ({config['name']})")
+        return
+
+    updated = await users_col.find_one_and_update(
+        {"_id": str(user.id)},
+        {"$inc": {"bump_count": 1, "xp": 100}, "$set": {"name": user.display_name}},
+        upsert=True, return_document=True,
+    )
+    await system_col.update_one(
+        {"_id": matched_id},
+        {"$set": {"last_bump_at": datetime.datetime.now(datetime.timezone.utc), "notified": False}},
+        upsert=True,
+    )
+    await message.add_reaction("✨")
+    personality_key = await get_server_personality()
+    personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+    bump_text = personality["bump_msg"].format(
+        user=user.mention,
+        count=updated.get("bump_count", 0),
+    )
+    await message.channel.send(bump_text)
+    print(f"[bump] Webhook検出: {config['name']} / user={user.display_name}")
+
+
+# =============================================================================
+# スラッシュコマンド
+# =============================================================================
+
+@client.tree.command(name="rank", description="ステータスを表示")
+async def rank_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    target     = member or interaction.user
+    user_data  = await users_col.find_one({"_id": str(target.id)}) or {}
+    xp         = user_data.get("xp", 0)
+    title      = user_data.get("title", "無名の")
+    bump_count = user_data.get("bump_count", 0)
+    rank_name, current_floor, next_floor, progress = get_rank_info(xp)
+
+    bar   = "█" * (progress // 10) + "░" * (10 - progress // 10)
+    embed = discord.Embed(title=f"📊 {target.display_name} のステータス", color=0x3498DB)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="二つ名", value=f"**{title}**",      inline=False)
+    embed.add_field(name="職階",   value=f"**{rank_name}**",  inline=True)
+    embed.add_field(name="総XP",   value=f"**{xp:,}**",       inline=True)
+    embed.add_field(name="Bump数", value=f"**{bump_count}**", inline=True)
+    embed.add_field(
+        name=f"次の職階まで ({progress}%)",
+        value=f"`{bar}` {xp - current_floor:,} / {next_floor - current_floor:,} XP",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@client.tree.command(name="top", description="XPランキングを表示")
+async def top_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed    = discord.Embed(title="🏆 XPランキング TOP10", color=0xF1C40F)
+    medals   = {1: "🥇", 2: "🥈", 3: "🥉"}
+    rank_num = 1
+    async for doc in users_col.find().sort("xp", -1).limit(10):
+        medal = medals.get(rank_num, f"**{rank_num}.**")
+        embed.add_field(
+            name=f"{medal} {doc.get('name', '不明')}",
+            value=f"{doc.get('xp', 0):,} XP",
+            inline=False,
+        )
+        rank_num += 1
+    await interaction.followup.send(embed=embed)
+
+
+@client.tree.command(name="luckytitle", description="今日のラッキー二つ名を生成")
+async def luckytitle_cmd(interaction: discord.Interaction):
+    seed  = f"{interaction.user.id}-{datetime.date.today()}"
+    rng   = random.Random(seed)
+    title = rng.choice(LUCKY_ADJECTIVES) + rng.choice(LUCKY_NOUNS)
+    embed = discord.Embed(
+        title="🎲 今日のラッキー二つ名",
+        description=f"{interaction.user.mention} の今日の二つ名は...\n# 「{title}」\n\nニックネームに反映する場合は下のボタンを押してね！",
+        color=0x9B59B6,
+    )
+    view = LuckyTitleView(title=title, member=interaction.user)
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
+@client.tree.command(name="as", description="二つ名を設定する")
+async def set_title_cmd(interaction: discord.Interaction, title: str):
+    if len(title) > 20:
+        await interaction.response.send_message("二つ名は20文字以内にしてね！", ephemeral=True)
+        return
+    await users_col.update_one(
+        {"_id": str(interaction.user.id)},
+        {"$set": {"title": title, "name": interaction.user.name}},
+        upsert=True,
+    )
+    member       = interaction.guild.get_member(interaction.user.id)
+    nick_applied = await apply_nickname(member, title) if member else False
+    msg  = f"✅ 二つ名を **「{title}」** に設定したよ！"
+    msg += f"\nニックネームも **「{title}」{interaction.user.name}** に変更したよ！" if nick_applied \
+          else "\n※ニックネームの変更権限がないため変更されませんでした。"
+    await interaction.response.send_message(msg)
+
+
+@client.tree.command(name="maid", description="メイドに話しかける（メンションでも会話できます）")
+@app_commands.describe(message="メイドに伝えたいこと")
+async def maid_cmd(interaction: discord.Interaction, message: str):
+    await interaction.response.defer()
+    await maid_respond_cmd(interaction, message)
+
+
+@client.tree.command(name="personality", description="メイドの性格を変更する（全員使用可）")
+@app_commands.default_permissions(send_messages=True)
+async def personality_cmd(interaction: discord.Interaction):
+    current_key = await get_server_personality()
+    current     = PERSONALITIES[current_key]
+    embed = discord.Embed(
+        title="🎭 メイドの性格を変更する",
+        description=f"現在の性格: **{current['label']}**\n\nサーバー全員に反映されます。好きな性格を選んでね！",
+        color=current["color"],
+    )
+    view = PersonalityView(invoker=interaction.user)
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
+@client.tree.command(name="myprofile", description="AIが記憶しているあなたの情報を確認する")
+async def myprofile_cmd(interaction: discord.Interaction):
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+
+    await interaction.response.defer(ephemeral=True)
+
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}) or {}
+    xp  = doc.get("xp", 0)
+    rank_name, _, _, _ = get_rank_info(xp)
+
+    if is_booster:
+        # ブースター: 全項目表示
+        profile    = doc.get("profile", {})
+        title      = doc.get("title", "")
+        conv_count = doc.get("conv_count", 0)
+
+        embed = discord.Embed(title="🧠 AIが記憶しているあなたの情報", color=0xFF69B4)
+        embed.add_field(name="ランク / XP", value=f"{rank_name} / {xp:,} XP", inline=True)
+        embed.add_field(name="二つ名",      value=title or "なし",             inline=True)
+        embed.add_field(name="誕生日",      value=profile.get("birthday") or "不明", inline=True)
+        embed.add_field(name="口調の特徴",  value=profile.get("tone") or "まだ分析中", inline=False)
+        if profile.get("tone_self"):
+            embed.add_field(name="口調の自己申告（優先）", value=profile["tone_self"], inline=False)
+        embed.add_field(name="口癖・語彙", value=profile.get("vocabulary") or "まだ分析中", inline=False)
+        hobbies = ", ".join(profile.get("hobbies") or []) or "なし"
+        memo    = ", ".join(profile.get("memo") or []) or "なし"
+        embed.add_field(name="趣味・好きなもの",          value=hobbies, inline=False)
+        embed.add_field(name="性格",                      value=profile.get("personality") or "まだ分析中", inline=False)
+        embed.add_field(name="コミュニケーションスタイル", value=profile.get("communication_style") or "まだ分析中", inline=False)
+        embed.add_field(name="サーバー内の立場",           value=profile.get("background") or "まだ分析中", inline=False)
+        embed.add_field(name="よく絡むメンバー",           value=profile.get("relations") or "まだ分析中", inline=False)
+        embed.add_field(name="関心・雰囲気",               value=profile.get("interests_vibe") or "まだ分析中", inline=False)
+        embed.add_field(name="メモ",                      value=memo, inline=False)
+        embed.set_footer(text=f"会話するたびに自動更新 / 累計会話数: {conv_count}回 • /editprofile で編集できます")
+
+    else:
+        # 非ブースター: simple_profileの内容を表示
+        sp = doc.get("simple_profile", {})
+
+        embed = discord.Embed(title="🧠 AIが記憶しているあなたの情報", color=0x99AAB5)
+        embed.add_field(name="ランク / XP", value=f"{rank_name} / {xp:,} XP", inline=True)
+
+        if not sp:
+            embed.description = "まだデータがありません。\nもう少し会話するとAIが分析を始めます！"
+        else:
+            if sp.get("vibe"):
+                embed.add_field(name="雰囲気",           value=sp["vibe"], inline=False)
+            if sp.get("tone_tags"):
+                embed.add_field(name="口調の特徴",       value="・".join(sp["tone_tags"]), inline=False)
+            if sp.get("personality"):
+                embed.add_field(name="性格",             value=sp["personality"], inline=False)
+            if sp.get("background"):
+                embed.add_field(name="サーバー内の立場", value=sp["background"], inline=False)
+            if sp.get("relations"):
+                embed.add_field(name="人間関係",         value=sp["relations"], inline=False)
+            if sp.get("frequent_members"):
+                embed.add_field(name="よく絡むメンバー", value="・".join(sp["frequent_members"]), inline=False)
+        embed.set_footer(text="毎日自動更新 • ブースターになると詳細プロフィール＆編集機能が使えます")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+class EditProfileModal(discord.ui.Modal, title="プロフィールを編集"):
+    birthday = discord.ui.TextInput(
+        label="誕生日",
+        placeholder="例: 03-15（MM-DD形式）",
+        required=False, max_length=10,
+    )
+    hobbies = discord.ui.TextInput(
+        label="趣味・好きなもの",
+        placeholder="例: ゲーム, アニメ, 料理（カンマ区切り）",
+        required=False, max_length=200,
+    )
+    memo = discord.ui.TextInput(
+        label="自己紹介メモ",
+        placeholder="例: 深夜によく出没します・猫好き",
+        required=False, max_length=300,
+        style=discord.TextStyle.paragraph,
+    )
+    tone_self = discord.ui.TextInput(
+        label="口調の自己申告",
+        placeholder="例: 敬語なしで話してほしい・タメ口でOK",
+        required=False, max_length=100,
+    )
+
+    def __init__(self, current: dict):
+        super().__init__()
+        # 既存値を初期値としてセット（max_length以内にトリム）
+        if current.get("birthday"):
+            self.birthday.default = current["birthday"][:10]
+        if current.get("hobbies"):
+            self.hobbies.default = ", ".join(current["hobbies"])[:200]
+        if current.get("memo"):
+            val = ", ".join(current["memo"]) if isinstance(current["memo"], list) else str(current["memo"])
+            self.memo.default = val[:300]
+        if current.get("tone_self"):
+            self.tone_self.default = current["tone_self"][:100]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid     = str(interaction.user.id)
+        updates = {}
+
+        if self.birthday.value.strip():
+            updates["profile.birthday"] = self.birthday.value.strip()
+        if self.hobbies.value.strip():
+            updates["profile.hobbies"] = [
+                h.strip() for h in self.hobbies.value.split(",") if h.strip()
+            ]
+        if self.memo.value.strip():
+            updates["profile.memo"] = [
+                m.strip() for m in self.memo.value.split(",") if m.strip()
+            ]
+        if self.tone_self.value.strip():
+            updates["profile.tone_self"] = self.tone_self.value.strip()
+
+        if updates:
+            await users_col.update_one(
+                {"_id": uid},
+                {"$set": updates},
+                upsert=True,
+            )
+        await interaction.response.send_message(
+            "✅ プロフィールを更新しました！`/myprofile` で確認できます。",
+            ephemeral=True,
+        )
+
+
+@client.tree.command(name="editprofile", description="あなたのプロフィールを編集する（ブースター専用）")
+async def editprofile_cmd(interaction: discord.Interaction):
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    if not is_booster:
+        await interaction.response.send_message("このコマンドはブースター専用だよ。", ephemeral=True)
+        return
+    uid     = str(interaction.user.id)
+    doc     = await users_col.find_one({"_id": uid}) or {}
+    profile = doc.get("profile", {})
+    await interaction.response.send_modal(EditProfileModal(profile))
+
+
+@client.tree.command(name="clearmaid", description="メイドとの会話履歴をリセットする（ブースター専用）")
+async def clearmaid_cmd(interaction: discord.Interaction):
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    if not is_booster:
+        await interaction.response.send_message("このコマンドはブースター専用だよ。", ephemeral=True)
+        return
+    await users_col.update_one(
+        {"_id": str(interaction.user.id)},
+        {"$set": {"butler_history": []}},
+        upsert=True,
+    )
+    await interaction.response.send_message("…記憶を、整理いたしました。", ephemeral=True)
+
+
+@client.tree.command(name="setxp", description="【管理者専用】指定メンバーのXPを設定する")
+@app_commands.describe(member="対象メンバー", xp="設定するXP量")
+@app_commands.default_permissions(administrator=True)
+async def setxp_cmd(interaction: discord.Interaction, member: discord.Member, xp: int):
+    if not await check_home_guild(interaction):
+        return
+    if xp < 0:
+        await interaction.response.send_message("XPは0以上で指定してね！", ephemeral=True)
+        return
+    await users_col.update_one(
+        {"_id": str(member.id)},
+        {"$set": {"xp": xp, "name": member.display_name}},
+        upsert=True,
+    )
+    await update_member_role(member, xp, interaction.channel)
+    rank_name, _, _, _ = get_rank_info(xp)
+    await interaction.response.send_message(
+        f"✅ **{member.display_name}** のXPを **{xp:,}** に設定したよ！\n現在の職階: **{rank_name}**",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="report", description="過去の日報を検索して表示（ブースター専用）")
+@app_commands.describe(date="日付・期間を入力（例: 2025-03-01 / 昨日 / 先週月曜）")
+async def report_cmd(interaction: discord.Interaction, date: str = "今日"):
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    if not is_booster:
+        await interaction.response.send_message("このコマンドはブースター専用だよ。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    try:
+        from datetime import date as date_cls, timedelta
+        import re
+
+        # 日付文字列を解釈してdatetimeに変換
+        now_jst  = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        today    = now_jst.date()
+
+        def parse_date(s: str):
+            s = s.strip()
+            if s in ("今日", "today"):
+                return today, today
+            if s in ("昨日", "yesterday"):
+                d = today - timedelta(days=1)
+                return d, d
+            if "先週" in s:
+                # 先週全体 or 先週月曜など
+                days_back = 7
+                if "月" in s: offset = 0
+                elif "火" in s: offset = 1
+                elif "水" in s: offset = 2
+                elif "木" in s: offset = 3
+                elif "金" in s: offset = 4
+                elif "土" in s: offset = 5
+                elif "日" in s: offset = 6
+                else:
+                    # 先週全体
+                    start = today - timedelta(days=today.weekday() + 7)
+                    end   = start + timedelta(days=6)
+                    return start, end
+                d = today - timedelta(days=today.weekday() + 7 - offset)
+                return d, d
+            # YYYY-MM-DD形式
+            m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+            if m:
+                d = date_cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                return d, d
+            # MM-DD形式
+            m = re.match(r"(\d{1,2})-(\d{1,2})", s)
+            if m:
+                d = date_cls(today.year, int(m.group(1)), int(m.group(2)))
+                return d, d
+            return today, today
+
+        start_date, end_date = parse_date(date)
+
+        # MongoDBから該当期間の日報を取得
+        start_dt = datetime.datetime(start_date.year, start_date.month, start_date.day,
+                           tzinfo=datetime.timezone.utc).isoformat()
+        end_dt   = datetime.datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59,
+                           tzinfo=datetime.timezone.utc).isoformat()
+
+        docs = await summaries_col.find(
+            {"created_at": {"$gte": start_dt, "$lte": end_dt}}
+        ).sort("created_at", -1).to_list(length=5)
+
+        if not docs:
+            await interaction.followup.send(
+                f"📭 `{date}` の日報は見つかりませんでした。",
+                ephemeral=True
+            )
+            return
+
+        # 複数件ある場合は最新1件を表示（範囲指定時は件数も表示）
+        doc      = docs[0]
+        summary  = doc.get("summary", "")[:800]
+        created  = doc.get("created_at", "")[:10]
+        msg_cnt  = doc.get("message_count", 0)
+
+        embed = discord.Embed(
+            title=f"📰 {created} の日報",
+            description=summary + ("…" if len(doc.get("summary","")) > 800 else ""),
+            color=0x5865F2,
+        )
+        embed.add_field(name="メッセージ数", value=f"{msg_cnt}件", inline=True)
+        if len(docs) > 1:
+            embed.add_field(name="該当件数", value=f"{len(docs)}件（最新を表示）", inline=True)
+        embed.set_footer(text=f"検索キーワード: {date}")
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[ERROR] report_cmd: {e}")
+        await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
+
+
+@client.tree.command(name="mimic", description="指定メンバーの深層心理をAIが代弁（ブースター専用）")
+@app_commands.describe(member="ミミック対象のメンバー")
+async def mimic_cmd(interaction: discord.Interaction, member: discord.Member):
+    # ブースター確認
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    if not is_booster:
+        await interaction.response.send_message("このコマンドはブースター専用です。", ephemeral=True)
+        return
+
+    # 対象者のデータ確認
+    target_uid = str(member.id)
+    doc        = await users_col.find_one({"_id": target_uid}) or {}
+    has_data   = bool(doc.get("profile") or doc.get("simple_profile") or doc.get("butler_history"))
+
+    if not has_data:
+        await interaction.response.send_message(
+            f"**{member.display_name}** のデータがまだ少なくてミミックできません…\nもう少し会話が蓄積されてから試してください。",
+            ephemeral=True,
+        )
+        return
+
+    # 既存セッションチェック
+    if interaction.channel_id in _mimic_sessions:
+        existing = _mimic_sessions[interaction.channel_id]
+        await interaction.response.send_message(
+            f"すでに **{existing['target_name']}** のミミックが進行中です。\n`/stopmimic` で停止してから再度お試しください。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    # セッション開始
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
+    session = {
+        "target_uid":  target_uid,
+        "target_name": member.display_name,
+        "avatar_url":  member.display_avatar.url,
+        "expires_at":  expires_at,
+        "turn_count":  0,
+        "webhook":     None,
+        "invoker":     str(interaction.user.id),
+    }
+    _mimic_sessions[interaction.channel_id] = session
+
+    # ログ記録
+    await system_col.insert_one({
+        "type":        "mimic_log",
+        "invoker_id":  str(interaction.user.id),
+        "invoker_name": interaction.user.display_name,
+        "target_id":   target_uid,
+        "target_name": member.display_name,
+        "channel_id":  str(interaction.channel_id),
+        "started_at":  datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+
+    await interaction.followup.send(
+        f"🎭 **{member.display_name}** の深層心理モード開始（5分間）\n"
+        f"チャンネルの流れに反応して本音を代弁します。`/stopmimic` で停止。",
+    )
+    asyncio.create_task(_run_mimic_session(interaction.channel, session))
+
+    # 5分後に自動終了
+    async def _auto_end():
+        await asyncio.sleep(300)
+        removed = _mimic_sessions.pop(interaction.channel_id, None)
+        if removed:
+            try:
+                await interaction.channel.send(
+                    f"🎭 **{member.display_name}** の深層心理モードが終了しました。"
+                )
+            except Exception:
+                pass
+    asyncio.create_task(_auto_end())
+
+
+@client.tree.command(name="stopmimic", description="進行中のミミックセッションを停止（ブースター専用）")
+async def stopmimic_cmd(interaction: discord.Interaction):
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    if not is_booster:
+        await interaction.response.send_message("このコマンドはブースター専用です。", ephemeral=True)
+        return
+
+    session = _mimic_sessions.pop(interaction.channel_id, None)
+    if session:
+        await interaction.response.send_message(
+            f"🎭 **{session['target_name']}** のミミックを停止しました。"
+        )
+    else:
+        await interaction.response.send_message("進行中のミミックはありません。", ephemeral=True)
+
+
+def _build_retro_embeds(doc: dict) -> list[dict]:
+    """既存の遡及日報からDiscord Embedリストを構築する"""
+    import re as _re2
+    summary    = doc.get("summary", "（要約なし）")
+    retro_date = doc.get("retro_date", "")
+    msg_count  = doc.get("message_count", 0)
+    now_jst    = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    ICONS = {
+        "全体の雰囲気": "🌡️", "主なトピック": "📌", "感情の波": "🎢",
+        "注目の発言": "💬", "今日の内輪ネタ": "🔑", "メンバーの人間関係": "🤝",
+        "ユーザーの感情状態": "😊", "直近の話題": "🔥", "会話の特徴": "✨",
+    }
+    parts = _re2.split(r"\n##\s+", "\n" + summary)
+    sections = []
+    for part in parts:
+        if not part.strip():
+            continue
+        split = part.strip().split("\n", 1)
+        title = split[0].strip()
+        body  = split[1].strip() if len(split) > 1 else ""
+        if title and body:
+            sections.append((title, body))
+    fields = []
+    for title, body in sections:
+        icon = next((v for k, v in ICONS.items() if k in title), "📋")
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"{icon} {title}", "value": body, "inline": False})
+    fields.append({"name": "📊 集計",
+                   "value": f"対象日: {retro_date} / メッセージ数: {msg_count:,}件",
+                   "inline": False})
+    title_str = f"📜 {retro_date} の過去日報（再掲）"
+    embeds, current_fields, current_chars = [], [], 0
+    for field in fields:
+        fc = len(field["name"]) + len(field["value"])
+        if (current_chars + fc > 5800 or len(current_fields) >= 25) and current_fields:
+            embed = {"color": 0x8B4513, "fields": current_fields,
+                     "title": title_str if not embeds else f"📜 {retro_date} の過去日報（再掲・続き）"}
+            embeds.append(embed)
+            current_fields, current_chars = [], 0
+        current_fields.append(field)
+        current_chars += fc
+    if current_fields:
+        embeds.append({
+            "color":  0x8B4513,
+            "title":  title_str if not embeds else f"📜 {retro_date} の過去日報（再掲・続き）",
+            "fields": current_fields,
+            "footer": {"text": f"空気くん遡及日報（再掲） • {now_jst.strftime('%H:%M')} JST"},
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        })
+    return embeds
+
+
+@client.tree.command(name="retroreport", description="過去の指定日の日報を作成（管理者・ブースター専用）")
+@app_commands.describe(
+    date="対象日付（例: 2026-03-01）",
+    force="既存の日報を無視して強制的に作り直す（壊れた日報の再生成用）",
+)
+async def retroreport_cmd(interaction: discord.Interaction, date: str, force: bool = False):
+    if not await check_home_guild(interaction):
+        return
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    is_admin   = interaction.user.guild_permissions.administrator
+    if not (is_booster or is_admin):
+        await interaction.response.send_message("このコマンドは管理者またはブースター専用です。", ephemeral=True)
+        return
+
+    import re as _re
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", date.strip()):
+        await interaction.response.send_message(
+            "日付は `YYYY-MM-DD` 形式で入力してください。\n例: `2026-03-01`",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    # 既存日報チェック → あれば再投稿して終了（force 指定時は無視して再生成）
+    existing = await summaries_col.find_one({"retro_date": date.strip()})
+    if existing and not force:
+        embeds = _build_retro_embeds(existing)
+        for i in range(0, len(embeds), 10):
+            await interaction.channel.send(embeds=[
+                discord.Embed.from_dict(e) for e in embeds[i:i+10]
+            ])
+        await interaction.followup.send(
+            f"📜 **{date}** の日報はすでに作成済みでした。上に再掲しました！",
+            ephemeral=True,
+        )
+        return
+
+    # 既存なし → GitHub Actions をトリガー
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    gh_repo  = os.environ.get("GITHUB_REPO")
+    if not gh_token or not gh_repo:
+        await interaction.followup.send(
+            "⚠️ GitHub連携が設定されていません。管理者に `GITHUB_TOKEN` と `GITHUB_REPO` の設定を依頼してください。",
+            ephemeral=True,
+        )
+        return
+
+    import aiohttp
+    url     = f"https://api.github.com/repos/{gh_repo}/actions/workflows/retro_report.yml/dispatches"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {"ref": "main", "inputs": {"target_date": date.strip()}}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 204:
+                    note = "（既存日報を上書きで再生成します）" if (existing and force) else ""
+                    await interaction.followup.send(
+                        f"📜 **{date}** の日報作成を開始しました！{note}\n数分後に日報チャンネルに投稿されます。"
+                    )
+                else:
+                    body = await resp.text()
+                    await interaction.followup.send(
+                        f"❌ GitHub Actions のトリガーに失敗しました。\n`{resp.status}: {body[:200]}`",
+                        ephemeral=True,
+                    )
+    except Exception as e:
+        print(f"[ERROR] retroreport_cmd: {e}")
+        await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
+
+
+@client.tree.command(name="focus", description="特定メンバー or キーワードに絞った要約を作成（管理者・ブースター専用）")
+@app_commands.describe(
+    member="対象メンバー（@メンションで指定）",
+    keyword="対象キーワード（例: Among Us・SNR問題）",
+)
+async def focus_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member = None,
+    keyword: str = None,
+):
+    if not await check_home_guild(interaction):
+        return
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    is_admin   = interaction.user.guild_permissions.administrator
+    if not (is_booster or is_admin):
+        await interaction.response.send_message("このコマンドは管理者またはブースター専用です。", ephemeral=True)
+        return
+
+    if not member and not keyword:
+        await interaction.response.send_message(
+            "`member` か `keyword` のどちらかを指定してください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    gh_repo  = os.environ.get("GITHUB_REPO")
+    if not gh_token or not gh_repo:
+        await interaction.followup.send(
+            "⚠️ GitHub連携が設定されていません。", ephemeral=True
+        )
+        return
+
+    # パラメータ構築
+    focus_type   = "member" if member else "keyword"
+    focus_target = str(member.id) if member else keyword
+    focus_name   = member.display_name if member else keyword
+
+    import aiohttp
+    url     = f"https://api.github.com/repos/{gh_repo}/actions/workflows/focus_summary.yml/dispatches"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "focus_type":   focus_type,
+            "focus_target": focus_target,
+            "focus_name":   focus_name,
+        },
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 204:
+                    icon = "👤" if focus_type == "member" else "🔍"
+                    icon = "👤" if focus_type == "member" else "🔍"
+                    await interaction.followup.send(
+                        f"{icon} **{focus_name}** に絞った要約を作成中です！\n数分後にこのチャンネルに投稿されます。"
+                    )
+                else:
+                    body = await resp.text()
+                    await interaction.followup.send(
+                        f"❌ 失敗しました。\n`{resp.status}: {body[:200]}`",
+                        ephemeral=True,
+                    )
+    except Exception as e:
+        print(f"[ERROR] focus_cmd: {e}")
+        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
+
+
+@client.tree.command(name="addnick", description="【管理者専用】ニックネームを登録する")
+@app_commands.describe(nickname="登録するニックネーム（例: たろー）", realname="正式名称（例: 山田太郎）")
+@app_commands.default_permissions(administrator=True)
+async def addnick_cmd(interaction: discord.Interaction, nickname: str, realname: str):
+    if not await check_home_guild(interaction):
+        return
+    doc = await system_col.find_one({"_id": "nickname_map"}) or {"_id": "nickname_map", "map": {}}
+    nick_map = doc.get("map", {})
+    nick_map[nickname.strip()] = realname.strip()
+    await system_col.update_one(
+        {"_id": "nickname_map"},
+        {"$set": {"map": nick_map}},
+        upsert=True,
+    )
+    await interaction.response.send_message(
+        f"✅ `{nickname}` → `{realname}` を登録したよ！",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="removenick", description="【管理者専用】ニックネームを削除する")
+@app_commands.describe(nickname="削除するニックネーム")
+@app_commands.default_permissions(administrator=True)
+async def removenick_cmd(interaction: discord.Interaction, nickname: str):
+    if not await check_home_guild(interaction):
+        return
+    doc = await system_col.find_one({"_id": "nickname_map"}) or {}
+    nick_map = doc.get("map", {})
+    if nickname.strip() in nick_map:
+        del nick_map[nickname.strip()]
+        await system_col.update_one(
+            {"_id": "nickname_map"},
+            {"$set": {"map": nick_map}},
+            upsert=True,
+        )
+        await interaction.response.send_message(f"✅ `{nickname}` を削除したよ！", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ `{nickname}` は登録されていないよ。", ephemeral=True)
+
+
+@client.tree.command(name="listnick", description="【管理者専用】登録済みニックネーム一覧を表示")
+@app_commands.default_permissions(administrator=True)
+async def listnick_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    nick_map = await get_nickname_map()
+    if not nick_map:
+        await interaction.response.send_message("まだニックネームは登録されていないよ。", ephemeral=True)
+        return
+    lines = [f"・`{k}` → `{v}`" for k, v in nick_map.items()]
+    embed = discord.Embed(title="📝 登録済みニックネーム一覧", color=0x3498DB)
+    embed.description = "\n".join(lines)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@client.tree.command(name="summarystatus", description="【管理者専用】最新の要約状態を確認")
+@app_commands.default_permissions(administrator=True)
+async def summarystatus_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        doc = await summaries_col.find_one(
+            {"summary": {"$exists": True},
+             "is_retro": {"$ne": True},
+             "retro_date": {"$exists": False}},
+            sort=[("created_at", -1)]
+        )
+        if not doc:
+            await interaction.followup.send("⚠️ 要約レコードが見つかりません。バッチが未実行の可能性があります。", ephemeral=True)
+            return
+        summary       = doc.get("summary", "")[:300]
+        created_at    = doc.get("created_at", "不明")
+        message_count = doc.get("message_count", 0)
+        embed = discord.Embed(title="📋 要約ステータス", color=0x00FF88)
+        embed.add_field(name="作成日時",          value=created_at,           inline=True)
+        embed.add_field(name="対象メッセージ数",   value=f"{message_count}件", inline=True)
+        embed.add_field(name="要約（冒頭300字）",  value=summary + "…" if summary else "なし", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
+
+
+@client.tree.command(name="listmodels", description="【管理者専用】利用可能なGeminiモデル一覧を表示")
+@app_commands.default_permissions(administrator=True)
+async def listmodels_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        lines = []
+        for m in gemini_client.models.list():
+            if hasattr(m, 'name'):
+                lines.append(f"`{m.name}`")
+        if not lines:
+            await interaction.followup.send("利用可能なモデルが見つかりませんでした。", ephemeral=True)
+            return
+        chunk = "**利用可能なGeminiモデル一覧：**\n"
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1900:
+                await interaction.followup.send(chunk, ephemeral=True)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await interaction.followup.send(chunk, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ モデル一覧の取得に失敗したよ: {e}", ephemeral=True)
+
+
+# =============================================================================
+# キルスイッチ（緊急遮断 / ブレークグラス）
+#   オーナーが手動で発火する可逆・監査可能・OWNER専用の緊急遮断。
+#   自動発火は一切なし（どのイベントハンドラからも呼ばない）。
+# =============================================================================
+
+# @everyone で per-bot に直せない「危険権限」
+_PANIC_DANGEROUS_PERMS = (
+    "administrator", "ban_members", "kick_members",
+    "manage_guild", "manage_roles", "manage_channels",
+    "manage_webhooks", "mention_everyone",
+)
+
+
+def _panic_dangerous_perm_names(perms: discord.Permissions) -> list[str]:
+    """与えられた権限のうち危険なものの名前一覧。"""
+    out = []
+    for name in _PANIC_DANGEROUS_PERMS:
+        if getattr(perms, name, False):
+            out.append(name)
+    return out
+
+
+async def _panic_resolve_me(guild) -> "discord.Member | None":
+    """空気くん自身の Member を解決する。
+    fetch_guild 由来のギルドは guild.me が None になるため REST フォールバックする。
+    """
+    me = getattr(guild, "me", None)
+    if me is not None:
+        return me
+    try:
+        if client.user is not None:
+            return await guild.fetch_member(client.user.id)
+    except Exception as e:
+        print(f"[PANIC] _panic_resolve_me fetch失敗: {e}")
+    return None
+
+
+async def _panic_audit(guild, text: str):
+    """best-effort 監査ログ。print は必ず実行。ch 投稿失敗はキルを止めない。"""
+    print(f"[PANIC] {text}")
+    if not PANIC_LOG_CHANNEL_ID:
+        return
+    try:
+        ch = None
+        if guild is not None:
+            ch = guild.get_channel(PANIC_LOG_CHANNEL_ID)
+        if ch is None:
+            ch = client.get_channel(PANIC_LOG_CHANNEL_ID)
+        if ch is None:
+            ch = await client.fetch_channel(PANIC_LOG_CHANNEL_ID)
+        embed = discord.Embed(
+            title="🚨 キルスイッチ監査ログ",
+            description=text[:4000],
+            color=0xE74C3C,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        await ch.send(embed=embed)
+    except Exception as e:
+        # 混乱時に最も失敗しやすいのが ch 投稿。絶対にキルを止めない。
+        print(f"[PANIC] 監査ログ投稿失敗（無視して続行）: {e}")
+
+
+async def _panic_neutralize_bot(guild, target, mode: str, actor: str) -> dict:
+    """対象 bot を無力化する共有ヘルパ。例外を外に投げない（全体 try/except）。
+    戻り値は構造化 dict。health server / bot を絶対に落とさない。
+    """
+    try:
+        result = {
+            "ok": False,
+            "mode": mode,
+            "target": {"id": getattr(target, "id", None),
+                       "name": str(getattr(target, "name", "?"))},
+            "snapshot_id": None,
+            "actions": [],
+            "unactionable": [],
+            "warnings": [],
+            "reversibility": "",
+        }
+
+        # --- ガード ---
+        if mode not in ("strip", "kick", "ban"):
+            result["error"] = f"未知の mode: {mode}"
+            return result
+        if not getattr(target, "bot", False):
+            result["error"] = "v1 は bot のみ対象です（メンバー隔離は v2）。"
+            return result
+
+        me = await _panic_resolve_me(guild)
+        if me is None:
+            result["error"] = "空気くん自身のメンバー情報を取得できませんでした。"
+            return result
+        if target.id == me.id:
+            result["error"] = "空気くん自身は対象にできません。"
+            return result
+        if OWNER_ID == 0 or target.id == OWNER_ID:
+            result["error"] = "オーナーは対象にできません（または OWNER 未設定）。"
+            return result
+
+        my_top = me.top_role.position
+
+        # --- 原状から entries / warnings を構築（破壊操作の前に確定） ---
+        managed_entries = []      # 権限ゼロ化する managed ロール
+        non_managed_roles = []    # bot から外す非 managed ロール
+        membership_entries = []
+        critical_blocks = []      # managed なのに編集不可（=階層が下） → 全体 abort
+
+        for role in target.roles:
+            if role.is_default():   # @everyone
+                continue
+            editable = my_top > role.position
+            if role.managed:
+                if not editable:
+                    # managed（危険権限の在処）が編集不可 → critical
+                    critical_blocks.append(role)
+                else:
+                    managed_entries.append({
+                        "role_id": role.id,
+                        "role_name": role.name,
+                        "type": "managed",
+                        "perms": role.permissions.value,
+                    })
+            else:
+                if not editable:
+                    # 非 managed が外せない（階層が下）。危険権限を持つなら managed と同じく
+                    # critical 扱い（半端な無力化＝「効いたつもりで生きてる」を避ける）。
+                    danger = _panic_dangerous_perm_names(role.permissions)
+                    if danger:
+                        critical_blocks.append(role)
+                    else:
+                        result["unactionable"].append(
+                            f"{role.name}: 空気くんより上位（除去不可・危険権限なし）"
+                        )
+                else:
+                    non_managed_roles.append(role)
+                    membership_entries.append({
+                        "role_id": role.id,
+                        "role_name": role.name,
+                        "type": "membership",
+                    })
+
+        # @everyone の危険権限は per-bot で直せない → warnings のみ（変更しない）
+        try:
+            ev = guild.default_role
+            danger = _panic_dangerous_perm_names(ev.permissions)
+            if danger:
+                result["warnings"].append(
+                    "@everyone が危険権限を保持（per-bot では直せません）: " + ", ".join(danger)
+                )
+        except Exception:
+            pass
+
+        # strip で「危険権限の在処」を編集/除去できないなら「何もせず」明確に拒否
+        # （managed ロールの権限編集不可、または危険権限を持つ非managedロールが除去不可）。
+        # 部分無力化＝「効いたつもりで Wick が生きてる」最悪パターンを避ける。
+        if mode == "strip" and critical_blocks:
+            names = ", ".join(f"`{r.name}`" for r in critical_blocks)
+            result["error"] = (
+                f"⛔ 階層前提を満たしていません。空気くんを {names} より上に移動してください。"
+                "（危険権限の在処であるこれらのロールを編集/除去できないため、"
+                "半端な無力化を避けて中止しました）"
+            )
+            await _panic_audit(
+                guild,
+                f"neutralize ABORT target={target} mode={mode} actor={actor} "
+                f"理由=危険権限ロール編集/除去不可 {names}"
+            )
+            return result
+
+        entries = managed_entries + membership_entries
+        reversibility = {
+            "strip": "strip=完全可逆（managed権限の復元 + ロール再付与）",
+            "kick":  "kick=再招待は手動（bot は OAuth 必須・bot 不可）",
+            "ban":   "ban=unban のみで可逆（再招待は手動）",
+        }[mode]
+        result["reversibility"] = reversibility
+
+        # --- Mongo に snapshot doc を insert（破壊操作より前 = restore の真実の源） ---
+        snapshot_doc = {
+            "target_id": target.id,
+            "target_name": str(target.name),
+            "guild_id": guild.id,
+            "mode": mode,
+            "actor": actor,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "applied",
+            "restored": False,
+            "restored_at": None,
+            "entries": entries,
+            "warnings": list(result["warnings"]),
+        }
+        ins = await killswitch_col.insert_one(snapshot_doc)
+        snapshot_id = str(ins.inserted_id)
+        result["snapshot_id"] = snapshot_id
+
+        # --- 破壊操作（per-action try/except で捕捉） ---
+        reason = f"[PANIC] killswitch {mode} by {actor}"
+        applied_entries = []
+        made_changes = False  # 破壊操作が1つでも適用されたか（snapshot を復旧可能にするか判定）
+
+        if mode == "strip":
+            # 危険権限ロールのうち無力化に失敗したもの（→ ok=False で正直に報告）
+            dangerous_failures = []
+            # managed: 権限をゼロ化
+            for ent in managed_entries:
+                ent_dangerous = bool(_panic_dangerous_perm_names(discord.Permissions(ent["perms"])))
+                role = guild.get_role(ent["role_id"])
+                if role is None:
+                    result["unactionable"].append(f"{ent['role_name']}: ロールが見つからない")
+                    if ent_dangerous:
+                        dangerous_failures.append(ent["role_name"])
+                    continue
+                try:
+                    await role.edit(permissions=discord.Permissions.none(), reason=reason)
+                    result["actions"].append(f"zeroed perms on {role.name}")
+                    applied_entries.append(ent)
+                except Exception as e:
+                    result["unactionable"].append(f"{ent['role_name']}: 権限ゼロ化失敗 {e}")
+                    if ent_dangerous:
+                        dangerous_failures.append(ent["role_name"])
+            # 非 managed: bulk で一括除去
+            if non_managed_roles:
+                try:
+                    await target.remove_roles(*non_managed_roles, reason=reason)
+                    for r in non_managed_roles:
+                        result["actions"].append(f"removed {r.name}")
+                    applied_entries.extend(membership_entries)
+                except Exception:
+                    # bulk 失敗時は個別に試行
+                    for r in non_managed_roles:
+                        try:
+                            await target.remove_roles(r, reason=reason)
+                            result["actions"].append(f"removed {r.name}")
+                            applied_entries.append({
+                                "role_id": r.id, "role_name": r.name, "type": "membership"
+                            })
+                        except Exception as e2:
+                            result["unactionable"].append(f"{r.name}: 除去失敗 {e2}")
+                            if _panic_dangerous_perm_names(r.permissions):
+                                dangerous_failures.append(r.name)
+            made_changes = bool(applied_entries)
+            # 危険権限を1つでも無力化し損ねたら ok=False（「効いたつもりで生きてる」を防ぐ）
+            if dangerous_failures:
+                result["ok"] = False
+                result["error"] = (
+                    "⚠️ 危険権限ロールを完全には無力化できませんでした（対象がまだ生きている可能性）: "
+                    + ", ".join(dangerous_failures)
+                    + "。空気くんの階層位置を確認し、必要なら kick/ban を検討してください。"
+                )
+            else:
+                result["ok"] = True
+            result["warnings"].append(
+                "strip はロール由来の権限のみ無効化します。チャンネル個別の権限上書き"
+                "(channel overwrite) を持つ bot はそれを保持し得ます。完全除去は kick/ban を。"
+            )
+
+        elif mode == "kick":
+            applied_entries = entries
+            try:
+                await target.kick(reason=reason)
+                result["actions"].append(f"kicked {target.name}")
+                result["ok"] = True
+                made_changes = True
+            except Exception as e:
+                result["error"] = f"kick 失敗: {e}"
+
+        elif mode == "ban":
+            applied_entries = entries
+            try:
+                await guild.ban(target, reason=reason, delete_message_seconds=0)
+                result["actions"].append(f"banned {target.name}")
+                result["ok"] = True
+                made_changes = True
+            except Exception as e:
+                result["error"] = f"ban 失敗: {e}"
+
+        # --- snapshot doc を結果で update ---
+        try:
+            await killswitch_col.update_one(
+                {"_id": ins.inserted_id},
+                {"$set": {
+                    # 1つでも適用できたら restore 可能にする（部分失敗で ok=False でも
+                    # 適用分は target 復旧で戻せるように status は made_changes で判定）
+                    "status": "applied" if made_changes else "failed",
+                    "entries": applied_entries,
+                    "actions": result["actions"],
+                    "unactionable": result["unactionable"],
+                }},
+            )
+        except Exception as e:
+            print(f"[PANIC] snapshot update 失敗: {e}")
+
+        # --- best-effort 監査ログ（失敗してもキルを止めない） ---
+        await _panic_audit(
+            guild,
+            f"neutralize target={target.name}({target.id}) mode={mode} actor={actor} "
+            f"ok={result['ok']} actions={result['actions']} snapshot={snapshot_id}"
+        )
+        return result
+
+    except Exception as e:
+        # どんな例外も外に投げない
+        print(f"[PANIC] _panic_neutralize_bot 例外: {e}")
+        traceback.print_exc()
+        return {"ok": False, "mode": mode, "error": f"内部エラー: {e}"}
+
+
+async def _panic_restore(guild, target_id: "int | None" = None,
+                         snapshot_id: "str | None" = None) -> dict:
+    """スナップショットから原状回復する共有ヘルパ。例外を外に投げない。"""
+    try:
+        from bson import ObjectId
+        result = {"ok": False, "actions": [], "warnings": [], "snapshot_id": snapshot_id}
+
+        doc = None
+        if snapshot_id:
+            try:
+                doc = await killswitch_col.find_one({"_id": ObjectId(snapshot_id)})
+            except Exception as e:
+                result["error"] = f"snapshot_id が不正です: {e}"
+                return result
+        elif target_id is not None:
+            doc = await killswitch_col.find_one(
+                {"target_id": int(target_id), "status": "applied", "restored": False},
+                sort=[("created_at", -1)],
+            )
+        else:
+            result["error"] = "target または snapshot_id を指定してください。"
+            return result
+
+        if not doc:
+            result["error"] = "復旧対象のスナップショットが見つかりません。"
+            return result
+
+        result["snapshot_id"] = str(doc["_id"])
+        result["mode"] = doc.get("mode")
+        result["target"] = {"id": doc.get("target_id"), "name": doc.get("target_name")}
+
+        # 二重 restore 拒否
+        if doc.get("restored"):
+            result["error"] = "このスナップショットは既に復旧済みです。"
+            return result
+
+        mode = doc.get("mode")
+        tid = int(doc.get("target_id"))
+        reason = "[PANIC] killswitch restore"
+        membership_roles = []
+
+        for ent in doc.get("entries", []):
+            if ent.get("type") == "managed":
+                role = guild.get_role(ent["role_id"])
+                if role is None:
+                    result["warnings"].append(
+                        f"{ent.get('role_name')}: ロールが見つからず権限復元できません"
+                    )
+                    continue
+                try:
+                    await role.edit(
+                        permissions=discord.Permissions(ent["perms"]), reason=reason
+                    )
+                    result["actions"].append(f"restored perms on {role.name}")
+                except Exception as e:
+                    result["warnings"].append(f"{ent.get('role_name')}: 権限復元失敗 {e}")
+            elif ent.get("type") == "membership":
+                role = guild.get_role(ent["role_id"])
+                if role is not None:
+                    membership_roles.append(role)
+                else:
+                    result["warnings"].append(
+                        f"{ent.get('role_name')}: ロールが見つからず再付与できません"
+                    )
+
+        if mode == "strip" and membership_roles:
+            try:
+                member = await guild.fetch_member(tid)
+                await member.add_roles(*membership_roles, reason=reason)
+                for r in membership_roles:
+                    result["actions"].append(f"re-added {r.name}")
+            except Exception as e:
+                result["warnings"].append(f"ロール再付与失敗（bot が不在の可能性）: {e}")
+
+        if mode == "kick":
+            result["warnings"].append(
+                "kick の復旧: bot の再招待は OAuth が必要で bot 側からは不可能です（手動で再招待してください）。"
+            )
+        elif mode == "ban":
+            try:
+                user = discord.Object(id=tid)
+                await guild.unban(user, reason=reason)
+                result["actions"].append("unbanned")
+            except Exception as e:
+                result["warnings"].append(f"unban 失敗: {e}")
+            result["warnings"].append(
+                "ban の復旧: unban のみ実施。再参加は対象 bot 側の再招待が必要です。"
+            )
+
+        await killswitch_col.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {
+                "restored": True,
+                "restored_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }},
+        )
+        result["ok"] = True
+        await _panic_audit(
+            guild,
+            f"restore snapshot={result['snapshot_id']} target={result['target']} "
+            f"mode={mode} actions={result['actions']}"
+        )
+        return result
+
+    except Exception as e:
+        print(f"[PANIC] _panic_restore 例外: {e}")
+        traceback.print_exc()
+        return {"ok": False, "error": f"内部エラー: {e}"}
+
+
+async def _panic_check(guild) -> dict:
+    """ギルド内の各 bot について階層 readiness を報告する共有ヘルパ。"""
+    try:
+        result = {"ok": True, "ready": True, "bots": [], "warnings": []}
+        me = await _panic_resolve_me(guild)
+        if me is None:
+            return {"ok": False, "error": "空気くん自身のメンバー情報を取得できません。"}
+        my_top = me.top_role.position
+        result["my_top_role"] = {"name": me.top_role.name, "position": my_top}
+
+        # @everyone の危険権限
+        try:
+            danger = _panic_dangerous_perm_names(guild.default_role.permissions)
+            if danger:
+                result["warnings"].append(
+                    "@everyone が危険権限を保持: " + ", ".join(danger)
+                )
+        except Exception:
+            pass
+
+        members = guild.members
+        if not members:
+            # gateway 未接続（fetch_guild 由来）だと members が空。最も診断が要る
+            # 障害時にこそ偽の readiness:True を返さない。
+            result["ready"] = False
+            result["warnings"].append(
+                "gateway 未接続の可能性: bot 一覧を取得できず readiness を判定できません"
+                "（このエンドポイントが本当に必要な障害時は正確な判定が出せない点に注意）"
+            )
+        for m in members:
+            if not m.bot:
+                continue
+            if m.id == me.id:
+                continue
+            bot_info = {
+                "id": m.id, "name": str(m.name),
+                "top_role": m.top_role.name,
+                "above_me": my_top > m.top_role.position,
+                "managed_editable": [], "managed_blocked": [],
+            }
+            for role in m.roles:
+                if role.is_default():
+                    continue
+                if role.managed:
+                    if my_top > role.position:
+                        bot_info["managed_editable"].append(role.name)
+                    else:
+                        bot_info["managed_blocked"].append(role.name)
+                        result["ready"] = False
+            result["bots"].append(bot_info)
+        return result
+    except Exception as e:
+        print(f"[PANIC] _panic_check 例外: {e}")
+        return {"ok": False, "error": f"内部エラー: {e}"}
+
+
+def _panic_owner_gate_ok(interaction: discord.Interaction) -> bool:
+    """実セキュリティ: OWNER_ID 照合。OWNER_ID==0 なら全拒否。admin 権限では判定しない。"""
+    return OWNER_ID != 0 and interaction.user.id == OWNER_ID
+
+
+class PanicConfirmView(discord.ui.View):
+    """/panic_bot の確認ボタン（ephemeral・60秒タイムアウト）。"""
+    def __init__(self, target: discord.Member, mode: str):
+        super().__init__(timeout=60)
+        self.target = target
+        self.mode = mode
+        self._origin: "discord.Interaction | None" = None
+
+    async def on_timeout(self):
+        # 60秒放置でボタンを無効化（取り残し防止）。best-effort。
+        for item in self.children:
+            item.disabled = True
+        if self._origin is not None:
+            try:
+                await self._origin.edit_original_response(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="実行する（緊急遮断）", style=discord.ButtonStyle.danger, emoji="🚨")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ボタン操作も OWNER のみ
+        if not _panic_owner_gate_ok(interaction):
+            await interaction.response.send_message("⛔ オーナー専用です。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        actor = f"slash:{interaction.user.id}"
+        res = await _panic_neutralize_bot(interaction.guild, self.target, self.mode, actor)
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+        await interaction.followup.send(_panic_format_result(res), ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="キャンセルしました。", view=self)
+        self.stop()
+
+
+def _panic_format_result(res: dict) -> str:
+    """neutralize / restore の dict を人間可読テキストに整形。"""
+    lines = []
+    if res.get("ok"):
+        lines.append("✅ 完了しました。")
+    else:
+        lines.append("⚠️ 失敗または部分的失敗。")
+    if res.get("error"):
+        lines.append(f"理由: {res['error']}")
+    if res.get("mode"):
+        lines.append(f"mode: `{res['mode']}`")
+    if res.get("snapshot_id"):
+        lines.append(f"snapshot: `{res['snapshot_id']}`")
+    if res.get("actions"):
+        lines.append("実行: " + ", ".join(res["actions"]))
+    if res.get("unactionable"):
+        lines.append("未処理: " + " / ".join(res["unactionable"]))
+    if res.get("warnings"):
+        lines.append("⚠️ 警告: " + " / ".join(res["warnings"]))
+    if res.get("reversibility"):
+        lines.append("可逆性: " + res["reversibility"])
+    return "\n".join(lines)[:1900]
+
+
+@client.tree.command(name="panic_check", description="【オーナー専用】キルスイッチの階層 readiness を確認")
+@app_commands.default_permissions(administrator=True)
+async def panic_check_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    res = await _panic_check(interaction.guild)
+    if not res.get("ok"):
+        await interaction.followup.send(f"❌ {res.get('error')}", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="🛡️ キルスイッチ階層 readiness",
+        color=0x2ECC71 if res.get("ready") else 0xE67E22,
+    )
+    mt = res.get("my_top_role", {})
+    embed.add_field(
+        name="空気くんの最上位ロール",
+        value=f"{mt.get('name','?')} (pos {mt.get('position','?')})",
+        inline=False,
+    )
+    for b in res.get("bots", [])[:20]:
+        status = "✅ 上位" if b["above_me"] else "❌ 下位"
+        val = f"top_role: {b['top_role']} / {status}"
+        if b["managed_editable"]:
+            val += "\n編集可 managed: " + ", ".join(b["managed_editable"])
+        if b["managed_blocked"]:
+            val += "\n⛔ 編集不可 managed: " + ", ".join(b["managed_blocked"])
+        embed.add_field(name=f"{b['name']} ({b['id']})", value=val[:1024], inline=False)
+    if not res.get("bots"):
+        embed.description = "bot メンバーが見つかりません。"
+    if res.get("warnings"):
+        embed.add_field(name="⚠️ 警告", value="\n".join(res["warnings"])[:1024], inline=False)
+    if not res.get("ready"):
+        embed.set_footer(text="readiness に問題があります。⚠️警告と各 bot の表示を確認してください。")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@client.tree.command(name="panic_bot", description="【オーナー専用】暴走 bot を緊急無力化（確認あり）")
+@app_commands.describe(bot="対象の bot", mode="strip=可逆 / kick / ban")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="strip（権限ゼロ化・可逆）", value="strip"),
+    app_commands.Choice(name="kick", value="kick"),
+    app_commands.Choice(name="ban", value="ban"),
+])
+@app_commands.default_permissions(administrator=True)
+async def panic_bot_cmd(interaction: discord.Interaction, bot: discord.Member,
+                        mode: app_commands.Choice[str]):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    if not bot.bot:
+        await interaction.response.send_message(
+            "⛔ v1 は bot のみ対象です（メンバー隔離は v2）。", ephemeral=True
+        )
+        return
+    view = PanicConfirmView(bot, mode.value)
+    await interaction.response.send_message(
+        f"🚨 **緊急遮断の確認**\n対象: {bot.mention}（{bot.name} / {bot.id}）\n"
+        f"mode: `{mode.value}`\n\n本当に実行しますか？（60秒以内）",
+        view=view, ephemeral=True,
+    )
+    view._origin = interaction  # on_timeout でボタン無効化するため保持
+
+
+@client.tree.command(name="panic_restore", description="【オーナー専用】キルスイッチで無力化した bot を復旧")
+@app_commands.describe(target="復旧対象の bot（省略時は直近の未復旧スナップショット）")
+@app_commands.default_permissions(administrator=True)
+async def panic_restore_cmd(interaction: discord.Interaction,
+                            target: "discord.Member | None" = None):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    target_id = target.id if target is not None else None
+    res = await _panic_restore(interaction.guild, target_id=target_id)
+    await interaction.followup.send(_panic_format_result(res), ephemeral=True)
+
+
+# --- 外部エンドポイント（aiohttp health server に相乗り） ---
+# 簡易レート制限（in-memory・送信元IP単位の「失敗試行」回数）。
+# ブルートフォース対策なので token 照合の【前】に判定し、【失敗だけ】を数える。
+# 正しいトークンの正規発火はカウントしない → オーナーを締め出さない。
+_panic_fail_hits: dict = {}
+_PANIC_RATE_WINDOW = 60
+_PANIC_RATE_MAX = 10
+# X-Forwarded-For は攻撃者が偽装でき、IP をローテートすると dict が無限増殖し得る。
+# レート制限は token(高エントロピー)+compare_digest を補助する best-effort 防御なので、
+# キー数に硬上限を設けてメモリ DoS を防ぐ（上限超過時は古い追跡を捨てる）。
+_PANIC_RATE_MAX_KEYS = 1024
+
+
+def _panic_client_ip(request) -> str:
+    # Render 等プロキシ背後では実IPは X-Forwarded-For の先頭ホップ。
+    # 偽装可能だが、ここで proxy IP を使うと攻撃者の失敗洪水でオーナーまで
+    # 巻き添えロックされる（緊急時に致命的）。偽装耐性より「オーナーを締め出さない」を優先。
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote or "?"
+
+
+def _panic_sweep_fail_hits():
+    """全キーをウィンドウで剪定し、空になったキーを削除（メモリ上限維持用）。"""
+    cutoff = time.time() - _PANIC_RATE_WINDOW
+    for k in list(_panic_fail_hits.keys()):
+        kept = [t for t in _panic_fail_hits[k] if t >= cutoff]
+        if kept:
+            _panic_fail_hits[k] = kept
+        else:
+            _panic_fail_hits.pop(k, None)
+
+
+def _panic_ip_blocked(ip: str) -> bool:
+    """直近ウィンドウの失敗回数が上限以上か（判定のみ・カウントしない）。"""
+    cutoff = time.time() - _PANIC_RATE_WINDOW
+    hits = [t for t in _panic_fail_hits.get(ip, ()) if t >= cutoff]
+    if hits:
+        _panic_fail_hits[ip] = hits
+    else:
+        _panic_fail_hits.pop(ip, None)
+    return len(hits) >= _PANIC_RATE_MAX
+
+
+def _panic_record_fail(ip: str):
+    """token 照合失敗を IP 単位で記録。キー数が硬上限を超えないよう剪定/退避する。"""
+    if ip not in _panic_fail_hits and len(_panic_fail_hits) >= _PANIC_RATE_MAX_KEYS:
+        _panic_sweep_fail_hits()
+        if len(_panic_fail_hits) >= _PANIC_RATE_MAX_KEYS:
+            # 剪定でも下がらなければ最古の最終失敗時刻のキーを1つ退避（FIFO 近似）
+            oldest = min(_panic_fail_hits,
+                         key=lambda k: _panic_fail_hits[k][-1] if _panic_fail_hits[k] else 0.0)
+            _panic_fail_hits.pop(oldest, None)
+    _panic_fail_hits.setdefault(ip, []).append(time.time())
+
+
+async def _panic_web_handler(request):
+    """外部 /panic エンドポイント。必ず web.Response を返す（health server を落とさない）。"""
+    from aiohttp import web
+    try:
+        # 1. PANIC_TOKEN 空 → 無効（503）
+        if not PANIC_TOKEN:
+            return web.json_response({"error": "disabled"}, status=503)
+
+        # 2. 送信元IP単位のブルートフォース判定（token 照合の【前】・失敗回数ベース）
+        ip = _panic_client_ip(request)
+        if _panic_ip_blocked(ip):
+            print(f"[PANIC] 429 レート制限 from {ip}")
+            return web.json_response({"error": "rate_limited"}, status=429)
+
+        # 3. token 照合（定数時間比較）。失敗は IP 単位で記録
+        provided = request.headers.get("X-Panic-Token", "")
+        if not hmac.compare_digest(str(provided), str(PANIC_TOKEN)):
+            _panic_record_fail(ip)
+            print(f"[PANIC] 403 不正トークン from {ip}")
+            return web.json_response({"error": "forbidden"}, status=403)
+
+        # 4. body パース
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        action = body.get("action")
+        if action not in ("neutralize", "restore", "check"):
+            return web.json_response({"error": "unknown_action"}, status=400)
+
+        # 5. ギルド取得は gateway キャッシュに依存しない
+        if OWNER_ID == 0:
+            return web.json_response({"error": "owner_not_configured"}, status=503)
+        guild = client.get_guild(HOME_GUILD_ID)
+        if guild is None:
+            guild = await client.fetch_guild(HOME_GUILD_ID)
+
+        actor = f"endpoint:{ip}(peer:{request.remote})"
+
+        # 6. action ごとにコア共有ヘルパを呼ぶ
+        if action == "check":
+            result = await _panic_check(guild)
+            return web.json_response(result)
+
+        if action == "neutralize":
+            bot_id = body.get("bot_id")
+            if bot_id is None:
+                return web.json_response({"error": "missing bot_id"}, status=400)
+            mode = body.get("mode", "strip")
+            try:
+                target = await guild.fetch_member(int(bot_id))
+            except Exception as e:
+                return web.json_response({"error": f"member_fetch_failed: {e}"}, status=404)
+            result = await _panic_neutralize_bot(guild, target, mode, actor)
+            return web.json_response(result)
+
+        if action == "restore":
+            bot_id = body.get("bot_id")
+            result = await _panic_restore(
+                guild, target_id=int(bot_id) if bot_id is not None else None
+            )
+            return web.json_response(result)
+
+        return web.json_response({"error": "unhandled"}, status=400)
+
+    except Exception as e:
+        # 想定外でも health server を落とさない
+        print(f"[PANIC] _panic_web_handler 例外: {e}")
+        traceback.print_exc()
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# =============================================================================
+# UI Views
+# =============================================================================
+
+class PersonalityView(discord.ui.View):
+    def __init__(self, invoker: discord.Member | discord.User | None = None):
+        super().__init__(timeout=60)
+        self.message: discord.Message | None = None
+        self.invoker = invoker
+        for key, data in PERSONALITIES.items():
+            btn = discord.ui.Button(
+                label=data["label"],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"personality_{key}",
+            )
+            btn.callback = self._make_callback(key)
+            self.add_item(btn)
+
+    def _make_callback(self, key: str):
+        async def callback(interaction: discord.Interaction):
+            await set_server_personality(key)
+            personality = PERSONALITIES[key]
+            changer     = interaction.user.display_name
+            # Botのニックネームを人格名に変更
+            try:
+                nickname = personality.get("nickname", "空気くん")
+                await interaction.guild.me.edit(nick=nickname)
+            except Exception as ne:
+                print(f"[WARN] nickname change: {ne}")
+            embed = discord.Embed(
+                title="🎭 性格が変わりました！",
+                description=(
+                    f"**{changer}** さんが変更しました\n\n"
+                    f"新しい性格: **{personality['label']}**\n"
+                    f"名前: **{personality.get('nickname', '空気くん')}**\n"
+                    f"サーバー全員に反映されました。"
+                ),
+                color=personality["color"],
+            )
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(embed=embed, view=self)
+        return callback
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+class LuckyTitleView(discord.ui.View):
+    def __init__(self, title: str, member: discord.Member):
+        super().__init__(timeout=60)
+        self.title   = title
+        self.member  = member
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="ニックネームに反映する", style=discord.ButtonStyle.primary, emoji="✨")
+    async def apply_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message("おいｗなにしようとしとんねん！", ephemeral=True)
+            return
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member:
+            await interaction.response.send_message("エラーが発生したよ。", ephemeral=True)
+            return
+        await users_col.update_one(
+            {"_id": str(interaction.user.id)},
+            {"$set": {"title": self.title, "name": interaction.user.name}},
+            upsert=True,
+        )
+        success = await apply_nickname(member, self.title)
+        await interaction.response.send_message(
+            f"✨ ニックネームを **「{self.title}」{interaction.user.name}** に変更したにゃ！" if success
+            else "権限の関係でニックネームを変更できなかったよ…ごめんにゃ。",
+            ephemeral=True,
+        )
+        button.disabled = True
+        button.label    = "反映済み"
+        await interaction.message.edit(view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+# =============================================================================
+# 通知タスク
+# =============================================================================
+
+# 招待ボーナス設定 { 招待人数: XP }
+INVITE_BONUSES = {1: 200, 3: 500, 5: 1000, 10: 2000}
+
+@client.event
+async def on_member_join(member: discord.Member):
+    """招待ボーナス処理"""
+    try:
+        invites_after = await member.guild.invites()
+        inviter_id    = None
+        used_code     = None
+        for inv in invites_after:
+            prev_uses = _invite_snapshot.get(inv.code, 0)
+            if (inv.uses or 0) > prev_uses:
+                inviter_id = str(inv.inviter.id) if inv.inviter else None
+                used_code  = inv.code
+                _invite_snapshot[inv.code] = inv.uses or 0
+                break
+        # スナップショット更新
+        for inv in invites_after:
+            _invite_snapshot[inv.code] = inv.uses or 0
+
+        if not inviter_id:
+            return
+
+        # 招待者の累計招待数を更新
+        inviter_doc = await users_col.find_one_and_update(
+            {"_id": inviter_id},
+            {"$inc": {"invite_count": 1}},
+            upsert=True, return_document=True,
+        )
+        invite_count = inviter_doc.get("invite_count", 1)
+
+        # マイルストーンボーナス
+        bonus = INVITE_BONUSES.get(invite_count, 0)
+        if bonus:
+            await users_col.update_one(
+                {"_id": inviter_id},
+                {"$inc": {"xp": bonus}},
+            )
+            general_ch = member.guild.get_channel(GENERAL_CHANNEL_ID)
+            inviter_member = member.guild.get_member(int(inviter_id))
+            if general_ch and inviter_member:
+                await general_ch.send(
+                    f"🎉 {inviter_member.mention} さんが **{invite_count}人目** の招待を達成！"
+                    f" **+{bonus:,} XP** ボーナス獲得！"
+                )
+            print(f"[invite] {inviter_id} が {invite_count}人招待 +{bonus}XP")
+    except Exception as e:
+        print(f"[ERROR] on_member_join: {e}")
+
+
+async def weekly_ranking_task():
+    """毎週日曜JST正午にランキングを表チャンネルに投稿"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+            # 日曜(weekday=6) 正午(12:00)に投稿
+            if now_jst.weekday() == 6 and now_jst.hour == 12 and now_jst.minute < 10:
+                await post_weekly_ranking()
+        except Exception as e:
+            print(f"[ERROR] weekly_ranking_task: {e}")
+        await asyncio.sleep(600)  # 10分ごとにチェック
+
+
+async def post_weekly_ranking():
+    guild = next(iter(client.guilds), None)
+    if not guild:
+        return
+    ch = guild.get_channel(GENERAL_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 上位20名取得
+    top_users = await users_col.find().sort("xp", -1).limit(20).to_list(length=20)
+    if not top_users:
+        return
+
+    now_jst  = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    medals   = ["🥇", "🥈", "🥉"]
+    lines    = []
+    for i, doc in enumerate(top_users):
+        rank_name, _, _, _ = get_rank_info(doc.get("xp", 0))
+        medal = medals[i] if i < 3 else f"**{i+1}.**"
+        name  = doc.get("name", "不明")
+        xp    = doc.get("xp", 0)
+        lines.append(f"{medal} {name}　`{rank_name}`　**{xp:,} XP**")
+
+    embed = discord.Embed(
+        title=f"📊 週次XPランキング",
+        description="\n".join(lines),
+        color=0xFFD700,
+    )
+    embed.set_footer(text=f"{now_jst.strftime('%Y/%m/%d')} 集計 • /rank で自分のステータスを確認！")
+    await ch.send(embed=embed)
+    print(f"[ranking] 週次ランキング投稿完了")
+
+
+async def notification_task():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            ch = client.get_channel(NOTIFY_CHANNEL_ID)
+            if ch:
+                now   = datetime.datetime.now(datetime.timezone.utc)
+                ready = []
+                async for doc in system_col.find({"notified": False}):
+                    bid = doc["_id"]
+                    if bid not in BOT_CONFIG or not doc.get("last_bump_at"):
+                        continue
+                    if (now - ensure_utc(doc["last_bump_at"])).total_seconds() >= BOT_CONFIG[bid]["cd"]:
+                        ready.append(bid)
+                if ready:
+                    await ch.send(
+                        "🔔 **宣伝準備完了！**\n" +
+                        "\n".join(f"✅ **{BOT_CONFIG[b]['name']}**" for b in ready)
+                    )
+                    for b in ready:
+                        await system_col.update_one({"_id": b}, {"$set": {"notified": True}})
+        except discord.errors.HTTPException as e:
+            if "429" in str(e):
+                print(f"[WARN] Notify 429: レート制限中、60秒待機")
+                await asyncio.sleep(60)  # 429時は60秒余分に待つ
+            else:
+                print(f"[ERROR] Notify: {e}")
+        except Exception as e:
+            print(f"[ERROR] Notify: {e}")
+        await asyncio.sleep(600)
+
+# =============================================================================
+# エントリーポイント
+# =============================================================================
+
+async def _main():
+    # Webサーバーを最初に起動（Renderのポートチェックを通すため）
+    await start_web_server()
+    print("[web] Webサーバー起動完了")
+
+    retry = 0
+    # client は起動時に一度だけ生成済み（グローバル）。
+    # 再生成すると @client.tree.command で登録したコマンドが消えるため、
+    # 429時はclose→再接続のみ行う。
+    while True:
+        try:
+            await client.start(TOKEN)
+        except discord.errors.HTTPException as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                wait = min(300 * (2 ** retry), 3600)  # 最大1時間
+                print(f"[WARN] Discord 429 rate limited. {wait}秒後に再試行... (retry={retry})")
+                try:
+                    if not client.is_closed():
+                        await client.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
+                retry += 1
+            else:
+                print(f"[ERROR] Discord HTTPException: {e}")
+                raise
+        except Exception as e:
+            print(f"[ERROR] client.start failed: {e}")
+            raise
+        finally:
+            try:
+                if not client.is_closed():
+                    await client.close()
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    asyncio.run(_main())

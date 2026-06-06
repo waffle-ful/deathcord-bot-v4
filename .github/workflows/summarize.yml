@@ -1,0 +1,43 @@
+name: Discord Log Summarizer
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # 4時間ごとに実行（成長時のDiscord REST負荷を抑制。窓は fetch側 HOURS_BACK=5h で1h重ねて取りこぼし防止）
+  workflow_dispatch:
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
+          # （古いキャッシュに discord.py が残っていると Gateway接続でBotが落ちる）
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: Fetch Discord logs
+        env:
+          DISCORD_BOT_TOKEN:    ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID:     ${{ secrets.DISCORD_GUILD_ID }}
+          DISCORD_CHANNEL_IDS:  ${{ secrets.DISCORD_CHANNEL_IDS }}
+          EXCLUDE_CHANNEL_IDS:  ${{ secrets.EXCLUDE_CHANNEL_IDS }}
+        run: python batch/fetch_discord_logs.py
+
+      - name: Summarize
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python batch/summarize.py
+
+      - name: Update MongoDB
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python batch/update_mongodb.py
