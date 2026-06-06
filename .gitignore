@@ -1,19 +1,49 @@
+# バイブコーディング向け
 claude.md
 .env
 .env.*
+.cursor/
+.windsurf/
+.antigravity/
+*.prompt
+*.chat
+.claude/.copilot/
+copilot-metrics.json
+.codex/
+.codexignore
+codex.config.json
+
 
 # runtime state / 自動生成（公開リポに混入させない）
 bump_db.json
 
-# python / tooling caches
+# ぺエソン
 __pycache__/
 *.pyc
 .ruff_cache/
+.venv/
+venv/
+ENV/
 
-# Claude Code 個人ツール（秘伝のたれ・公開しない）
-.claude/
+# pytest / テスト自動化のキャッシュ
+.pytest_cache/
+.coverage
+htmlcov/
 
-# 実行時データ（本来は /tmp 出力。将来うっかり repo 直下に書き出しても commit させない安全網）
+# mypy などの型チェックキャッシュ
+.mypy_cache/
+
+# OS固有のゴミファイル
+.DS_Store
+Thumbs.db
+
+# 開発エディタの設定
+.vscode/
+.idea/
+.poetry/
+
+# logとか
 logs.json
 summary_result.json
 dashboard.png
+
