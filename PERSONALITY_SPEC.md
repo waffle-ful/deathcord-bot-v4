@@ -10,7 +10,7 @@
 
 | レイヤー | 役割 | 実装 |
 |---|---|---|
-| A. 自己申告（TIPI-J 10問） | 科学的アンカー。本人が答えたときだけ「妥当」と言える唯一の出力 | `/personality` コマンド（main.py） |
+| A. 自己申告（TIPI-J 10問） | 科学的アンカー。本人が答えたときだけ「妥当」と言える唯一の出力 | `/personalitytest` コマンド（main.py） |
 | B. ログ推論（主力） | TIPI-Jの各項目をLLM＋言語特徴量で本人に代わって採点 | `batch/analyze_personality.py` / `analyze_nonbooster.py` |
 | C. 提示・倫理 | 「推定」と明示・確信度・オプトアウト | `/myprofile`・`format_profile`・`/privacy` |
 
@@ -41,7 +41,7 @@ profile.bigfive = {
   "data_points": 42,                  // 推論に使った発言数
   "analyzed_at": "2026-06-08T..."
 }
-profile.bigfive_self = {              // /personality 回答時のみ
+profile.bigfive_self = {              // /personalitytest 回答時のみ
   "openness": { "band": "...", "raw": 1-7 }, ...,
   "method": "self_report",
   "answered_at": "..."
@@ -101,7 +101,7 @@ TIPI-J項目（採点対象。「私は自分自身を、○○ と思う」形�
   - high: data_points≥80 かつ 根拠あり かつ N/C以外
   - mid : data_points≥30 かつ 根拠あり
   - low : それ未満、または N/C、またはStage1/2が不一致
-- `/personality` の自己申告があれば**それを正**とし、推論は補足として併置（食い違いは表示）。
+- `/personalitytest` の自己申告があれば**それを正**とし、推論は補足として併置（食い違いは表示）。
 
 ### Stage 4 — 安全マージ（既知バグの恒久修正）
 現行 `merge_profiles`(L234) は空/薄レスポンスで蓄積を上書き破壊し conv_count もリセットする。
@@ -110,9 +110,9 @@ TIPI-J項目（採点対象。「私は自分自身を、○○ と思う」形�
 - `conv_count` は **confident な因子が1つ以上保存できたときだけ** unset（失敗時はトリガーを残す）。
 - 全因子 null（データ不足）なら**何も書かない**（skip）。
 
-## 4. レイヤーA：/personality（TIPI-J 自己申告）
+## 4. レイヤーA：/personalitytest（TIPI-J 自己申告）
 
-- スラッシュコマンド `/personality`：Discord UI（Select×10 もしくは Modal）でTIPI-J 10問に回答（1–7）。
+- スラッシュコマンド `/personalitytest`：Discord UI（Select×10 もしくは Modal）でTIPI-J 10問に回答（1–7）。
 - 採点して `profile.bigfive_self` に保存。`/myprofile` で推論結果と並べて表示。
 - 任意・再受験自由（性格は変動するため再検査前提を明記）。
 - 回答が集まらない前提なので必須にはしない。集まった分は推論の較正・検証に使える。
@@ -120,26 +120,26 @@ TIPI-J項目（採点対象。「私は自分自身を、○○ と思う」形�
 ## 5. レイヤーC：提示・倫理
 
 - 名称：**ログ推論(レイヤーB)** は「性格**診断**」→「性格**推定（参考）**」に変更（臨床的断定を避ける）。
-  **自己申告(レイヤーA `/personality`)** は検証済み尺度なので、ハイブリッド方針のもと娯楽寄りの
+  **自己申告(レイヤーA `/personalitytest`)** は検証済み尺度なので、ハイブリッド方針のもと娯楽寄りの
   「性格**診断**」表記を許容（コマンド説明・View見出し・フッターで使用）。
 - **バンド閾値（科学的refinement・未対応/follow-up）**: 現在は固定閾値（≤3.5 低 / ≥5.0 高）。
   本来は TIPI-J の出版済み母集団規範（Oshio et al. 2012 の因子別 平均±SD）で規範参照すべき
   （日本サンプルは中点4.0からズレる因子がある／LLM推定は高めに偏るので固定5.0は高バンドを過大化）。
   採用時は**出典の規範表を必ず取得してから**ハードコードすること（記憶からの再構成は禁止）。
-- `/myprofile` 注記：「会話ログからのAI推定です。正確な診断ではありません。`/personality` で
+- `/myprofile` 注記：「会話ログからのAI推定です。正確な診断ではありません。`/personalitytest` で
   本人回答に基づく結果も見られます」。
 - バンド表示（数値は出さない）＋因子ごとの確信度バッジ（◎/○/△）＋根拠引用。
 - ハイブリッド見せ方：各因子に親しみやすい一言ラベル（例 外向性=高→「社交的・話題を振る」）。
   任意で「タイプ風ニックネーム」をお遊び併記可（科学主張はしない）。
 - **同意/オプトアウト**：非ブースターは現状無断で受動分析。第三者の性格も群チャットから推定している。
-  `/privacy`（または `/personality` 内トグル）で推定停止・非表示を選べるようにする。停止者は
+  `/privacy`（または `/personalitytest` 内トグル）で推定停止・非表示を選べるようにする。停止者は
   バッチ対象から除外（`users.personality_optout: true`）。
 
 ## 6. 影響ファイル
 
 - `batch/analyze_personality.py` … Stage1–4 実装（ブースター・主力）
 - `batch/analyze_nonbooster.py` … 同方式に揃える（要約ベースなのでStage1は限定的）
-- `main.py` … `/personality`・`/privacy`・`format_profile`・`_build_mimic_profile`・`/myprofile` 更新
+- `main.py` … `/personalitytest`・`/privacy`・`format_profile`・`_build_mimic_profile`・`/myprofile` 更新
 - `_build_mimic_profile` は口調模倣が主目的なので bigfive は軽く反映する程度（喋り方は変えない）
 
 ## 7. 出典

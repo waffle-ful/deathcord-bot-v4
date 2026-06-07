@@ -878,7 +878,7 @@ async def get_booster_profile(uid: str) -> dict:
 # =============================================================================
 # Big Five（性格推定）共通ヘルパー  ※詳細仕様は PERSONALITY_SPEC.md
 #   - 推定(profile.bigfive)はバッチ batch/analyze_personality.py が生成。
-#   - 自己申告(profile.bigfive_self)は /personality（検証済み尺度 TIPI-J）で生成。
+#   - 自己申告(profile.bigfive_self)は /personalitytest（検証済み尺度 TIPI-J）で生成。
 #   ここでは表示・プロンプト整形と、自己申告の採点のみ行う。
 # =============================================================================
 
@@ -979,7 +979,7 @@ def add_bigfive_fields(embed: discord.Embed, profile: dict):
         embed.add_field(
             name="ℹ️ 注記",
             value=("推定（◎高/○中/△低 = 確信度）は会話ログからのAI推定で、正確な診断ではありません。"
-                   "`/personality` で本人回答に基づく結果も追加できます。"),
+                   "`/personalitytest` で本人回答に基づく結果も追加できます。"),
             inline=False,
         )
 
@@ -2317,7 +2317,7 @@ async def myprofile_cmd(interaction: discord.Interaction):
     if not has_any:
         embed.description = ("まだ分析データがありません。\n"
                              "メイドと会話したりチャットすると自動で分析が始まるよ。\n"
-                             "今すぐ `/personality` で本格的な性格診断もできる！")
+                             "今すぐ `/personalitytest` で本格的な性格診断もできる！")
     else:
         if tone:
             embed.add_field(name="口調の特徴", value=tone, inline=False)
@@ -2345,7 +2345,7 @@ async def myprofile_cmd(interaction: discord.Interaction):
             embed.add_field(name="メモ", value=", ".join(memo), inline=False)
         add_bigfive_fields(embed, profile)
 
-    embed.set_footer(text="会話で自動更新 • /personality で性格診断 • /privacy で推定のオン/オフ")
+    embed.set_footer(text="会話で自動更新 • /personalitytest で性格診断 • /privacy で推定のオン/オフ")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 class EditProfileModal(discord.ui.Modal, title="プロフィールを編集"):
@@ -2426,7 +2426,7 @@ async def editprofile_cmd(interaction: discord.Interaction):
 
 
 # =============================================================================
-# /personality — TIPI-J 自己申告（検証済みBig Five尺度） ※PERSONALITY_SPEC.md レイヤーA
+# /personalitytest — TIPI-J 自己申告（検証済みBig Five尺度） ※PERSONALITY_SPEC.md レイヤーA
 #   10項目を 1-7 で回答 → profile.bigfive_self に保存。推定の較正アンカーになる。
 # =============================================================================
 
@@ -2527,13 +2527,13 @@ class TipiView(discord.ui.View):
             if isinstance(seg, dict):
                 e.add_field(name=f"{FACTOR_JA[f]}（{FACTOR_HINT[f]}）",
                             value=f"**{seg['band']}**", inline=True)
-        e.set_footer(text="検証済み尺度TIPI-J • 性格は変わるのでいつでも /personality で再診断OK")
+        e.set_footer(text="検証済み尺度TIPI-J • 性格は変わるのでいつでも /personalitytest で再診断OK")
         self.stop()
         await interaction.response.edit_message(embed=e, view=None)
 
 
-@client.tree.command(name="personality", description="本格的な性格診断（Big Five / TIPI-J 10問）を受ける")
-async def personality_cmd(interaction: discord.Interaction):
+@client.tree.command(name="personalitytest", description="本格的な性格診断（Big Five / TIPI-J 10問）を受ける")
+async def personalitytest_cmd(interaction: discord.Interaction):
     view = TipiView(str(interaction.user.id))
     await interaction.response.send_message(embed=view.page_embed(), view=view, ephemeral=True)
 
