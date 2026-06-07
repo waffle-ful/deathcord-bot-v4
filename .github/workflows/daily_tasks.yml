@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-batch.txt
 
-      - name: ブースター性格分析（conv_count >= 10 のユーザー対象）
+      - name: 性格分析（Big Five/TIPI-J・全メンバー対象・1回最大25人ローテーション）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
