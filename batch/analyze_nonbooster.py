@@ -181,9 +181,10 @@ def main():
     print(f"[nonbooster] Summaries: {len(summaries_text)}文字")
 
     targets = list(users_col.find({
-        "is_booster": {"$ne": True},
-        "name":       {"$exists": True},
-        "xp":         {"$gt": 0},
+        "is_booster":         {"$ne": True},
+        "name":               {"$exists": True},
+        "xp":                 {"$gt": 0},
+        "personality_optout": {"$ne": True},   # /privacy でオプトアウトした人は分析しない
     }))
     print(f"[nonbooster] Target users: {len(targets)}")
     if not targets:

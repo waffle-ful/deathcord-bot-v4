@@ -353,6 +353,9 @@ def _build_mimic_profile(doc: dict) -> str:
         lines.append(f"- 口癖・語彙: {profile['vocabulary']}")
     if profile.get("personality"):
         lines.append(f"- 性格: {profile['personality']}")
+    _bf_brief = _bigfive_brief(profile.get("bigfive_self") or profile.get("bigfive") or {})
+    if _bf_brief:
+        lines.append(f"- 性格傾向: {_bf_brief}")
     if profile.get("communication_style"):
         lines.append(f"- 話し方: {profile['communication_style']}")
     if profile.get("background"):
@@ -872,6 +875,115 @@ async def get_booster_profile(uid: str) -> dict:
     return doc.get("profile", {})
 
 
+# =============================================================================
+# Big Five（性格推定）共通ヘルパー  ※詳細仕様は PERSONALITY_SPEC.md
+#   - 推定(profile.bigfive)はバッチ batch/analyze_personality.py が生成。
+#   - 自己申告(profile.bigfive_self)は /personality（検証済み尺度 TIPI-J）で生成。
+#   ここでは表示・プロンプト整形と、自己申告の採点のみ行う。
+# =============================================================================
+
+# TIPI-J 10項目（小塩ら 2012）。factor=因子, reverse=逆転項目
+TIPI_ITEMS = [
+    ("q1",  "活発で、外向的だと思う",                   "extraversion",      False),
+    ("q2",  "他人に不満をもち、もめごとを起こしやすいと思う", "agreeableness",     True),
+    ("q3",  "しっかりしていて、自分に厳しいと思う",       "conscientiousness", False),
+    ("q4",  "心配性で、うろたえやすいと思う",             "neuroticism",       False),
+    ("q5",  "新しいことが好きで、変わった考えをもつと思う", "openness",          False),
+    ("q6",  "ひかえめで、おとなしいと思う",               "extraversion",      True),
+    ("q7",  "人に気をつかう、やさしい人間だと思う",       "agreeableness",     False),
+    ("q8",  "だらしなく、うっかりしていると思う",         "conscientiousness", True),
+    ("q9",  "冷静で、気分が安定していると思う",           "neuroticism",       True),
+    ("q10", "発想力に欠けた、平凡な人間だと思う",         "openness",          True),
+]
+FACTOR_JA = {
+    "openness": "開放性", "conscientiousness": "誠実性", "extraversion": "外向性",
+    "agreeableness": "協調性", "neuroticism": "情緒不安定さ",
+}
+FACTOR_HINT = {  # ハイブリッド見せ方: 各因子の親しみやすい補足
+    "openness": "好奇心・新しいもの好き", "conscientiousness": "計画性・きっちり",
+    "extraversion": "社交性・話を振る", "agreeableness": "思いやり・協調",
+    "neuroticism": "気分の揺れやすさ",
+}
+LIKERT_OPTIONS = [
+    ("1", "1: まったく違う"), ("2", "2: ほとんど違う"), ("3", "3: あまりそう思わない"),
+    ("4", "4: どちらでもない"), ("5", "5: ややそう思う"), ("6", "6: そう思う"),
+    ("7", "7: 強くそう思う"),
+]
+_CONF_BADGE = {"high": "◎", "mid": "○", "low": "△"}
+
+
+def _tipi_band(val: float) -> str:
+    if val <= 3.5:
+        return "低"
+    return "高" if val >= 5.0 else "中"
+
+
+def compute_self_bigfive(answers: dict) -> dict:
+    """TIPI-J回答(q1..q10 → 1-7)を5因子のband/scoreに採点する（自己申告）。"""
+    pair = {}  # factor -> [normal, reversed-adjusted...]
+    for key, _text, factor, reverse in TIPI_ITEMS:
+        v = answers.get(key)
+        if not isinstance(v, int):
+            continue
+        pair.setdefault(factor, []).append(8 - v if reverse else v)
+    result = {}
+    for factor, vals in pair.items():
+        if not vals:
+            continue
+        avg = sum(vals) / len(vals)
+        result[factor] = {"band": _tipi_band(avg), "score": round((avg - 1) / 6 * 100)}
+    result["method"] = "self_report"
+    result["answered_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return result
+
+
+def _bigfive_brief(bigfive: dict) -> str | None:
+    """会話プロンプト/ミミック用の一言。高め・控えめ因子だけ簡潔に。"""
+    if not isinstance(bigfive, dict):
+        return None
+    highs = [FACTOR_JA[f] for f in FACTOR_JA
+             if isinstance(bigfive.get(f), dict) and bigfive[f].get("band") == "高"]
+    lows  = [FACTOR_JA[f] for f in FACTOR_JA
+             if isinstance(bigfive.get(f), dict) and bigfive[f].get("band") == "低"]
+    parts = []
+    if highs:
+        parts.append("・".join(highs) + "が高め")
+    if lows:
+        parts.append("・".join(lows) + "は控えめ")
+    return "、".join(parts) if parts else None
+
+
+def add_bigfive_fields(embed: discord.Embed, profile: dict):
+    """/myprofile 用: 推定と自己申告のBig Fiveをembedに追加する。"""
+    self_bf = profile.get("bigfive_self") or {}
+    inf_bf  = profile.get("bigfive") or {}
+    if not self_bf and not any(isinstance(inf_bf.get(f), dict) for f in FACTOR_JA):
+        return
+    lines = []
+    for f in FACTOR_JA:
+        sj = self_bf.get(f) if isinstance(self_bf.get(f), dict) else None
+        ij = inf_bf.get(f)  if isinstance(inf_bf.get(f), dict) else None
+        if not sj and not ij:
+            continue
+        seg = f"**{FACTOR_JA[f]}**（{FACTOR_HINT[f]}）: "
+        if sj:
+            seg += f"自己申告 **{sj['band']}**"
+        if ij:
+            badge = _CONF_BADGE.get(ij.get("confidence", "low"), "△")
+            seg += (" / " if sj else "") + f"推定 {ij['band']} {badge}"
+            if ij.get("evidence"):
+                seg += f"\n　└ 根拠: 「{str(ij['evidence'])[:40]}」"
+        lines.append(seg)
+    if lines:
+        embed.add_field(name="🧬 性格傾向（Big Five）", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(
+            name="ℹ️ 注記",
+            value=("推定（◎高/○中/△低 = 確信度）は会話ログからのAI推定で、正確な診断ではありません。"
+                   "`/personality` で本人回答に基づく結果も追加できます。"),
+            inline=False,
+        )
+
+
 def format_profile(profile: dict, xp: int, rank_name: str, title: str) -> str:
     """プロフィール情報を読みやすい文字列に変換してプロンプトへ埋め込む"""
     if not profile and xp == 0:
@@ -888,6 +1000,9 @@ def format_profile(profile: dict, xp: int, rank_name: str, title: str) -> str:
         lines.append(f"- 趣味・好きなもの: {', '.join(profile['hobbies'])}")
     if profile.get("personality"):
         lines.append(f"- 性格: {profile['personality']}")
+    _bf_brief = _bigfive_brief(profile.get("bigfive_self") or profile.get("bigfive") or {})
+    if _bf_brief:
+        lines.append(f"- 性格傾向(Big Five): {_bf_brief}")
     if profile.get("communication_style"):
         lines.append(f"- コミュニケーションスタイル: {profile['communication_style']}")
     if profile.get("background"):
@@ -2155,8 +2270,6 @@ async def personality_cmd(interaction: discord.Interaction):
 
 @client.tree.command(name="myprofile", description="AIが記憶しているあなたの情報を確認する")
 async def myprofile_cmd(interaction: discord.Interaction):
-    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
-
     await interaction.response.defer(ephemeral=True)
 
     uid = str(interaction.user.id)
@@ -2164,55 +2277,75 @@ async def myprofile_cmd(interaction: discord.Interaction):
     xp  = doc.get("xp", 0)
     rank_name, _, _, _ = get_rank_info(xp)
 
-    if is_booster:
-        # ブースター: 全項目表示
-        profile    = doc.get("profile", {})
-        title      = doc.get("title", "")
-        conv_count = doc.get("conv_count", 0)
+    # 性格診断系は全員に開放。profile（メイド会話由来のリッチ分析）を優先し、
+    # simple_profile（要約由来）で補完して1つのビューに統合する。
+    profile = doc.get("profile", {}) or {}
+    sp      = doc.get("simple_profile", {}) or {}
+    title   = doc.get("title", "")
 
-        embed = discord.Embed(title="🧠 AIが記憶しているあなたの情報", color=0xFF69B4)
-        embed.add_field(name="ランク / XP", value=f"{rank_name} / {xp:,} XP", inline=True)
-        embed.add_field(name="二つ名",      value=title or "なし",             inline=True)
-        embed.add_field(name="誕生日",      value=profile.get("birthday") or "不明", inline=True)
-        embed.add_field(name="口調の特徴",  value=profile.get("tone") or "まだ分析中", inline=False)
+    def pick(*vals):
+        for v in vals:
+            if v:
+                return v
+        return None
+
+    tone        = profile.get("tone")
+    vibe        = sp.get("vibe")
+    vocab       = profile.get("vocabulary")
+    hobbies     = profile.get("hobbies") or []
+    personality = pick(profile.get("personality"), sp.get("personality"))
+    comm        = pick(profile.get("communication_style"),
+                       "・".join(sp.get("tone_tags") or []) or None)
+    background  = pick(profile.get("background"), sp.get("background"))
+    relations   = pick(profile.get("relations"), sp.get("relations"))
+    interests   = profile.get("interests_vibe")
+    freq        = sp.get("frequent_members") or []
+    memo        = profile.get("memo") or []
+
+    has_bigfive = bool(profile.get("bigfive_self")) or any(
+        isinstance((profile.get("bigfive") or {}).get(f), dict) for f in FACTOR_JA
+    )
+    has_any = any([tone, vibe, vocab, hobbies, personality, comm, background,
+                   relations, interests, freq, memo, has_bigfive])
+
+    embed = discord.Embed(title="🧠 AIが記憶しているあなたの情報", color=0xFF69B4)
+    embed.add_field(name="ランク / XP", value=f"{rank_name} / {xp:,} XP", inline=True)
+    embed.add_field(name="二つ名",      value=title or "なし",             inline=True)
+    if profile.get("birthday"):
+        embed.add_field(name="誕生日", value=profile["birthday"], inline=True)
+
+    if not has_any:
+        embed.description = ("まだ分析データがありません。\n"
+                             "メイドと会話したりチャットすると自動で分析が始まるよ。\n"
+                             "今すぐ `/personality` で本格的な性格診断もできる！")
+    else:
+        if tone:
+            embed.add_field(name="口調の特徴", value=tone, inline=False)
         if profile.get("tone_self"):
             embed.add_field(name="口調の自己申告（優先）", value=profile["tone_self"], inline=False)
-        embed.add_field(name="口癖・語彙", value=profile.get("vocabulary") or "まだ分析中", inline=False)
-        hobbies = ", ".join(profile.get("hobbies") or []) or "なし"
-        memo    = ", ".join(profile.get("memo") or []) or "なし"
-        embed.add_field(name="趣味・好きなもの",          value=hobbies, inline=False)
-        embed.add_field(name="性格",                      value=profile.get("personality") or "まだ分析中", inline=False)
-        embed.add_field(name="コミュニケーションスタイル", value=profile.get("communication_style") or "まだ分析中", inline=False)
-        embed.add_field(name="サーバー内の立場",           value=profile.get("background") or "まだ分析中", inline=False)
-        embed.add_field(name="よく絡むメンバー",           value=profile.get("relations") or "まだ分析中", inline=False)
-        embed.add_field(name="関心・雰囲気",               value=profile.get("interests_vibe") or "まだ分析中", inline=False)
-        embed.add_field(name="メモ",                      value=memo, inline=False)
-        embed.set_footer(text=f"会話するたびに自動更新 / 累計会話数: {conv_count}回 • /editprofile で編集できます")
+        if vocab:
+            embed.add_field(name="口癖・語彙", value=vocab, inline=False)
+        if vibe:
+            embed.add_field(name="雰囲気", value=vibe, inline=False)
+        if hobbies:
+            embed.add_field(name="趣味・好きなもの", value=", ".join(hobbies), inline=False)
+        if personality:
+            embed.add_field(name="性格", value=personality, inline=False)
+        if comm:
+            embed.add_field(name="コミュニケーションスタイル", value=comm, inline=False)
+        if background:
+            embed.add_field(name="サーバー内の立場", value=background, inline=False)
+        if relations:
+            embed.add_field(name="人間関係", value=relations, inline=False)
+        if interests:
+            embed.add_field(name="関心・雰囲気", value=interests, inline=False)
+        if freq:
+            embed.add_field(name="よく絡むメンバー", value="・".join(freq), inline=False)
+        if memo:
+            embed.add_field(name="メモ", value=", ".join(memo), inline=False)
+        add_bigfive_fields(embed, profile)
 
-    else:
-        # 非ブースター: simple_profileの内容を表示
-        sp = doc.get("simple_profile", {})
-
-        embed = discord.Embed(title="🧠 AIが記憶しているあなたの情報", color=0x99AAB5)
-        embed.add_field(name="ランク / XP", value=f"{rank_name} / {xp:,} XP", inline=True)
-
-        if not sp:
-            embed.description = "まだデータがありません。\nもう少し会話するとAIが分析を始めます！"
-        else:
-            if sp.get("vibe"):
-                embed.add_field(name="雰囲気",           value=sp["vibe"], inline=False)
-            if sp.get("tone_tags"):
-                embed.add_field(name="口調の特徴",       value="・".join(sp["tone_tags"]), inline=False)
-            if sp.get("personality"):
-                embed.add_field(name="性格",             value=sp["personality"], inline=False)
-            if sp.get("background"):
-                embed.add_field(name="サーバー内の立場", value=sp["background"], inline=False)
-            if sp.get("relations"):
-                embed.add_field(name="人間関係",         value=sp["relations"], inline=False)
-            if sp.get("frequent_members"):
-                embed.add_field(name="よく絡むメンバー", value="・".join(sp["frequent_members"]), inline=False)
-        embed.set_footer(text="毎日自動更新 • ブースターになると詳細プロフィール＆編集機能が使えます")
-
+    embed.set_footer(text="会話で自動更新 • /personality で性格診断 • /privacy で推定のオン/オフ")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 class EditProfileModal(discord.ui.Modal, title="プロフィールを編集"):
@@ -2290,6 +2423,134 @@ async def editprofile_cmd(interaction: discord.Interaction):
     doc     = await users_col.find_one({"_id": uid}) or {}
     profile = doc.get("profile", {})
     await interaction.response.send_modal(EditProfileModal(profile))
+
+
+# =============================================================================
+# /personality — TIPI-J 自己申告（検証済みBig Five尺度） ※PERSONALITY_SPEC.md レイヤーA
+#   10項目を 1-7 で回答 → profile.bigfive_self に保存。推定の較正アンカーになる。
+# =============================================================================
+
+_TIPI_PAGES = [["q1", "q2", "q3", "q4"], ["q5", "q6", "q7", "q8"], ["q9", "q10"]]
+_TIPI_TEXT  = {k: (i + 1, text) for i, (k, text, _f, _r) in enumerate(TIPI_ITEMS)}
+
+
+class _LikertSelect(discord.ui.Select):
+    def __init__(self, key: str):
+        num, text = _TIPI_TEXT[key]
+        self.key = key
+        super().__init__(
+            placeholder=f"Q{num}. {text[:80]}",
+            min_values=1, max_values=1,
+            options=[discord.SelectOption(label=lab, value=val) for val, lab in LIKERT_OPTIONS],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.answers[self.key] = int(self.values[0])
+        # 「回答済」表示を即時反映（page_embed が answers を読む）
+        await interaction.response.edit_message(embed=self.view.page_embed(), view=self.view)
+
+
+class _TipiNavButton(discord.ui.Button):
+    def __init__(self, last: bool):
+        self.last = last
+        super().__init__(
+            label="✅ 結果を見る" if last else "次へ ▶",
+            style=discord.ButtonStyle.success if last else discord.ButtonStyle.primary,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        need = _TIPI_PAGES[view.page]
+        if any(k not in view.answers for k in need):
+            await interaction.response.send_message("このページの全問に回答してね。", ephemeral=True)
+            return
+        if self.last:
+            if len(view.answers) < 10:
+                await interaction.response.send_message("まだ未回答の質問があるよ。", ephemeral=True)
+                return
+            await view.finish(interaction)
+            return
+        view.page += 1
+        view.render()
+        await interaction.response.edit_message(embed=view.page_embed(), view=view)
+
+
+class TipiView(discord.ui.View):
+    """TIPI-J 10問をページ送りで回答させるView。"""
+
+    def __init__(self, user_id: str):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.answers: dict = {}
+        self.page = 0
+        self.render()
+
+    def render(self):
+        self.clear_items()
+        for key in _TIPI_PAGES[self.page]:
+            self.add_item(_LikertSelect(key))
+        self.add_item(_TipiNavButton(last=(self.page == len(_TIPI_PAGES) - 1)))
+
+    def page_embed(self) -> discord.Embed:
+        e = discord.Embed(
+            title=f"🧬 性格診断（TIPI-J） {self.page + 1}/{len(_TIPI_PAGES)}ページ",
+            description="各質問に「どれくらい当てはまるか」を 1〜7 で選んでね。",
+            color=0xFF69B4,
+        )
+        for key in _TIPI_PAGES[self.page]:
+            num, text = _TIPI_TEXT[key]
+            mark = f"（回答済: {self.answers[key]}）" if key in self.answers else ""
+            e.add_field(name=f"Q{num}. {text}", value=mark or "未回答", inline=False)
+        e.set_footer(text="心理尺度 TIPI-J（小塩ら2012）に基づく自己申告 • 5分でタイムアウト")
+        return e
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("これは他の人の診断画面だよ。", ephemeral=True)
+            return False
+        return True
+
+    async def finish(self, interaction: discord.Interaction):
+        bigfive_self = compute_self_bigfive(self.answers)
+        await users_col.update_one(
+            {"_id": self.user_id},
+            {"$set": {"profile.bigfive_self": bigfive_self}},
+            upsert=True,
+        )
+        e = discord.Embed(
+            title="🧬 性格診断の結果（自己申告 Big Five）",
+            description="あなた自身の回答に基づく結果だよ。`/myprofile` でAI推定との比較も見られる！",
+            color=0xFF69B4,
+        )
+        for f in FACTOR_JA:
+            seg = bigfive_self.get(f)
+            if isinstance(seg, dict):
+                e.add_field(name=f"{FACTOR_JA[f]}（{FACTOR_HINT[f]}）",
+                            value=f"**{seg['band']}**", inline=True)
+        e.set_footer(text="検証済み尺度TIPI-J • 性格は変わるのでいつでも /personality で再診断OK")
+        self.stop()
+        await interaction.response.edit_message(embed=e, view=None)
+
+
+@client.tree.command(name="personality", description="本格的な性格診断（Big Five / TIPI-J 10問）を受ける")
+async def personality_cmd(interaction: discord.Interaction):
+    view = TipiView(str(interaction.user.id))
+    await interaction.response.send_message(embed=view.page_embed(), view=view, ephemeral=True)
+
+
+@client.tree.command(name="privacy", description="AIによる性格推定のオン/オフを切り替える")
+async def privacy_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}) or {}
+    new_optout = not doc.get("personality_optout", False)
+    await users_col.update_one({"_id": uid}, {"$set": {"personality_optout": new_optout}}, upsert=True)
+    if new_optout:
+        msg = ("🔒 会話ログからのAI性格推定を**停止**しました。\n"
+               "今後あなたの発言は性格推定に使われません（既存の推定結果は `/myprofile` から見えますが更新されません）。\n"
+               "再開したいときはもう一度 `/privacy` を実行してね。")
+    else:
+        msg = "🔓 AI性格推定を**再開**しました。次回のバッチから分析対象に戻ります。"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @client.tree.command(name="clearmaid", description="メイドとの会話履歴をリセットする（ブースター専用）")
