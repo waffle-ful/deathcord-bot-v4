@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from pymongo import MongoClient
 
-MONGODB_URI        = os.environ["MONGODB_URI"]
+MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
 DB_NAME            = "discord_bot_db"
