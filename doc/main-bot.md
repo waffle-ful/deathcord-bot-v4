@@ -62,8 +62,8 @@
 | L573 | `save_claim(uid, text)` | ✓ | `$push claims`（CLAIM_PATTERNS 判定） |
 | L594 | `save_memory(uid, text, category)` | ✓ | embedding 付き `$push memories` |
 | L556 | `_get_embedding(text)` | ✓ | gemini-embedding-001 でベクトル化 |
-| L632 | `_get_recent_memories(uid, top_k)` | ✓ | 最新から単純取得 |
-| L637 | `search_memories(uid, query, top_k)` | ✓ | MEMORY_TRIGGER_WORDS ヒット時に Vector Search |
+| – | `_cosine(a, b)` | ✓ | 純Pythonのコサイン類似度 |
+| L637 | `search_memories(uid, query, top_k)` | ✓ | 返信ごとに in-Python cosine で関連記憶を選定（閾値 `MEMORY_SIM_THRESHOLD`、フォールバックは最近の記憶） |
 | L1136 | `_analyze_nonbooster_realtime(uid, name)` | ✓ | 30発言ごとに非ブースター性格分析 |
 | L714 | `resolve_nickname(name)` | ✓ | エイリアス → 正式名 |
 | L733 | `get_nickname_map()` | ✓ | system.nickname_map 読取 |

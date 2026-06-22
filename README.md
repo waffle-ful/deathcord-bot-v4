@@ -12,22 +12,14 @@ pip install -r requirements-batch.txt    # batch/*.py (GitHub Actions)
 pip install -r requirements-market.txt   # market_report.py
 ```
 
-### 2. MongoDB Atlas — Vector Search インデックス作成
+### 2. MongoDB Atlas — Vector Search インデックスは不要
 
-メモリ検索機能（`search_memories`）は Atlas Vector Search インデックスが必要。
-**手動作成の代わりにスクリプトで一発作成できる：**
+メモリ検索機能（`search_memories`）は **main.py 内の in-Python cosine** に移行済み。
+保存済み記憶の embedding（`gemini-embedding-001`）を取得し、メッセージとの
+コサイン類似度を Python 側で計算して関連記憶を選ぶため、**Atlas の Vector Search
+インデックスは不要**（`setup_mongo_index.py` は非推奨。実行しなくてよい）。
 
-```bash
-MONGODB_URI=<your_uri> python setup_mongo_index.py
-```
-
-- 対象コレクション: `discord_bot_db.users`
-- インデックス名: `memories_vector_index`
-- 次元数: 768（`gemini-embedding-001` の出力次元）
-- インデックスが ACTIVE になるまで Atlas UI で数分かかる
-
-インデックスが存在しない場合でも bot は動作するが、
-メモリ検索が fallback（最新 N 件）になり関連記憶がヒットしにくくなる。
+旧 `memories_vector_index` は残っていても無害（参照されない）。
 
 ### 3. 環境変数
 

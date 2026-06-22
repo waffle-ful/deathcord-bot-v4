@@ -371,7 +371,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
         vec = []
         try:
             er = client_ai.models.embed_content(
-                model="models/text-embedding-004",
+                model="models/gemini-embedding-001",
                 contents=text[:500],
             )
             if hasattr(er, "embeddings") and er.embeddings:
@@ -387,7 +387,8 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
         })
         time.sleep(0.5)
 
-    all_memories = (doc.get("memories", []) + new_memories)[-10:]
+    # 新しい記憶を先頭に置き、新しい順に40件保持（main.py $position:0 と向きを統一）
+    all_memories = (new_memories + doc.get("memories", []))[:40]
 
     if new_claims or new_memories:
         users_col.update_one(

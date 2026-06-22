@@ -190,7 +190,7 @@ GitHub Actions: retro_summarize.py
 | 最新要約は `created_at` 降順ソートで選択（`is_retro`/`retro_date` 除外） | batch/update_mongodb.py | main.py `get_latest_summary` | 並びが壊れる/遡及除外漏れ → 誤った要約注入・応答品質低下（known-issue #8 は 2026-06-06 にフラグ廃止で解消） |
 | `summaries.summary` の `##` セクション区切り | batch/summarize.py | main.py `extract_summary_sections`, post_summary.py | セクション分割が壊れ、プロンプトに要約が入らない |
 | `system.nickname_map.map` の merge 優先順（手動 > AI） | batch/update_mongodb.py L56 | main.py `get_nickname_map` | AI の誤検出が手動登録を上書きし、人物識別が狂う |
-| `users.memories[].embedding` の次元数 | main.py, batch/enrich_memories.py | Atlas `memories_vector_index` | Vector Search 失敗（index と embedding 次元不一致） |
+| `users.memories[].embedding` のモデル/次元の統一 | main.py, batch/enrich_memories.py, batch/focus_summary.py | main.py `search_memories`（in-Python cosine） | クエリと記憶で embedding モデルが違うと次元不一致でその記憶がスキップされ想起精度が落ちる（全箇所 `gemini-embedding-001` 統一が前提） |
 | `RANK_STAGES` の昇順 | main.py 定数 | `get_rank_info`, `update_member_role` | 降順で挿入すると全員のランクが壊れる |
 | `BOT_CONFIG` キーと Bot の user_id 一致 | main.py 定数 | `check_bump` | ID 間違えると Bump 検知がシカト |
 | `HOME_GUILD_ID` が有効なギルド | 環境変数 | `setup_hook` でコマンド sync | 別ギルドに登録される / sync 失敗 |

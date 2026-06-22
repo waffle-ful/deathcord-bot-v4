@@ -9,6 +9,7 @@ import random
 import traceback
 import hmac
 import time
+import math
 from motor.motor_asyncio import AsyncIOMotorClient
 # --- 新SDK (Context Caching対応) ---
 from google import genai
@@ -494,7 +495,14 @@ def _looks_like_claim(text: str) -> bool:
 
 
 async def _get_embedding(text: str) -> list[float] | None:
-    """Gemini Embeddingでテキストをベクトル化"""
+    """Gemini Embeddingでテキストをベクトル化。
+
+    NOTE(レート): search_memories から返信ごとに呼ばれるが、ここは _rate_record()
+    しない。_RATE_LIMIT_RPM(12) は「会話の自然なペース維持」のためチャット応答
+    モデル(generateContent)を絞る behavioral limiter で、embed_content は別エンド
+    ポイント・別クォータ。ここで記録するとチャットのペース制御を誤って圧迫する。
+    embedding 側クォータ(数十〜数百RPM)はホームギルドの会話量では余裕がある。
+    """
     try:
         resp = await asyncio.to_thread(
             gemini_client.models.embed_content,
@@ -532,13 +540,20 @@ async def save_claim(uid: str, text: str):
 
 
 async def save_memory(uid: str, text: str, category: str = ""):
-    """長期記憶をEmbeddingベクトル付きで保存"""
+    """長期記憶をEmbeddingベクトル付きで保存（同一内容は重複スキップ）"""
     import datetime as _dt
+    content = text[:300]
+    # 重複排除: 同一contentが既に保存済みなら何もしない
+    dup = await users_col.find_one(
+        {"_id": uid, "memories.content": content}, {"_id": 1}
+    )
+    if dup:
+        return
     now     = _dt.datetime.now(_dt.timezone.utc)
     year_mo = now.strftime("%Y-%m")
     vec     = await _get_embedding(text)
     entry   = {
-        "content":   text[:300],
+        "content":   content,
         "date":      year_mo,
         "category":  category,
         "embedding": vec or [],
@@ -549,7 +564,7 @@ async def save_memory(uid: str, text: str, category: str = ""):
             "$push": {
                 "memories": {
                     "$each":     [entry],
-                    "$slice":    -10,  # 直近10件
+                    "$slice":    40,   # 直近40件（$position:0 と組で新しい順に保持）
                     "$position": 0,
                 }
             }
@@ -569,46 +584,59 @@ MEMORY_TRIGGER_WORDS = [
     "冬", "秋", "夏", "春", # 季節
 ]
 
-async def _get_recent_memories(uid: str, top_k: int) -> list[dict]:
-    """Vector Searchなしで最新記憶をそのまま返す（高速）"""
-    doc = await users_col.find_one({"_id": uid}, {"memories": 1}) or {}
-    return doc.get("memories", [])[-top_k:]
+def _cosine(a: list[float], b: list[float]) -> float:
+    """2ベクトルのコサイン類似度（純Python・依存なし）"""
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na  += x * x
+        nb  += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+# コサイン類似度の採用閾値（gemini-embedding-001。ログの best= を見て要調整）
+# 低くするほど積極的に記憶を想起（ノイズも増える）。high=厳選。
+MEMORY_SIM_THRESHOLD = 0.65
+
 
 async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     """
-    記憶検索（トリガー制）
-    ① 20文字以下 → スキップ
-    ② 記憶系キーワードあり → Vector Search（フル）
-    ③ それ以外 → 最新記憶をそのまま返す（高速）
+    記憶検索（毎回 in-Python cosine）
+    ① 8文字未満 → スキップ
+    ② クエリをembedding化し、保存済み記憶とのcosine類似度を全件計算
+    ③ 閾値以上の上位top_kを返す。該当なし → 最近の記憶でフォールバック
+    （記憶トリガー語が含まれる場合は「思い出して」の意図が強いので閾値を緩める）
     """
-    if len(query) < 15:
+    if len(query) < 8:
         return []
-    use_vector = any(w in query for w in MEMORY_TRIGGER_WORDS)
-    if use_vector:
-        vec = await _get_embedding(query)
-        if vec:
-            try:
-                pipeline = [
-                    {
-                        "$vectorSearch": {
-                            "index":         "memories_vector_index",
-                            "path":          "memories.embedding",
-                            "queryVector":   list(vec),
-                            "numCandidates": 20,
-                            "limit":         top_k,
-                        }
-                    },
-                    {"$match": {"_id": uid}},
-                    {"$project": {"memories": 1}},
-                ]
-                cursor  = users_col.aggregate(pipeline)
-                results = await cursor.to_list(length=10)
-                if results and results[0].get("memories"):
-                    print(f"[memory] Vector Search成功: {uid}")
-                    return results[0]["memories"][:top_k]
-            except Exception as e:
-                print(f"[WARN] vector search: {e}")
-    return await _get_recent_memories(uid, top_k)
+    doc      = await users_col.find_one({"_id": uid}, {"memories": 1}) or {}
+    memories = doc.get("memories", [])
+    if not memories:
+        return []
+    qvec = await _get_embedding(query)
+    if not qvec:
+        return memories[:top_k]  # embedding失敗 → 最近の記憶
+    threshold = MEMORY_SIM_THRESHOLD
+    if any(w in query for w in MEMORY_TRIGGER_WORDS):
+        threshold -= 0.10  # 明示的に思い出させる意図 → より積極的に想起
+    scored = []
+    for m in memories:
+        emb = m.get("embedding")
+        # 次元不一致（旧モデル由来の記憶等）は安全にスキップ
+        if not emb or len(emb) != len(qvec):
+            continue
+        scored.append((_cosine(qvec, emb), m))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best     = scored[0][0] if scored else 0.0
+    relevant = [m for sc, m in scored if sc >= threshold][:top_k]
+    if relevant:
+        # best= は閾値チューニング用（この値以下なら拾われない）
+        print(f"[memory] cosine hit: {uid} best={best:.3f} thr={threshold:.2f} ({len(relevant)}件)")
+        return relevant
+    print(f"[memory] cosine miss: {uid} best={best:.3f} thr={threshold:.2f} → 最近の記憶")
+    return memories[:top_k]  # 関連記憶なし → 最近の記憶
 
 
 async def _extract_claims_and_memories(uid: str, display_name: str, user_msg: str):
@@ -623,14 +651,19 @@ async def _extract_claims_and_memories(uid: str, display_name: str, user_msg: st
 JSON形式で返せ。含まれない場合は null を返せ。
 前置き・説明文・コードブロックは不要。
 
-判断基準（いずれかに該当する場合のみ保存）:
-- 趣味・好きなもの・ハマっているもの
-- 人生の出来事・状況の変化（転職・引越し等）
+判断基準（いずれかに該当する場合に保存）:
+- 趣味・好きなもの・嫌いなもの・ハマっているもの
+- 人生の出来事・状況の変化（転職・引越し・進学等）
 - 強い感情・印象的な体験
-- 将来の目標・計画
+- 将来の目標・計画・予定・約束
+- 人間関係（家族・友人・恋人・ペット等）
+- 価値観・意見・こだわり
+- 悩み・困りごと・体調
+
+ただし、単なる挨拶・相槌・その場限りの雑談は保存しない。
 
 出力形式（該当する場合）:
-{{"category": "趣味/出来事/感情/計画のいずれか"}}
+{{"category": "趣味/出来事/感情/計画/人間関係/価値観/悩みのいずれか"}}
 
 【発言】
 {user_msg[:200]}"""
@@ -1330,8 +1363,12 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     )
 
     # ユーザー情報・サーバー要約をプロンプト先頭に付加
+    # memories.embedding は重い(各3072次元)＆ここでは使わないので射影で除外。
+    # 関連記憶は search_memories() が別途取得する。
     try:
-        user_doc = await users_col.find_one({"_id": uid}) or {}
+        user_doc = await users_col.find_one(
+            {"_id": uid}, {"memories.embedding": 0}
+        ) or {}
     except Exception as e:
         print(f"[WARN] _build_prompt users_col失敗: {e}")
         user_doc = {}

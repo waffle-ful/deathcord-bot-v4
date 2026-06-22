@@ -110,13 +110,14 @@
 | `$set butler_history: []` | L2304 | /clearmaid |
 | `$inc invite_count, xp` | L2955, L2965 | 招待検出 + ボーナス |
 
-### Vector Search インデックス
+### 記憶の類似検索（in-Python cosine）
 
-- **名前**: `memories_vector_index`
-- **対象**: `users.memories.embedding`
-- **作成**: MongoDB Atlas の UI で手動作成（セットアップスクリプトなし ⚠️）
-- **使用**: main.py `search_memories` L650-669、メモリトリガーワード（`MEMORY_TRIGGER_WORDS`）がヒットした時のみ実行
-- **フォールバック**: Vector Search が例外 / 0 件なら `_get_recent_memories` で最新 N 件を返す
+> 2026-06-22 に Atlas Vector Search から移行。旧 `memories_vector_index` は不要（残置可・参照されない。詳細は known-issues #3）。
+
+- **方式**: main.py `search_memories`。返信ごとにメッセージを `gemini-embedding-001` で embedding 化し、`users.memories[].embedding` との**コサイン類似度を Python 側で全件計算**（`_cosine`）。
+- **採用条件**: クエリ8文字以上 ＆ ユーザーに記憶あり。`MEMORY_SIM_THRESHOLD`(既定0.65) 以上の上位 top_k を注入。`MEMORY_TRIGGER_WORDS`（「覚えてる」等）ヒット時は閾値を 0.10 下げて積極想起。
+- **フォールバック**: 閾値を超える記憶が無い / embedding 失敗時は最近の記憶（配列先頭 N 件）を返す。
+- **次元不一致の保護**: 旧モデル由来などで次元が違う記憶は `len(emb)!=len(qvec)` で安全にスキップ。
 
 ### xp 降順インデックス
 
@@ -291,10 +292,10 @@ Discord サーバーのチャット
    - 遡及（retro）要約は `is_retro`/`retro_date` で除外される
    - `is_latest` フラグは廃止（known-issue #8 を 2026-06-06 に解消）。旧フラグ方式の「複数件 True が残る」リスクは消滅した
 
-2. **`users.memories` の embedding 次元数は固定**
-   - `gemini-embedding-001` のデフォルト次元（本プロジェクトでは 768 と推定）
-   - モデル変更時は全 memories の embedding 再計算が必要
-   - Atlas Vector Search index も再作成
+2. **`users.memories` の embedding は `gemini-embedding-001`（デフォルト3072次元）**
+   - 全保存箇所（main.py / enrich / focus）で同一モデルに統一
+   - in-Python cosine 検索なので Atlas index への依存はなし。クエリと記憶が同一モデル=同一次元なら整合
+   - 旧モデル(text-embedding-004=768)由来の混在記憶は次元ガードで自動スキップされるが、揃えたい場合は全 memories を再 embedding
 
 3. **`users._id` は文字列型**
    - `str(user.id)` で常に文字列化されている
