@@ -39,14 +39,19 @@ MODEL          = "models/gemma-4-31b-it"
 MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
 DB_NAME        = "discord_bot_db"
 JST            = timezone(timedelta(hours=9))
-FETCH_DAYS     = 7   # 直近何日分のログを取得するか
+FETCH_DAYS     = 7    # 直近何日分の生ログを取得するか
+SUMMARY_LOOKBACK_DAYS = 90     # 要約アーカイブを何日分さかのぼるか
+SUMMARY_MAX_DOCS      = 1200   # 走査する要約ドキュメント上限（安全弁。90日×12件/日≈1080をカバー）
+MAX_LOG_CHARS         = 25000  # 生ログをプロンプトに入れる最大文字数（旧10000の切り詰めを撤廃）
+MAX_SUMMARY_CHARS     = 12000  # 要約抜粋をプロンプトに入れる最大文字数
 
 # =============================================================================
 # プロンプト
 # =============================================================================
 
 MEMBER_FOCUS_PROMPT = """\
-以下はDiscordサーバーの直近{days}日分のチャットログです。
+以下はDiscordサーバーの「長期の要約アーカイブ（過去数ヶ月）」と「直近{days}日分の生チャットログ」です。
+両方を突き合わせ、長期の傾向と直近の動きの両面から、
 「{name}」というメンバーの発言・言及に絞って分析し、
 この人物についての詳細な観察レポートを書いてください。
 前置き・導入文は不要です。各セクションの見出しから即座に書き始めてください。
@@ -61,7 +66,8 @@ MEMBER_FOCUS_PROMPT = """\
 """
 
 KEYWORD_FOCUS_PROMPT = """\
-以下はDiscordサーバーの直近{days}日分のチャットログです。
+以下はDiscordサーバーの「長期の要約アーカイブ（過去数ヶ月）」と「直近{days}日分の生チャットログ」です。
+両方を突き合わせ、長期の経緯と直近の状況の両面から、
 「{keyword}」に関する発言・話題に絞って分析し、
 このトピックについての詳細なレポートを書いてください。
 前置き・導入文は不要です。各セクションの見出しから即座に書き始めてください。
@@ -207,17 +213,23 @@ def fetch_logs(days: int) -> list[dict]:
     return msgs
 
 
-def filter_logs(msgs: list[dict]) -> str:
-    """フォーカス対象に絞ってログをテキスト化"""
+def filter_logs(msgs: list[dict], needles: list[str] = None) -> str:
+    """フォーカス対象に絞ってログをテキスト化。
+
+    member の場合、needles に nickname_map のエイリアスを含めると
+    「たろー」のような愛称での発言・言及も拾える。
+    """
     filtered = []
 
     if FOCUS_TYPE == "member":
-        target_name = FOCUS_NAME.lower()
-        target_id   = FOCUS_TARGET
+        target_id = FOCUS_TARGET
+        nlist     = [n.lower() for n in (needles or [FOCUS_NAME]) if n]
         for m in msgs:
-            # 発言者が対象 or メッセージ内に名前/IDが含まれる
-            is_author  = m["author_id"] == target_id or target_name in m["author"].lower()
-            is_mention = target_name in m["content"].lower() or f"<@{target_id}>" in m["content"]
+            author_l  = m["author"].lower()
+            content_l = m["content"].lower()
+            # 発言者が対象 or メッセージ内に名前/エイリアス/IDが含まれる
+            is_author  = m["author_id"] == target_id or any(n in author_l for n in nlist)
+            is_mention = any(n in content_l for n in nlist) or f"<@{target_id}>" in m["content"]
             if is_author or is_mention:
                 filtered.append(m)
     else:
@@ -231,6 +243,69 @@ def filter_logs(msgs: list[dict]) -> str:
         ts = m["timestamp"][:16].replace("T", " ")
         lines.append(f"[{ts}] #{m['channel']} {m['author']}: {m['content']}")
     return "\n".join(lines)
+
+
+# =============================================================================
+# 長期アーカイブ（summaries）からの絞り込み
+# =============================================================================
+
+def build_member_needles(system_col) -> list[str]:
+    """FOCUS_NAME と、nickname_map 上で同一人物を指すエイリアス群を集める。"""
+    variants = {FOCUS_NAME}
+    try:
+        doc  = system_col.find_one({"_id": "nickname_map"}) or {}
+        nmap = doc.get("map", {})
+        for alias, canon in nmap.items():
+            if canon == FOCUS_NAME or alias == FOCUS_NAME:
+                variants.add(alias)
+                variants.add(canon)
+    except Exception as e:
+        print(f"[WARN] nickname_map 読込失敗: {e}")
+    return [v for v in variants if v]
+
+
+def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
+    """summaries アーカイブ（永久保持）から、needle を含む行だけを
+    新しい順に MAX_SUMMARY_CHARS まで抜き出してテキスト化する。
+
+    要約は全員分の内容を含むため、フォーカス対象を含む行のみに絞って
+    ノイズとトークン消費を抑える。retro 要約も歴史的文脈として含める。
+    """
+    needles_l = [n.lower() for n in needles if n]
+    if not needles_l:
+        return ""
+
+    # created_at は全書き手が .isoformat()（UTC）で文字列保存しているため、
+    # ISO 文字列の辞書順比較で日付フィルタできる（analyze_* / enrich と同パターン）。
+    since = datetime.now(timezone.utc) - timedelta(days=SUMMARY_LOOKBACK_DAYS)
+    try:
+        docs = list(summaries_col.find(
+            {"summary": {"$exists": True}, "created_at": {"$gte": since.isoformat()}},
+            {"summary": 1, "created_at": 1, "retro_date": 1},
+            sort=[("created_at", -1)],
+        ).limit(SUMMARY_MAX_DOCS))
+    except Exception as e:
+        print(f"[WARN] summaries 取得失敗: {e}")
+        return ""
+
+    blocks, total = [], 0
+    for d in docs:
+        summ = d.get("summary", "")
+        if not summ:
+            continue
+        date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
+        hits = [ln.strip() for ln in summ.split("\n")
+                if ln.strip() and any(n in ln.lower() for n in needles_l)]
+        if not hits:
+            continue
+        block = f"[{date}]\n" + "\n".join(hits)
+        if total + len(block) > MAX_SUMMARY_CHARS:
+            break  # 新しい順なので、ここで打ち切れば直近を優先して保持
+        blocks.append(block)
+        total += len(block)
+
+    print(f"[focus] 関連サマリ: {len(blocks)}ブロック ({total}文字)")
+    return "\n\n".join(blocks)
 
 
 # =============================================================================
@@ -275,13 +350,25 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
     return None
 
 
-def generate_report(client_ai: genai.Client, log_text: str) -> str | None:
+def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = "") -> str | None:
     if FOCUS_TYPE == "member":
         prompt = MEMBER_FOCUS_PROMPT.format(name=FOCUS_NAME, days=FETCH_DAYS)
     else:
         prompt = KEYWORD_FOCUS_PROMPT.format(keyword=FOCUS_NAME, days=FETCH_DAYS)
 
-    full_prompt = prompt + f"\n\n【チャットログ（{FOCUS_NAME}関連のみ抽出）】\n{log_text[:10000]}"
+    parts = []
+    if summary_text:
+        parts.append(
+            f"【長期の要約アーカイブ（過去{SUMMARY_LOOKBACK_DAYS}日・{FOCUS_NAME}関連の行を抽出）】\n"
+            f"{summary_text[:MAX_SUMMARY_CHARS]}"
+        )
+    if log_text:
+        parts.append(
+            f"【直近{FETCH_DAYS}日の生チャットログ（{FOCUS_NAME}関連のみ抽出）】\n"
+            f"{log_text[:MAX_LOG_CHARS]}"
+        )
+
+    full_prompt = prompt + "\n\n" + "\n\n".join(parts)
     return call_ai(client_ai, full_prompt, max_tokens=3000)
 
 
@@ -465,24 +552,38 @@ def post_report(report: str):
 def main():
     print(f"[focus] type={FOCUS_TYPE}, target={FOCUS_TARGET}, name={FOCUS_NAME}")
 
-    # ログ取得
-    print(f"[focus] 直近{FETCH_DAYS}日分のログを取得中...")
-    msgs = fetch_logs(FETCH_DAYS)
-    if not msgs:
-        print("[focus] メッセージが見つかりません。")
+    # MongoDB は両モードで使う（要約アーカイブ・nickname_map）ので先に接続
+    mongo         = MongoClient(MONGODB_URI)
+    db            = mongo[DB_NAME]
+    users_col     = db["users"]
+    summaries_col = db["summaries"]
+    system_col    = db["system"]
+
+    # フォーカス対象の検索語（member はエイリアスまで展開）
+    if FOCUS_TYPE == "member":
+        needles = build_member_needles(system_col)
+        print(f"[focus] 名前バリアント: {needles}")
+    else:
+        needles = list({FOCUS_TARGET, FOCUS_NAME})
+
+    # 生ログ取得（直近 FETCH_DAYS 日）
+    print(f"[focus] 直近{FETCH_DAYS}日分の生ログを取得中...")
+    msgs     = fetch_logs(FETCH_DAYS)
+    log_text = filter_logs(msgs, needles) if msgs else ""
+    print(f"[focus] 対象生ログ: {len(log_text)}文字")
+
+    # 長期アーカイブ（summaries）から関連行を抽出
+    print(f"[focus] 過去{SUMMARY_LOOKBACK_DAYS}日の要約アーカイブを検索中...")
+    summary_text = fetch_relevant_summaries(summaries_col, needles)
+
+    if not log_text and not summary_text:
+        print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
         return
 
-    # フォーカス対象に絞る
-    log_text = filter_logs(msgs)
-    if not log_text:
-        print(f"[focus] 「{FOCUS_NAME}」に関する発言が見つかりませんでした。")
-        return
-    print(f"[focus] 対象ログ: {len(log_text)}文字")
-
-    # レポート生成
+    # レポート生成（長期要約 + 直近生ログ）
     print("[focus] レポート生成中...")
     client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    report    = generate_report(client_ai, log_text)
+    report    = generate_report(client_ai, log_text, summary_text)
     if not report:
         print("[focus] レポート生成失敗")
         return
@@ -492,8 +593,6 @@ def main():
     if FOCUS_TYPE == "member":
         print("[focus] プロフィール・記憶抽出中...")
         time.sleep(3)
-        mongo     = MongoClient(MONGODB_URI)
-        users_col = mongo[DB_NAME]["users"]
         profile = extract_profile(client_ai, report)
         if profile:
             save_profile(users_col, profile)
