@@ -946,13 +946,42 @@ _CONF_BADGE = {"high": "◎", "mid": "○", "low": "△"}
 
 
 def _tipi_band(val: float) -> str:
+    """中点基準の素朴なバンド（規範が無い因子のフォールバック）。"""
     if val <= 3.5:
         return "低"
     return "高" if val >= 5.0 else "中"
 
 
+# TIPI-J 出版規範（小塩・阿部・カトローニ 2012, パーソナリティ研究 21(1), 40-52, Table 2）。
+#   各因子=2項目の【合計得点】(範囲2-14)の 平均(M), 標準偏差(SD)。n=902 大学生。
+#   ※規範参照バンドに使う。固定閾値(≤3.5/≥5.0)だと中点4.0からズレる因子（協調性・神経症は
+#     高めに偏る）で高バンドを過大化するため、因子ごとに M±0.5SD で低/中/高に分ける。
+#   ※母集団は大学生サンプル。一般・本コミュニティとは厳密には異なる点に留意（最善の公刊規範）。
+TIPI_NORMS = {
+    "extraversion":      (7.83, 2.97),
+    "agreeableness":     (9.48, 2.16),
+    "conscientiousness": (6.14, 2.41),
+    "neuroticism":       (9.21, 2.48),
+    "openness":          (8.03, 2.48),
+}
+
+
+def _norm_band(factor: str, total: float, n_items: int) -> str | None:
+    """合計得点を出版規範(M±0.5SD)と比較して低/中/高。規範が無い/2項目揃わない場合はNone。"""
+    norm = TIPI_NORMS.get(factor)
+    if not norm or n_items < 2:
+        return None
+    m, sd = norm
+    if total < m - 0.5 * sd:
+        return "低"
+    if total > m + 0.5 * sd:
+        return "高"
+    return "中"
+
+
 def compute_self_bigfive(answers: dict) -> dict:
-    """TIPI-J回答(q1..q10 → 1-7)を5因子のband/scoreに採点する（自己申告）。"""
+    """TIPI-J回答(q1..q10 → 1-7)を5因子のband/scoreに採点する（自己申告）。
+    バンドは出版規範(TIPI_NORMS)を基準にした規範参照（M±0.5SD）。"""
     pair = {}  # factor -> [normal, reversed-adjusted...]
     for key, _text, factor, reverse in TIPI_ITEMS:
         v = answers.get(key)
@@ -963,8 +992,11 @@ def compute_self_bigfive(answers: dict) -> dict:
     for factor, vals in pair.items():
         if not vals:
             continue
-        avg = sum(vals) / len(vals)
-        result[factor] = {"band": _tipi_band(avg), "score": round((avg - 1) / 6 * 100)}
+        total = sum(vals)  # 合計得点(2項目=範囲2-14)で規範参照
+        band = _norm_band(factor, total, len(vals))
+        if band is None:   # 規範なし/項目不足は中点基準でフォールバック
+            band = _tipi_band(total / len(vals))
+        result[factor] = {"band": band, "score": round((total / len(vals) - 1) / 6 * 100)}
     result["method"] = "self_report"
     result["answered_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return result
@@ -986,10 +1018,53 @@ def _bigfive_brief(bigfive: dict) -> str | None:
     return "、".join(parts) if parts else None
 
 
-def add_bigfive_fields(embed: discord.Embed, profile: dict):
-    """/myprofile 用: 推定と自己申告のBig Fiveをembedに追加する。"""
+# 自己-行動 乖離レイヤー（PERSONALITY_SPEC.md レイヤーB拡張・SOKA重み付け）
+#   自己申告(bigfive_self) と 客観行動(behavior_signals.pct) のギャップを、行動が自己と
+#   同等以上に妥当な因子に限って「振り返るきっかけ」として提示する。LLM推定(bigfive)は使わない
+#   （r≤0.27で自己申告の劣化コピーに過ぎず、ギャップの根拠にできないため）。
+#   SOKA: 外向性=行動が妥当(主役) / 開放性=脇役・低確信 / 情緒=自己が最良(対象外) /
+#         協調性・誠実性=チャット行動シグナルが弱い(対象外)。
+_DISCREPANCY_FACTORS = {
+    "extraversion": {"conf": "mid",
+                     "hi": "サーバーではよく発言し、人に話しかける方",
+                     "lo": "サーバーでの発言・絡みは少なめ"},
+    "openness":     {"conf": "low",
+                     "hi": "語彙が多彩で、疑問や新しい話題をよく投げる方",
+                     "lo": "話題や語彙は安定志向で、変化球は控えめ"},
+}
+_BEHAVIOR_MIN_MSGS = 50  # 行動側にこれだけ発言がなければギャップ判定しない（沈黙）
+
+
+def bigfive_discrepancy(profile: dict) -> list[str]:
+    """自己申告と客観行動(behavior_signals.pct)のギャップをSOKA-legitimateな因子に限り検出。
+    「真の自分」は名乗らず、確信度付きの“振り返るきっかけ”として返す。無ければ空リスト。"""
     self_bf = profile.get("bigfive_self") or {}
-    inf_bf  = profile.get("bigfive") or {}
+    bs      = profile.get("behavior_signals") or {}
+    raw, pct = bs.get("raw") or {}, bs.get("pct") or {}
+    if not self_bf or not pct or raw.get("n_msgs", 0) < _BEHAVIOR_MIN_MSGS:
+        return []  # 自己申告なし or 行動データ薄 → 沈黙
+    out = []
+    for factor, meta in _DISCREPANCY_FACTORS.items():
+        sj = self_bf.get(factor)
+        p  = pct.get(factor)
+        if not isinstance(sj, dict) or not isinstance(p, (int, float)):
+            continue
+        badge = _CONF_BADGE[meta["conf"]]
+        if sj.get("band") == "低" and p >= 75:
+            out.append(f"**{FACTOR_JA[factor]}** {badge}：自己申告は『控えめ』ですが、"
+                       f"{meta['hi']}（行動データで上位{100 - int(p)}%）。")
+        elif sj.get("band") == "高" and p <= 25:
+            out.append(f"**{FACTOR_JA[factor]}** {badge}：自己申告は『高め』ですが、"
+                       f"{meta['lo']}（行動データで下位{int(p)}%）。")
+    return out
+
+
+def add_bigfive_fields(embed: discord.Embed, profile: dict, optout: bool = False):
+    """/myprofile 用: 推定と自己申告のBig Fiveをembedに追加する。
+    optout=True（personality_optout）の人には分析由来（推定・行動ギャップ）を出さず、
+    本人の自己申告(bigfive_self)だけ表示する。"""
+    self_bf = profile.get("bigfive_self") or {}
+    inf_bf  = {} if optout else (profile.get("bigfive") or {})
     if not self_bf and not any(isinstance(inf_bf.get(f), dict) for f in FACTOR_JA):
         return
     lines = []
@@ -1009,10 +1084,20 @@ def add_bigfive_fields(embed: discord.Embed, profile: dict):
         lines.append(seg)
     if lines:
         embed.add_field(name="🧬 性格傾向（Big Five）", value="\n".join(lines)[:1024], inline=False)
+        gaps = [] if optout else bigfive_discrepancy(profile)
+        if gaps:
+            embed.add_field(
+                name="🔍 自己申告と行動のギャップ（振り返りのヒント）",
+                value=("\n".join(gaps)[:900] +
+                       "\n— これは“間違い”ではなく、自分では気づきにくい一面かも。"
+                       "特に外向性は『周りから見た自分』の方が当たりやすい傾向があります。"),
+                inline=False,
+            )
         embed.add_field(
             name="ℹ️ 注記",
             value=("推定（◎高/○中/△低 = 確信度）は会話ログからのAI推定で、正確な診断ではありません。"
-                   "`/personalitytest` で本人回答に基づく結果も追加できます。"),
+                   "ギャップも“真の自分”の断定ではなく、自己申告(`/personalitytest`)と"
+                   "サーバーでの行動傾向の差を参考表示したものです。"),
             inline=False,
         )
 
@@ -2319,6 +2404,7 @@ async def myprofile_cmd(interaction: discord.Interaction):
     profile = doc.get("profile", {}) or {}
     sp      = doc.get("simple_profile", {}) or {}
     title   = doc.get("title", "")
+    optout  = bool(doc.get("personality_optout"))  # 推定オプトアウト者には分析由来を出さない
 
     def pick(*vals):
         for v in vals:
@@ -2339,9 +2425,9 @@ async def myprofile_cmd(interaction: discord.Interaction):
     freq        = sp.get("frequent_members") or []
     memo        = profile.get("memo") or []
 
-    has_bigfive = bool(profile.get("bigfive_self")) or any(
+    has_bigfive = bool(profile.get("bigfive_self")) or (not optout and any(
         isinstance((profile.get("bigfive") or {}).get(f), dict) for f in FACTOR_JA
-    )
+    ))
     has_any = any([tone, vibe, vocab, hobbies, personality, comm, background,
                    relations, interests, freq, memo, has_bigfive])
 
@@ -2380,7 +2466,7 @@ async def myprofile_cmd(interaction: discord.Interaction):
             embed.add_field(name="よく絡むメンバー", value="・".join(freq), inline=False)
         if memo:
             embed.add_field(name="メモ", value=", ".join(memo), inline=False)
-        add_bigfive_fields(embed, profile)
+        add_bigfive_fields(embed, profile, optout=optout)
 
     embed.set_footer(text="会話で自動更新 • /personalitytest で性格診断 • /privacy で推定のオン/オフ")
     await interaction.followup.send(embed=embed, ephemeral=True)

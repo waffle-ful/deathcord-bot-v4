@@ -22,6 +22,7 @@ import os
 import json
 import re
 import time
+import bisect
 from datetime import datetime, timezone, timedelta
 from pymongo import MongoClient
 from google import genai
@@ -39,6 +40,7 @@ SUMMARY_DAYS   = 7
 MIN_UTTERANCES     = 15  # Big Five推定に必要な最低発言数（messages＋butler合算）
 MAX_USERS_PER_RUN  = 25  # 1回のバッチで分析する最大人数（タイムアウト対策）
 ROTATION_DAYS      = 5   # 直近この日数内に分析済みの人はローテーションでスキップ
+MIN_COHORT         = 8   # 行動パーセンタイル算出に必要な最低母集団（これ未満は沈黙）
 
 # 確信度の順序（安全マージで大小比較に使う）
 CONF_RANK = {None: -1, "low": 0, "mid": 1, "high": 2}
@@ -332,6 +334,69 @@ def signals_to_text(s: dict) -> str:
 
 
 # =============================================================================
+# 行動シグナル → コホート相対パーセンタイル（自己-行動 乖離レイヤーの「観測側」土台）
+#   ※ここで使うのは Stage1 の決定論シグナルのみ。LLM推定(bigfive)は混ぜない。
+#     生の率は単体では高低を判断できないため、サーバー内（コホート）相対順位に変換する。
+#   ※SOKA: 行動が自己申告と同等以上に妥当なのは外向性(E)。開放性(O)は脇役・低確信。
+#     N/A/C は行動シグナルが弱いのでパーセンタイル化しない（乖離レイヤーでも沈黙）。
+# =============================================================================
+
+def _signal_features(raw: dict) -> dict:
+    """raw signals から E/O の連続特徴量を取り出す（パーセンタイル化前）。
+    O系はボリューム(=外向性)との交絡を避けるため発言数で正規化する。"""
+    n = max(raw.get("n_msgs", 0), 1)
+    return {
+        "E_n_msgs":    raw.get("n_msgs", 0),
+        "E_avg_len":   raw.get("avg_len", 0.0),
+        "E_exclam":    raw.get("exclam_rate", 0.0),
+        "E_emoji":     raw.get("emoji_per_msg", 0.0),
+        "E_mention":   raw.get("mention_rate", 0.0),
+        "O_lexdiv":    raw.get("lexical_diversity", 0.0),
+        "O_curiosity": raw.get("curiosity_hits", 0) / n,
+        "O_question":  raw.get("question_rate", 0.0),
+    }
+
+_E_FEATS = ["E_n_msgs", "E_avg_len", "E_exclam", "E_emoji", "E_mention"]
+_O_FEATS = ["O_lexdiv", "O_curiosity", "O_question"]
+
+
+def _pct_rank(sorted_vals: list, x: float) -> int:
+    """ソート済み母集団に対する x のパーセンタイル順位(0-100)。"""
+    i = bisect.bisect_right(sorted_vals, x)
+    return round(i / len(sorted_vals) * 100)
+
+
+def compute_cohort_percentiles(users_col) -> int:
+    """全ユーザの behavior_signals.raw から E/O のコホート相対パーセンタイルを算出し、
+    behavior_signals.pct を更新する。母集団が MIN_COHORT 未満なら付けない（沈黙）。
+    返り値は pct を更新した人数。"""
+    docs = list(users_col.find(
+        {"profile.behavior_signals.raw": {"$exists": True},
+         "personality_optout": {"$ne": True}},  # オプトアウト者は母集団からも除外
+        {"profile.behavior_signals.raw": 1},
+    ))
+    if len(docs) < MIN_COHORT:
+        print(f"[personality] cohort too small ({len(docs)}<{MIN_COHORT}) - pct skip")
+        return 0
+
+    feats = {d["_id"]: _signal_features(d["profile"]["behavior_signals"]["raw"]) for d in docs}
+    dists = {k: sorted(f[k] for f in feats.values()) for k in (_E_FEATS + _O_FEATS)}
+
+    updated = 0
+    for uid, f in feats.items():
+        e_ranks = [_pct_rank(dists[k], f[k]) for k in _E_FEATS]
+        o_ranks = [_pct_rank(dists[k], f[k]) for k in _O_FEATS]
+        pct = {
+            "extraversion": round(sum(e_ranks) / len(e_ranks)),
+            "openness":     round(sum(o_ranks) / len(o_ranks)),
+        }
+        users_col.update_one({"_id": uid}, {"$set": {"profile.behavior_signals.pct": pct}})
+        updated += 1
+    print(f"[personality] cohort percentiles updated for {updated} users (n={len(docs)})")
+    return updated
+
+
+# =============================================================================
 # Stage 2-3: TIPI採点 → 因子スコア → バンド・確信度
 # =============================================================================
 
@@ -587,13 +652,14 @@ def main():
         context = analyze_context(client, name, summaries_text)
         time.sleep(3)
 
-        if not tone and not context and not bigfive:
-            print(f"[personality] Skipped {name}: データ不足（既存は温存）")
-            continue
-
-        # ④ 安全マージ（既存を破壊しない）
+        # ④ 安全マージ（既存を破壊しない）＋ Stage1行動シグナルを常時永続化
         existing = doc.get("profile", {})
         merged, has_confident = safe_merge(existing, tone, context, bigfive)
+        # 決定論シグナルはLLM失敗時も有効。乖離レイヤーの「観測側」土台として常に保存する。
+        merged["behavior_signals"] = {
+            "raw":         compute_signals(utterances),
+            "computed_at": now.isoformat(),
+        }
 
         update = {"$set": {"profile": merged}}
         # conv_count は confident な性格推定が保存できたときだけリセット。
@@ -602,9 +668,20 @@ def main():
             update["$unset"] = {"conv_count": ""}
 
         users_col.update_one({"_id": doc["_id"]}, update)
-        print(f"[personality] Saved {name} (confident={has_confident})")
+        if not tone and not context and not bigfive:
+            print(f"[personality] {name}: LLM分析は空（行動シグナルのみ保存）")
+        else:
+            print(f"[personality] Saved {name} (confident={has_confident})")
         success += 1
         time.sleep(5)
+
+    # 全ユーザの行動シグナルからコホート相対パーセンタイルを再計算（乖離レイヤー用）。
+    # per-userの本体保存はループ内で完了済みなので、ここで失敗してもジョブを落とさない（非致命）。
+    print("[personality] Recomputing cohort behavior percentiles...")
+    try:
+        compute_cohort_percentiles(users_col)
+    except Exception as e:
+        print(f"[personality] cohort percentile step failed (non-fatal): {e}")
 
     print(f"[personality] Completed. {success}/{processed} analyzed (candidates={len(candidates)}).")
 

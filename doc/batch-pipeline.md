@@ -123,13 +123,23 @@ retro_summarize.py (batch/)
 ```
 focus_summary.py
     ├ 環境変数: FOCUS_TYPE, FOCUS_TARGET, FOCUS_NAME
-    ├ FOCUS_TYPE="member": 特定メンバーの全発言を集めて分析
+    ├ 情報源は2系統（Tier1 で拡張済み）:
+    │   ① 直近 FETCH_DAYS=7 日の生ログ（Discord REST, filter_logs で絞り込み、最大 MAX_LOG_CHARS=25000 字）
+    │   ② summaries アーカイブ（created_at >= 過去 SUMMARY_LOOKBACK_DAYS=90 日, 安全弁 SUMMARY_MAX_DOCS=1200,
+    │       fetch_relevant_summaries が needle を含む行のみ新しい順に MAX_SUMMARY_CHARS=12000 字まで抽出。retro 要約も含む）
+    ├ FOCUS_TYPE="member": needle = FOCUS_NAME + system.nickname_map のエイリアス展開
+    │   （build_member_needles）。愛称呼びの発言・言及も拾う
     │   → プロンプト: MEMBER_FOCUS_PROMPT
     │   → 書戻: users.profile 更新 + claims + memories（embedding 付与）
-    ├ FOCUS_TYPE="keyword": keyword を含む発言を収集して分析
+    ├ FOCUS_TYPE="keyword": needle = keyword。生ログは部分文字列一致で収集
     │   → プロンプト: KEYWORD_FOCUS_PROMPT
     └ Discord 投稿
 ```
+
+> **Tier1 拡張 (2026-06)**: 旧実装は直近7日生ログを先頭1万字に切り詰めるだけで、永久保持の `summaries`
+> アーカイブを未使用だった（情報ロスの主因）。現在は長期要約 + 直近生ログの両方を投入し、member は
+> nickname_map のエイリアスまで絞り込み対象を広げる。embedding 不要・両 focus モードに有効。
+> （keyword の意味検索 RAG = 各 summary への embedding キャッシュ付与は Tier3 として未実装）
 
 ## 副業スクリプト（root 直下）
 
