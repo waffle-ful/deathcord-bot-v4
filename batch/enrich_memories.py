@@ -30,7 +30,7 @@ MODEL_FB       = "models/gemma-4-26b-a4b-it"
 EMBED_MODEL    = "models/gemini-embedding-001"
 DB_NAME        = "discord_bot_db"
 SUMMARY_DAYS   = 7
-MAX_MEMORIES   = 10
+MAX_MEMORIES   = 40
 MAX_CLAIMS     = 20
 
 
@@ -232,7 +232,9 @@ def main():
             all_claims = (existing_claims + claims_to_add_dicts)[-MAX_CLAIMS:]
             update["claims"] = all_claims
         if memories_with_vec:
-            all_memories = (existing_memories + memories_with_vec)[-MAX_MEMORIES:]
+            # 新しい記憶を先頭に置き、新しい順に MAX_MEMORIES 件保持。
+            # main.py($position:0)と向きを揃え、main側が直近書いた記憶を切り捨てない。
+            all_memories = (memories_with_vec + existing_memories)[:MAX_MEMORIES]
             update["memories"] = all_memories
 
         if update:

@@ -69,7 +69,19 @@ post_summary.py・enrich_memories.py が未実行
 
 ### 3. MongoDB インデックス `memories_vector_index` の手動作成依存
 
-> ✅ **2026-04-25 対応済み**（commit `094402c`）
+> ♻️ **2026-06-22 後継対応: Atlas Vector Search を廃止し in-Python cosine に移行**
+>
+> 調査で判明した根本問題:
+> 1. **次元不一致**: #1 の移行で `text-embedding-004`(768次元) → `gemini-embedding-001` に統一した際、後者のデフォルト出力が **3072次元** であることを見落としていた。`output_dimensionality` 未指定のため main.py / enrich は 3072 を生成 → 768 のインデックスと不一致（コード構成上ほぼ確実）。`$vectorSearch` は例外を出さず空振りしていたと推定。
+>    - ※ 実データ確認推奨（読み取り専用）: 保存済み次元を実測すれば確定する。古い記憶は旧モデル由来で768次元が混在している可能性あり（in-Python cosine 側は `len(emb)!=len(qvec)` で安全にスキップ）。
+>    ```bash
+>    python -c "import os,pymongo; c=pymongo.MongoClient(os.environ['MONGO_URL']); d=c['discord_bot_db']['users'].find_one({'memories.embedding':{'$exists':True,'$ne':[]}},{'memories':1}); print([len(m.get('embedding',[])) for m in (d or {}).get('memories',[]) if m.get('embedding')])"
+>    ```
+> 2. **構造ミスマッチ**: `memories.embedding` は「1ドキュメント内に複数ベクトルの配列」。Atlas `$vectorSearch` は「1ドキュメント=1ベクトル」前提で、`limit` は全ユーザー横断、射影は配列丸ごと → `[:top_k]` は類似度ではなく配列順（≒最近）を返すだけ。次元を直しても per-user 意味検索は機能しない。
+>
+> **対応**: `search_memories` を main.py 内の **in-Python cosine**（`_cosine` + `MEMORY_SIM_THRESHOLD`）に置換。保存済み embedding を取得して毎回コサイン類似度を計算。embedding モデルは全箇所 `gemini-embedding-001`（3072次元）に統一。`setup_mongo_index.py` は非推奨化。旧 `memories_vector_index` は残置可（参照されない）。
+>
+> 以下の元記録（2026-04-25 / 768次元前提）は**この時点で無効**。
 
 **現象**: Atlas Vector Search のインデックスは UI から手動作成が必要。コード側にセットアップスクリプトがない
 

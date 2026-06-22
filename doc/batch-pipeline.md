@@ -81,8 +81,8 @@ enrich_memories.py
     ├ 対象: 全ブースターユーザー
     ├ summaries（直近7日）から各ユーザーの claims / memories を抽出
     ├ EXTRACT_PROMPT で JSON 出力
-    ├ memories には text-embedding-004 で embedding 付与
-    └ 書込: users.claims（最大20件）, users.memories（最大10件）
+    ├ memories には gemini-embedding-001 で embedding 付与
+    └ 書込: users.claims（最大20件）, users.memories（最大40件・新しい順）
 ```
 
 ### 使用モデル
@@ -93,7 +93,7 @@ enrich_memories.py
 | analyze_personality.py | `gemma-4-31b-it` | `gemma-3-27b-it` |
 | analyze_nonbooster.py | `gemma-4-31b-it` | `gemma-4-26b-a4b-it` |
 | enrich_memories.py | `gemma-4-31b-it` | `gemma-4-26b-a4b-it` |
-| Embedding | `text-embedding-004` | なし（失敗で skip） |
+| Embedding | `gemini-embedding-001`（3072次元） | なし（失敗で skip） |
 
 ## パイプライン 3: 手動トリガー
 

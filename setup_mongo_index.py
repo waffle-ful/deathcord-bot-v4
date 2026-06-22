@@ -1,8 +1,17 @@
 """
 setup_mongo_index.py
 
+【非推奨 / DEPRECATED】
+記憶の類似検索は main.py の in-Python cosine（search_memories）に移行したため、
+この Atlas Vector Search インデックスはもう使用していない。
+（理由: memories は「1ドキュメント内に複数ベクトルの配列」という構造で、
+ Atlas $vectorSearch が前提とする「1ドキュメント=1ベクトル」に合わず、
+ 次元を揃えても per-user の意味検索が正しく機能しなかった。）
+新規環境構築時にこのスクリプトを実行する必要はない。既存インデックスは
+残っていても無害（参照されない）なので削除は任意。
+
+--- 以下は歴史的記録 ---
 MongoDB Atlas の Vector Search インデックスを作成するセットアップスクリプト。
-新環境構築時・Atlas 再作成時に1回だけ実行する。
 
 使い方:
     MONGODB_URI=<your_uri> python setup_mongo_index.py
