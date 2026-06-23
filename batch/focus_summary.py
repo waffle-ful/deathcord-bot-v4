@@ -143,11 +143,34 @@ REST_HEADERS = {
     "Content-Type":  "application/json",
 }
 
+# Discord API 叩きすぎ防止のガード（fetch_discord_logs.py と同方針）。
+# /focus は手動で何度でも叩けて本番と同一トークンなので、繁忙期の青天井ページングで
+# レート制限/BAN を踏むと本番Botまで巻き添えになる。上限は実トラフィックの十分上に置き、
+# 通常運用では発火せず暴走時のみ打ち切る。
+MAX_TOTAL_API_CALLS   = int(os.environ.get("MAX_TOTAL_API_CALLS", "400"))
+MAX_PAGES_PER_CHANNEL = int(os.environ.get("MAX_PAGES_PER_CHANNEL", "50"))
+_api_call_count = 0
+
 
 def _api_get(path: str, params: dict = None):
+    global _api_call_count
+    # C: グローバル上限 — 超えたら打ち切り（fetch_logs の per-channel ループの break に繋がる）
+    if _api_call_count >= MAX_TOTAL_API_CALLS:
+        print(f"[WARN] Total API call limit reached ({MAX_TOTAL_API_CALLS}), aborting fetch early")
+        return None
+    _api_call_count += 1
+
     url = BASE_URL + path
     for attempt in range(5):
         resp = requests.get(url, headers=REST_HEADERS, params=params, timeout=30)
+
+        # A: 先手スロットリング — 429 が来る前に自分でブレーキをかける
+        remaining   = int(resp.headers.get("X-RateLimit-Remaining", 5))
+        reset_after = float(resp.headers.get("X-RateLimit-Reset-After", "1"))
+        if remaining <= 1:
+            print(f"[fetch] Rate limit low (remaining={remaining}), sleeping {reset_after:.2f}s proactively")
+            time.sleep(reset_after + 0.1)
+
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 429:
@@ -205,7 +228,9 @@ def fetch_logs(days: int) -> list[dict]:
         ch_id   = int(ch["id"])
         ch_name = ch.get("name", str(ch_id))
         last_id = after_sf
-        while True:
+        # B: ページング上限 — 1ch あたり最大 MAX_PAGES_PER_CHANNEL ページで打ち切り。
+        #    繁忙期に len(batch)<100 まで止まらない青天井ページングを防ぐ。
+        for _ in range(MAX_PAGES_PER_CHANNEL):
             params = {"limit": 100, "after": str(last_id)}
             batch  = _api_get(f"/channels/{ch_id}/messages", params=params)
             if not batch:
