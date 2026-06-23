@@ -42,6 +42,9 @@ Thumbs.db
 .idea/
 .poetry/
 
+# Claude Code のローカル設定・ワークフロー（秘伝のたれ・公開リポに出さない）
+.claude/
+
 # logとか
 logs.json
 summary_result.json
