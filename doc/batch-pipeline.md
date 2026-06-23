@@ -124,11 +124,12 @@ summaries アーカイブの空白期間を一括で埋めて focus/記憶の素
 
 ```
 retro_backfill.py (batch/)
-    ├ 環境変数: BACKFILL_START_DATE, BACKFILL_DAYS(既定31), BACKFILL_SLEEP(既定45) + retro と共通の secrets
+    ├ 環境変数: BACKFILL_START_DATE, BACKFILL_DAYS(既定31), BACKFILL_SLEEP(既定45),
+    │            BACKFILL_POST(既定true) + retro と共通の secrets
     ├ retro_summarize.run_for_date() を start_date から過去へ DAYS 日ぶん逐次呼び出し
     ├ 既存 retro_date はスキップ（中断しても再開可能）
     ├ 日間 BACKFILL_SLEEP 秒スリープ＋429検知で即停止（Discord BAN 回避。Gemini=gemma-4は1500/日で余裕）
-    └ Discord 投稿はしない（post=False＝連投スパム防止）。MongoDB 保存のみ（is_retro=True）
+    └ MongoDB 保存（is_retro=True）＋ 各日を Discord 投稿（BACKFILL_POST=既定ON。false で Mongo のみ）
 ```
 timeout-minutes=300（5h以内・6h連続稼働は回避）。
 
