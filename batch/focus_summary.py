@@ -72,12 +72,17 @@ MEMBER_FOCUS_PROMPT = """\
 古い情報の単なる引き写しは避け、変化や新事実を重視すること。
 前置き・導入文は不要です。各セクションの見出しから即座に書き始めてください。
 
+「数ヶ月の変遷・時系列」では、長期アーカイブの各行頭にある [YYYY-MM-DD] の日付を必ず引用し、
+過去数ヶ月から現在への「変化・継続・一過性の出来事」を時系列で具体的に書くこと。
+直近{days}日だけで分かることの繰り返しは禁止。1ヶ月以上前の話題・エピソード・関係性の移り変わりを優先して拾うこと。
+
 ## 発言の口調・語彙
 ## 性格・行動パターン
 ## サーバー内での立場・役割
 ## よく絡むメンバーと関係性
 ## 関心・よく話すトピック
 ## 印象的な発言・エピソード
+## 数ヶ月の変遷・時系列
 ## 総合評価
 """
 
@@ -119,7 +124,8 @@ PROFILE_UPDATE_PROMPT = """\
 
 SECTION_ICONS_MEMBER = {
     "発言の口調": "🗣️", "性格": "🧠", "立場": "👑",
-    "よく絡む": "🤝", "関心": "💡", "印象的": "⭐", "総合": "📋",
+    "よく絡む": "🤝", "関心": "💡", "印象的": "⭐",
+    "変遷": "🕰️", "総合": "📋",
 }
 SECTION_ICONS_KEYWORD = {
     "概要": "📌", "議論の流れ": "🔄", "関わった": "👥",
@@ -492,21 +498,24 @@ def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = 
     else:
         prompt = KEYWORD_FOCUS_PROMPT.format(keyword=FOCUS_NAME, days=FETCH_DAYS)
 
+    # 並び順: 既知情報 → 直近生ログ → 長期アーカイブ(最後=高アテンション位置)。
+    # 長期データを末尾に置き、時系列見出しで活用を強制する。
     parts = []
     if member_context:
         parts.append(
             f"【これまでに蓄積した既知情報（過去の分析結果。今回の証拠で検証・更新せよ）】\n"
             f"{member_context[:MAX_MEMBER_CONTEXT_CHARS]}"
         )
-    if summary_text:
-        parts.append(
-            f"【長期の要約アーカイブ（過去{SUMMARY_LOOKBACK_DAYS}日・{FOCUS_NAME}関連の行を抽出）】\n"
-            f"{summary_text[:MAX_SUMMARY_CHARS]}"
-        )
     if log_text:
         parts.append(
-            f"【直近{FETCH_DAYS}日の生チャットログ（{FOCUS_NAME}関連のみ抽出）】\n"
+            f"【直近{FETCH_DAYS}日の生チャットログ（{FOCUS_NAME}関連のみ抽出・あくまで最近の断面）】\n"
             f"{log_text[:MAX_LOG_CHARS]}"
+        )
+    if summary_text:
+        parts.append(
+            f"【長期の要約アーカイブ（過去{SUMMARY_LOOKBACK_DAYS}日・各行頭に[日付]・{FOCUS_NAME}関連を抽出）\n"
+            f"※「数ヶ月の変遷・時系列」セクションはこのアーカイブを主たる根拠にすること】\n"
+            f"{summary_text[:MAX_SUMMARY_CHARS]}"
         )
 
     full_prompt = prompt + "\n\n" + "\n\n".join(parts)
@@ -729,6 +738,11 @@ def main():
     # 長期アーカイブ（summaries）から関連行を抽出
     print(f"[focus] 過去{SUMMARY_LOOKBACK_DAYS}日の要約アーカイブを検索中...")
     summary_text = fetch_relevant_summaries(summaries_col, needles)
+
+    # 診断: 抽出された長期サマリが「濃い本人記述」か「grepノイズ」か見極めるためのプレビュー
+    if summary_text:
+        _preview = summary_text[:1800]
+        print(f"[focus][debug] summary_text プレビュー（全{len(summary_text)}字中先頭{len(_preview)}字）↓↓↓\n{_preview}\n[focus][debug] ↑↑↑ preview end")
 
     if not log_text and not summary_text:
         print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
