@@ -40,10 +40,11 @@ MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
 DB_NAME        = "discord_bot_db"
 JST            = timezone(timedelta(hours=9))
 FETCH_DAYS     = 7    # 直近何日分の生ログを取得するか
-SUMMARY_LOOKBACK_DAYS = 90     # 要約アーカイブを何日分さかのぼるか
-SUMMARY_MAX_DOCS      = 1200   # 走査する要約ドキュメント上限（安全弁。90日×12件/日≈1080をカバー）
+SUMMARY_LOOKBACK_DAYS_MEMBER  = 365    # member: 人物は1年遡る（密度と負荷のバランス）
+SUMMARY_LOOKBACK_DAYS_KEYWORD = 730    # keyword: トピックは深い歴史を持つので2年遡る
+SUMMARY_MAX_DOCS      = 10000  # 走査ドキュメントのハードキャップ（暴走防止）。実際は窓×13/日で算出
 MAX_LOG_CHARS         = 10000  # 生ログ(直近7日)は「最近の断面」の補助なので絞る（長期偏重を優先）
-MAX_SUMMARY_CHARS     = 16000  # 長期アーカイブが主役。月ごと按分でこの予算を数ヶ月に配分する
+MAX_SUMMARY_CHARS     = 24000  # 長期アーカイブが主役。月ごと按分でこの予算を1〜2年に配分する
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
 
 # 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
@@ -320,6 +321,11 @@ def build_member_needles(system_col, users_col) -> list[str]:
     return [v for v in variants if v and len(v) >= 2]
 
 
+def _lookback_days() -> int:
+    """focusタイプ別の遡及日数。member=1年・keyword=2年。"""
+    return SUMMARY_LOOKBACK_DAYS_MEMBER if FOCUS_TYPE == "member" else SUMMARY_LOOKBACK_DAYS_KEYWORD
+
+
 def _select_across_months(matched: list, budget: int) -> list:
     """matched=[(date, block)]（新しい順）を、月ごとに予算を按分して選ぶ。
     直近偏重の「新しい順で予算切り」をやめ、各月を必ず代表させる。
@@ -367,13 +373,16 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
 
     # created_at は全書き手が .isoformat()（UTC）で文字列保存しているため、
     # ISO 文字列の辞書順比較で日付フィルタできる（analyze_* / enrich と同パターン）。
-    since = datetime.now(timezone.utc) - timedelta(days=SUMMARY_LOOKBACK_DAYS)
+    lookback  = _lookback_days()
+    since     = datetime.now(timezone.utc) - timedelta(days=lookback)
+    # 窓を必ずカバーする doc 上限（13件/日 ≈ 2h時代の最大。ハードキャップで暴走防止）
+    doc_limit = min(SUMMARY_MAX_DOCS, lookback * 13)
     try:
         docs = list(summaries_col.find(
             {"summary": {"$exists": True}, "created_at": {"$gte": since.isoformat()}},
             {"summary": 1, "created_at": 1, "retro_date": 1},
             sort=[("created_at", -1)],
-        ).limit(SUMMARY_MAX_DOCS))
+        ).limit(doc_limit))
     except Exception as e:
         print(f"[WARN] summaries 取得失敗: {e}")
         return ""
@@ -568,7 +577,7 @@ def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = 
         )
     if summary_text:
         parts.append(
-            f"【長期の要約アーカイブ（過去{SUMMARY_LOOKBACK_DAYS}日・各行頭に[日付]・{FOCUS_NAME}関連を抽出）\n"
+            f"【長期の要約アーカイブ（過去{_lookback_days()}日・各行頭に[日付]・{FOCUS_NAME}関連を抽出）\n"
             f"※「数ヶ月の変遷・時系列」セクションはこのアーカイブを主たる根拠にすること】\n"
             f"{summary_text[:MAX_SUMMARY_CHARS]}"
         )
@@ -791,7 +800,7 @@ def main():
     print(f"[focus] 対象生ログ: {len(log_text)}文字")
 
     # 長期アーカイブ（summaries）から関連行を抽出
-    print(f"[focus] 過去{SUMMARY_LOOKBACK_DAYS}日の要約アーカイブを検索中...")
+    print(f"[focus] 過去{_lookback_days()}日の要約アーカイブを検索中...")
     summary_text = fetch_relevant_summaries(summaries_col, needles)
 
     if not log_text and not summary_text:
