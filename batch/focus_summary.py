@@ -46,6 +46,18 @@ MAX_LOG_CHARS         = 25000  # 生ログをプロンプトに入れる最大�
 MAX_SUMMARY_CHARS     = 12000  # 要約抜粋をプロンプトに入れる最大文字数
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
 
+# 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
+# 構築失敗時は None（=SDKデフォルト）にフォールバックしてモジュール読込を壊さない。
+try:
+    SAFETY_OFF = [
+        types.SafetySetting(category=c, threshold="BLOCK_NONE")
+        for c in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                  "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
+    ]
+except Exception as _e:
+    print(f"[WARN] safety_settings 構築失敗（デフォルト使用）: {_e}")
+    SAFETY_OFF = None
+
 # =============================================================================
 # プロンプト
 # =============================================================================
@@ -440,12 +452,21 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
                     config=types.GenerateContentConfig(
                         temperature=temperature,
                         max_output_tokens=max_tokens,
+                        safety_settings=SAFETY_OFF,
                     ),
                 )
                 text = getattr(resp, "text", None)
                 if text and text.strip():
                     return text.strip()
-                print(f"[WARN] {label}: 空レスポンス attempt{attempt+1}")
+                # 空の理由を診断（finish_reason / safety / prompt_feedback）
+                try:
+                    cand = (getattr(resp, "candidates", None) or [None])[0]
+                    fr   = getattr(cand, "finish_reason", None)
+                    sr   = getattr(cand, "safety_ratings", None)
+                    pf   = getattr(resp, "prompt_feedback", None)
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1} finish={fr} pf={pf} safety={sr}")
+                except Exception:
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1}")
                 time.sleep(5)
             except Exception as e:
                 err = str(e)
@@ -495,7 +516,7 @@ def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = 
 def extract_profile(client_ai: genai.Client, report: str) -> dict | None:
     """人物フォーカスの場合のみプロフィールをJSON抽出"""
     prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:3000])
-    raw    = call_ai(client_ai, prompt, max_tokens=400)
+    raw    = call_ai(client_ai, prompt, max_tokens=2000)
     if not raw:
         return None
     try:
@@ -551,7 +572,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 
     # call_ai 経由で MODEL→MODEL_FALLBACK のリトライ/フォールバックに乗せる
     # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
-    raw = call_ai(client_ai, prompt, max_tokens=500, temperature=0.1)
+    raw = call_ai(client_ai, prompt, max_tokens=2000, temperature=0.1)
     if not raw:
         print("[WARN] focus memories extract: 空/失敗（スキップ）")
         return
