@@ -135,7 +135,7 @@
 | `models/gemini-3.1-flash-lite-preview` | ユーザー対面の応答（メイン） | main.py L41 `MODEL_BOOSTER` |
 | `models/gemma-4-31b-it` | 503 フォールバック + バッチ要約・分析 | main.py L42, batch/summarize L20, batch/analyze_personality L31, batch/analyze_nonbooster L28, batch/enrich_memories L28, batch/retro_summarize L23, batch/focus_summary L38 |
 | `models/gemma-4-26b-a4b-it` | バックグラウンド処理（軽量） | main.py L43 `MODEL_GENERAL_FB`, batch/analyze_nonbooster L29, batch/enrich_memories L29, batch/retro_summarize L24, batch/focus_summary L39 |
-| `models/gemma-3-27b-it` | 二次フォールバック・市場分析 | batch/summarize L21, batch/analyze_personality L32, market_report L44 `MODEL`, batch/focus_summary L339 |
+| `models/gemma-3-27b-it` | 二次フォールバック・市場分析 ⚠️**現APIで 404 NOT_FOUND（v1beta で generateContent 非対応）。focus_summary は call_ai 経由に修正済で離脱。market_report の主モデルが未だこれを直書き＝毎回404→gemini-2.5-flash-lite フォールバック頼み。要見直し** | batch/summarize L21（フォールバックのみ）, batch/analyze_personality L32, market_report L44 `MODEL` |
 | `models/gemini-embedding-001` | 記憶 embedding（全箇所で統一・3072次元） | main.py `_get_embedding`, batch/enrich_memories L30, batch/focus_summary（embed_content 呼び出し） |
 | `models/gemini-2.5-flash-lite` | 検索グラウンディング | market_report L46 `MODEL_SEARCH` |
 | `models/gemini-flash-lite-latest` | 検索グラウンディング エイリアス | market_report L47 `MODEL_SEARCH_ALT` |

@@ -253,19 +253,53 @@ def filter_logs(msgs: list[dict], needles: list[str] = None) -> str:
 # 長期アーカイブ（summaries）からの絞り込み
 # =============================================================================
 
-def build_member_needles(system_col) -> list[str]:
-    """FOCUS_NAME と、nickname_map 上で同一人物を指すエイリアス群を集める。"""
+def _strip_title_decoration(name: str) -> set[str]:
+    """「二つ名」本名 / 【二つ名】本名 等の装飾を剥がして素の名前候補を返す。
+    例: 「わっふる教団司祭」チャコ → {'わっふる教団司祭', 'チャコ'}。
+    /as の title が Discord 表示名に「title」付きで反映されるため、summaries/生ログ上の
+    素の呼称（チャコ）と表示名（装飾付き）がズレてヒットしない問題に対応。"""
+    out = set()
+    if not name:
+        return out
+    stripped = re.sub(r"[「」『』【】《》〈〉\[\]()（）\"'`･・|]", " ", name)
+    tokens   = [t for t in stripped.split() if len(t) >= 2]
+    out.update(tokens)
+    joined = "".join(tokens)
+    if len(joined) >= 2:
+        out.add(joined)
+    return out
+
+
+def build_member_needles(system_col, users_col) -> list[str]:
+    """フォーカス対象を summaries/生ログで拾うための検索語を集める。
+    FOCUS_NAME（装飾付き表示名）・素名・users.name/title・nickname_map の相互展開を統合。"""
     variants = {FOCUS_NAME}
+    variants |= _strip_title_decoration(FOCUS_NAME)
+
+    # users ドキュメントの記録名・二つ名も候補に
     try:
-        doc  = system_col.find_one({"_id": "nickname_map"}) or {}
-        nmap = doc.get("map", {})
-        for alias, canon in nmap.items():
-            if canon == FOCUS_NAME or alias == FOCUS_NAME:
-                variants.add(alias)
-                variants.add(canon)
+        udoc = users_col.find_one({"_id": FOCUS_TARGET}, {"name": 1, "title": 1}) or {}
+        for key in ("name", "title"):
+            if udoc.get(key):
+                variants.add(udoc[key])
+                variants |= _strip_title_decoration(udoc[key])
+    except Exception as e:
+        print(f"[WARN] users doc 読込失敗: {e}")
+
+    # nickname_map: variants のいずれかに一致する alias/canon を相互展開（2パスで推移的に）
+    try:
+        ndoc = system_col.find_one({"_id": "nickname_map"}) or {}
+        nmap = ndoc.get("map", {})
+        for _ in range(2):
+            for alias, canon in nmap.items():
+                if alias in variants or canon in variants:
+                    variants.add(alias)
+                    variants.add(canon)
     except Exception as e:
         print(f"[WARN] nickname_map 読込失敗: {e}")
-    return [v for v in variants if v]
+
+    # 1文字は誤爆するので2文字以上のみ採用
+    return [v for v in variants if v and len(v) >= 2]
 
 
 def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
@@ -395,7 +429,8 @@ def _extract_retry_wait(err: str) -> float:
     return float(m.group(1)) + 2.0 if m else 60.0
 
 
-def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str | None:
+def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
+            temperature: float = 0.3) -> str | None:
     for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
         for attempt in range(5):
             try:
@@ -403,7 +438,7 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
                     model=model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        temperature=0.3,
+                        temperature=temperature,
                         max_output_tokens=max_tokens,
                     ),
                 )
@@ -418,9 +453,10 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
                     wait = _extract_retry_wait(err)
                     print(f"[WARN] 429 ({label}) attempt{attempt+1}, {wait:.1f}s待機...")
                     time.sleep(wait)
-                elif "503" in err or "UNAVAILABLE" in err:
+                elif any(s in err for s in ("503", "UNAVAILABLE", "500", "INTERNAL")):
+                    # 500 INTERNAL / 503 UNAVAILABLE は一時障害が多い → backoff してリトライ
                     wait = (attempt + 1) * 20
-                    print(f"[WARN] 503 ({label}) attempt{attempt+1}, {wait}s待機...")
+                    print(f"[WARN] 500/503 ({label}) attempt{attempt+1}, {wait}s待機...")
                     time.sleep(wait)
                 else:
                     print(f"[ERROR] {label}: {e}")
@@ -513,16 +549,17 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 【観察レポート】
 {report[:3000]}"""
 
+    # call_ai 経由で MODEL→MODEL_FALLBACK のリトライ/フォールバックに乗せる
+    # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
+    raw = call_ai(client_ai, prompt, max_tokens=500, temperature=0.1)
+    if not raw:
+        print("[WARN] focus memories extract: 空/失敗（スキップ）")
+        return
     try:
-        resp = client_ai.models.generate_content(
-            model="models/gemma-3-27b-it",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=500),
-        )
-        raw  = getattr(resp, "text", "").strip().replace("```json", "").replace("```", "").strip()
+        raw  = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
     except Exception as e:
-        print(f"[WARN] focus memories extract: {e}")
+        print(f"[WARN] focus memories extract parse: {e}")
         return
 
     doc = users_col.find_one({"_id": FOCUS_TARGET}) or {}
@@ -657,7 +694,7 @@ def main():
 
     # フォーカス対象の検索語（member はエイリアスまで展開）
     if FOCUS_TYPE == "member":
-        needles = build_member_needles(system_col)
+        needles = build_member_needles(system_col, users_col)
         print(f"[focus] 名前バリアント: {needles}")
     else:
         needles = list({FOCUS_TARGET, FOCUS_NAME})
