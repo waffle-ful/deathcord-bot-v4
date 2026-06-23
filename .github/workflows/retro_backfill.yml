@@ -1,0 +1,50 @@
+name: 遡及日報バックフィル（複数日まとめて）
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: '開始日 YYYY-MM-DD（この日から過去へ遡る）'
+        required: true
+        type: string
+      days:
+        description: '遡る日数（既定 31）'
+        required: false
+        default: '31'
+        type: string
+      sleep:
+        description: '日間スリープ秒（Discord負荷対策・既定 45）'
+        required: false
+        default: '45'
+        type: string
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # 5h以内（6h連続稼働は避ける）
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: 遡及日報を一括生成（Mongo保存のみ・Discord投稿なし）
+        env:
+          BACKFILL_START_DATE: ${{ github.event.inputs.start_date }}
+          BACKFILL_DAYS:       ${{ github.event.inputs.days }}
+          BACKFILL_SLEEP:      ${{ github.event.inputs.sleep }}
+          DISCORD_BOT_TOKEN:   ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID:    ${{ secrets.DISCORD_GUILD_ID }}
+          DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
+          EXCLUDE_CHANNEL_IDS: ${{ secrets.EXCLUDE_CHANNEL_IDS }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:         ${{ secrets.MONGODB_URI }}
+          SUMMARY_CHANNEL_ID:  ${{ secrets.SUMMARY_CHANNEL_ID }}
+        run: python batch/retro_backfill.py

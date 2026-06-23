@@ -2,7 +2,7 @@
 
 GitHub Actions 上で実行される全ての定期処理のまとめ。`batch/*.py` と root 直下の副業スクリプト（`market_report.py`, `ai_news_bot.py`, `cleanup_bot.py`）を統括。
 
-## 8 個の workflow
+## 9 個の workflow
 
 | YAML | cron (UTC) | JST | 呼び出し | 所要時間目安 |
 |------|-----------|-----|---------|------------|
@@ -12,7 +12,8 @@ GitHub Actions 上で実行される全ての定期処理のまとめ。`batch/*
 | `nikkei-report.yml` | `0 7 * * 1-5` | 平日16:00 | market_report.py | ~10 min |
 | `ai_news.yml` | `0 1,4,7,10,13 * * *` | 10, 13, 16, 19, 22 時 | ai_news_bot.py | ~5 min |
 | `cleanup.yml` | `0 15 * * *` | 0:00 | cleanup_bot.py（別トークン） | ~5 min |
-| `retro_report.yml` | manual (dispatch) | - | batch/retro_summarize.py | ~30 min |
+| `retro_report.yml` | manual (dispatch) | - | batch/retro_summarize.py（1日） | ~30 min |
+| `retro_backfill.yml` | manual (dispatch) | - | batch/retro_backfill.py（複数日まとめて） | days×数分 |
 | `focus_summary.yml` | manual (dispatch) | - | batch/focus_summary.py | ~20 min |
 
 **毎日 JST 0:00 に 3 つの workflow が一斉起動**（`daily_tasks`, `personality_analyze`, `cleanup`）。GitHub Actions の同時実行キューに注意。
@@ -109,12 +110,27 @@ main.py retroreport_cmd (L2575)
 
 retro_summarize.py (batch/)
     ├ 環境変数: TARGET_DATE, DISCORD_GUILD_ID, CHANNEL_IDS, EXCLUDE_IDS, GEMINI_API_KEY, MONGODB_URI, SUMMARY_CHANNEL_ID
-    ├ REST API で指定日 JST 24時間分のメッセージ取得
+    ├ REST API で指定日のメッセージ取得（after のみページング＋before_sf 手動境界＝対象日に厳密境界化。
+    │   旧実装は after/before 同時指定で before が無視され複数日に溢れていた＝15,858件バグ）
     ├ 文脈: 前後 CONTEXT_DAYS=2 日の要約を MongoDB から取得
-    ├ Gemini で RETRO_SUMMARY_PROMPT を実行
+    ├ Gemini で RETRO_SUMMARY_PROMPT を実行（run_for_date に切り出し、backfill から再利用）
     ├ 既存 retro_date ドキュメントがあれば delete → insert（重複防止）
     └ Discord 投稿（SUMMARY_CHANNEL_ID）+ MongoDB 保存（is_retro=True）
 ```
+
+### retro_backfill.yml（複数日まとめて埋め戻し）
+
+summaries アーカイブの空白期間を一括で埋めて focus/記憶の素材を厚くするための手動処理。
+
+```
+retro_backfill.py (batch/)
+    ├ 環境変数: BACKFILL_START_DATE, BACKFILL_DAYS(既定31), BACKFILL_SLEEP(既定45) + retro と共通の secrets
+    ├ retro_summarize.run_for_date() を start_date から過去へ DAYS 日ぶん逐次呼び出し
+    ├ 既存 retro_date はスキップ（中断しても再開可能）
+    ├ 日間 BACKFILL_SLEEP 秒スリープ＋429検知で即停止（Discord BAN 回避。Gemini=gemma-4は1500/日で余裕）
+    └ Discord 投稿はしない（post=False＝連投スパム防止）。MongoDB 保存のみ（is_retro=True）
+```
+timeout-minutes=300（5h以内・6h連続稼働は回避）。
 
 ### focus_summary.yml
 
