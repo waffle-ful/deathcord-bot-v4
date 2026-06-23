@@ -583,12 +583,13 @@ def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = 
         )
 
     full_prompt = prompt + "\n\n" + "\n\n".join(parts)
-    return call_ai(client_ai, full_prompt, max_tokens=3000)
+    # 8セクション（時系列見出し追加）で出力が伸びたため上限を引き上げ、総合評価が途切れないように
+    return call_ai(client_ai, full_prompt, max_tokens=5000)
 
 
 def extract_profile(client_ai: genai.Client, report: str) -> dict | None:
     """人物フォーカスの場合のみプロフィールをJSON抽出"""
-    prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:3000])
+    prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:4000])
     raw    = call_ai(client_ai, prompt, max_tokens=2000)
     if not raw:
         return None
@@ -641,7 +642,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 }}
 
 【観察レポート】
-{report[:3000]}"""
+{report[:4000]}"""
 
     # call_ai 経由で MODEL→MODEL_FALLBACK のリトライ/フォールバックに乗せる
     # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
@@ -717,6 +718,27 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 # Discord投稿
 # =============================================================================
 
+def _split_for_field(text: str, limit: int = 1020) -> list[str]:
+    """Discordの1フィールド=1024字制限に収まるよう、本文を行境界で複数チャンクに分割。
+    切り捨てず全文を表示するため。1行自体が limit 超なら強制分割。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:                      # 1行が長すぎる場合は強制分割
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:limit]); line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def post_report(report: str):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
@@ -737,9 +759,11 @@ def post_report(report: str):
     fields = []
     for title, body in sections:
         icon_c = next((v for k, v in ICONS.items() if k in title), "📋")
-        if len(body) > 1020:
-            body = body[:1017] + "…"
-        fields.append({"name": f"{icon_c} {title}", "value": body, "inline": False})
+        # 1024字超のセクションは切り捨てず、続きフィールドに分割して全文表示
+        chunks = _split_for_field(body, 1020)
+        for i, chunk in enumerate(chunks):
+            name = f"{icon_c} {title}" if i == 0 else f"{icon_c} {title}（続き{i+1}）"
+            fields.append({"name": name[:256], "value": chunk, "inline": False})
 
     embeds, current_fields, current_chars = [], [], 0
     for field in fields:
