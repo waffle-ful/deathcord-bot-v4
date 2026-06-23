@@ -31,26 +31,47 @@ RETRO_SUMMARY_PROMPT = """\
 指定された日付のチャットログと、その前後の要約（文脈）を読んで
 「過去の観察メモ」を書いてください。
 前置き・導入文は一切不要です。各セクションの見出しから即座に本文を書き始めてください。
-各セクションは3文以上で書いてください。
+各セクションは具体的に書いてください（箇条書き指定のセクションは最低3項目）。
+
+【重要: 人物の識別ルール】
+- ログの各行には「表示名(uid:数字)」の形式でユーザーIDが付いています。
+- 同じuidの発言は必ず同一人物です。名前が似ていてもuidが異なれば別人として扱ってください。
+- 人物に言及する際は表示名のみを使用し、uidは書かないでください。
 
 ## 全体の雰囲気・トーン
+（その日のサーバー全体の空気感を簡潔に）
+
 ## 主なトピック
-## 感情の波
-## 注目の発言・流れ
-## 今日の内輪ネタ・キーワード
+（話されていた話題を箇条書きで。各トピックに一言）
+
+## メンバー別の動き
+（発言が目立ったメンバーを名前付きで列挙し、各人の具体的な発言・行動・テンションを箇条書きで。
+　形式は「- 表示名: 何をどう言っていたか・どんな様子だったか」。最低3人、いれば多いほどよい）
+
 ## メンバーの人間関係・関係性
-## ユーザーの感情状態
-## 直近の話題（最後の30分）
-## 会話の特徴・パターン
+（誰と誰が絡んでいたか、仲良さそうな組み合わせ、いじり合いの構図などを名前付きで）
+
+## 記憶すべき事実・発言・決定
+（後から思い出す価値のある情報を名前付きで箇条書き。誰かの主張・意見・予定・決定・報告・印象的な出来事。
+　形式は「- 表示名: 〜と主張/予定/報告した」。憶測は書かず、ログにある事実だけ）
+
+## 感情の波・注目の瞬間
+（何で盛り上がり何で冷めたか、テンションの上下と、特に反応が多かった発言・面白い流れを具体的に）
+
+## 今日の内輪ネタ・キーワード
+（独自ワード・ノリ・内輪ジョークを箇条書きで）
 """
 
 SECTION_ICONS = {
     "全体の雰囲気":       "🌡️",
     "主なトピック":       "📌",
-    "感情の波":           "🎢",
-    "注目の発言":         "💬",
-    "今日の内輪ネタ":     "🔑",
+    "メンバー別の動き":   "👥",
     "メンバーの人間関係": "🤝",
+    "記憶すべき":         "📝",
+    "感情の波":           "🎢",
+    "今日の内輪ネタ":     "🔑",
+    # 旧称（後方互換・残置）
+    "注目の発言":         "💬",
     "ユーザーの感情状態": "😊",
     "直近の話題":         "🔥",
     "会話の特徴":         "✨",
@@ -156,6 +177,7 @@ def fetch_day_logs(target_date: date_cls) -> list[dict]:
                 all_messages.append({
                     "channel":   ch_name,
                     "author":    author.get("global_name") or author.get("username", ""),
+                    "author_id": author.get("id", ""),
                     "timestamp": msg.get("timestamp", ""),
                     "content":   msg.get("content", ""),
                 })
@@ -200,7 +222,7 @@ def generate_summary(client_ai: genai.Client, log_text: str, context: str) -> st
                 resp = client_ai.models.generate_content(
                     model=model,
                     contents=user_prompt,
-                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=4000),
+                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=5500),
                 )
                 text = getattr(resp, "text", None)
                 if text and text.strip():
@@ -239,25 +261,64 @@ def parse_sections(summary: str) -> list[tuple[str, str]]:
         if len(split) > 1: sections.append((split[0].strip(), split[1].strip()))
     return sections
 
+def _split_for_field(text: str, limit: int = 1020) -> list[str]:
+    """Discord 1フィールド=1024字制限に収まるよう本文を行境界で分割（切り捨てず全文表示）。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:limit]); line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def post_to_discord(summary: str, target_date: date_cls, msg_count: int):
     date_str = target_date.strftime("%Y年%m月%d日")
     sections = parse_sections(summary)
+
+    # 1024字超は「(続きN)」に分割して全文表示
     fields = []
     for title, body in sections:
         icon = next((v for k, v in SECTION_ICONS.items() if k in title), "📋")
-        fields.append({"name": f"{icon} {title}", "value": body[:1020], "inline": False})
+        for i, chunk in enumerate(_split_for_field(body, 1020)):
+            name = f"{icon} {title}" if i == 0 else f"{icon} {title}（続き{i+1}）"
+            fields.append({"name": name[:256], "value": chunk, "inline": False})
     fields.append({"name": "📊 集計", "value": f"対象日: {target_date.isoformat()} / {msg_count:,}件", "inline": False})
 
-    embed = {
-        "title": f"📜 {date_str} の過去日報（遡及作成）",
-        "color": 0x8B4513,
-        "fields": fields,
-        "footer": {"text": "空気くん遡及日報"},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    # 6000字/25フィールド制限で複数Embedに分割し、1Embed=1メッセージで投稿（合計6000超の400回避）
+    title_str = f"📜 {date_str} の過去日報（遡及作成）"
+    groups, cur, chars = [], [], 0
+    for f in fields:
+        fc = len(f["name"]) + len(f["value"])
+        if (chars + fc > 5800 or len(cur) >= 25) and cur:
+            groups.append(cur); cur, chars = [], 0
+        cur.append(f); chars += fc
+    if cur:
+        groups.append(cur)
 
     url = f"https://discord.com/api/v10/channels/{SUMMARY_CHANNEL_ID}/messages"
-    requests.post(url, headers=REST_HEADERS, json={"embeds": [embed]}, timeout=10)
+    for idx, fset in enumerate(groups):
+        embed = {
+            "title": title_str if idx == 0 else f"{title_str}（続き）",
+            "color": 0x8B4513,
+            "fields": fset,
+        }
+        if idx == len(groups) - 1:
+            embed["footer"]    = {"text": "空気くん遡及日報"}
+            embed["timestamp"] = datetime.now(timezone.utc).isoformat()
+        resp = requests.post(url, headers=REST_HEADERS, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code not in (200, 201):
+            print(f"[ERROR] 投稿失敗: {resp.status_code} {resp.text}")
+        time.sleep(0.5)
     print("[post] Discord投稿完了")
 
 def main():
@@ -275,7 +336,12 @@ def main():
         print("[retro] メッセージなし。")
         return
 
-    log_text = "\n".join([f"[{m['timestamp'][11:16]}] #{m['channel']} {m['author']}: {m['content']}" for m in messages])[:40000]
+    def _fmt_line(m: dict) -> str:
+        uid = m.get("author_id", "")
+        who = f"{m['author']}(uid:{uid})" if uid else m["author"]
+        return f"[{m['timestamp'][11:16]}] #{m['channel']} {who}: {m['content']}"
+
+    log_text = "\n".join(_fmt_line(m) for m in messages)[:40000]
 
     mongo = MongoClient(MONGODB_URI)
     col = mongo[DB_NAME]["summaries"]

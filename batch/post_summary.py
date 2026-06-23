@@ -20,29 +20,35 @@ SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
 DB_NAME            = "discord_bot_db"
 JST                = timezone(timedelta(hours=9))
 
-# セクションのアイコンマッピング
+# セクションのアイコンマッピング（新項目に追従。旧称は後方互換で残置）
 SECTION_ICONS = {
     "全体の雰囲気":       "🌡️",
     "主なトピック":       "📌",
-    "感情の波":           "🎢",
-    "注目の発言":         "💬",
-    "今日の内輪ネタ":     "🔑",
+    "メンバー別の動き":   "👥",
     "メンバーの人間関係": "🤝",
-    "ユーザーの感情状態": "😊",
+    "記憶すべき":         "📝",
+    "感情の波":           "🎢",
+    "今日の内輪ネタ":     "🔑",
     "直近の話題":         "🔥",
+    # 旧称（後方互換・残置）
+    "注目の発言":         "💬",
+    "ユーザーの感情状態": "😊",
     "会話の特徴":         "✨",
 }
 
 # 表示優先順位（上から順に表示）
 SECTION_ORDER = [
     "直近の話題",
+    "メンバー別の動き",
+    "記憶すべき",
     "感情の波",
-    "今日の内輪ネタ",
     "メンバーの人間関係",
+    "今日の内輪ネタ",
+    "主なトピック",
+    "全体の雰囲気",
+    # 旧称（後方互換）
     "注目の発言",
     "ユーザーの感情状態",
-    "全体の雰囲気",
-    "主なトピック",
     "会話の特徴",
 ]
 
@@ -59,6 +65,26 @@ def fetch_latest_summary(col) -> dict | None:
          "retro_date": {"$exists": False}},
         sort=[("created_at", -1)]
     )
+
+
+def _split_for_field(text: str, limit: int = 1020) -> list[str]:
+    """Discord 1フィールド=1024字制限に収まるよう本文を行境界で分割（切り捨てず全文表示）。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:limit]); line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def parse_sections(summary: str) -> list[tuple[str, str]]:
@@ -111,11 +137,10 @@ def build_embeds(doc: dict) -> list[dict]:
     fields = []
     for title, body in sections:
         icon  = next((v for k, v in SECTION_ICONS.items() if k in title), "📋")
-        label = f"{icon} {title}"
-        # 1024文字制限（少し余裕を持たせて1020）
-        if len(body) > 1020:
-            body = body[:1017] + "…"
-        fields.append({"name": label, "value": body, "inline": False})
+        # 1024字超は切り捨てず「(続きN)」フィールドに分割して全文表示
+        for i, chunk in enumerate(_split_for_field(body, 1020)):
+            label = f"{icon} {title}" if i == 0 else f"{icon} {title}（続き{i+1}）"
+            fields.append({"name": label[:256], "value": chunk, "inline": False})
 
     # 集計フィールド
     fields.append({
