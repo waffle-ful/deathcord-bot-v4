@@ -17,6 +17,11 @@ on:
         required: false
         default: '45'
         type: string
+      post:
+        description: '各日をDiscordにも投稿するか（true/false・既定 true）'
+        required: false
+        default: 'true'
+        type: string
 
 jobs:
   backfill:
@@ -35,11 +40,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-batch.txt
 
-      - name: 遡及日報を一括生成（Mongo保存のみ・Discord投稿なし）
+      - name: 遡及日報を一括生成（既定でDiscord投稿あり・Mongo保存）
         env:
           BACKFILL_START_DATE: ${{ github.event.inputs.start_date }}
           BACKFILL_DAYS:       ${{ github.event.inputs.days }}
           BACKFILL_SLEEP:      ${{ github.event.inputs.sleep }}
+          BACKFILL_POST:       ${{ github.event.inputs.post }}
           DISCORD_BOT_TOKEN:   ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID:    ${{ secrets.DISCORD_GUILD_ID }}
           DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
