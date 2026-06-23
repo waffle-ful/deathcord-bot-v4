@@ -42,7 +42,6 @@ JST            = timezone(timedelta(hours=9))
 FETCH_DAYS     = 7    # 直近何日分の生ログを取得するか
 SUMMARY_LOOKBACK_DAYS_MEMBER  = 365    # member: 人物は1年遡る（密度と負荷のバランス）
 SUMMARY_LOOKBACK_DAYS_KEYWORD = 730    # keyword: トピックは深い歴史を持つので2年遡る
-SUMMARY_MAX_DOCS      = 10000  # 走査ドキュメントのハードキャップ（暴走防止）。実際は窓×13/日で算出
 MAX_LOG_CHARS         = 10000  # 生ログ(直近7日)は「最近の断面」の補助なので絞る（長期偏重を優先）
 MAX_SUMMARY_CHARS     = 24000  # 長期アーカイブが主役。月ごと按分でこの予算を1〜2年に配分する
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
@@ -371,40 +370,48 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     if not needles_l:
         return ""
 
-    # created_at は全書き手が .isoformat()（UTC）で文字列保存しているため、
-    # ISO 文字列の辞書順比較で日付フィルタできる（analyze_* / enrich と同パターン）。
-    lookback  = _lookback_days()
-    since     = datetime.now(timezone.utc) - timedelta(days=lookback)
-    # 窓を必ずカバーする doc 上限（13件/日 ≈ 2h時代の最大。ハードキャップで暴走防止）
-    doc_limit = min(SUMMARY_MAX_DOCS, lookback * 13)
-    try:
-        docs = list(summaries_col.find(
-            {"summary": {"$exists": True}, "created_at": {"$gte": since.isoformat()}},
-            {"summary": 1, "created_at": 1, "retro_date": 1},
-            sort=[("created_at", -1)],
-        ).limit(doc_limit))
-    except Exception as e:
-        print(f"[WARN] summaries 取得失敗: {e}")
-        return ""
+    # created_at は全書き手が .isoformat()（UTC）文字列なので ISO 辞書順比較で日付フィルタ可。
+    # 窓を 30 日チャンクに分割し各チャンクを個別クエリ＝生成密度に関係なく窓全体へ必ず到達する。
+    # （単一クエリ＋newest-N limit だと密度が高い期間で古い側が打ち切られ、窓が縮む＝旧バグ）
+    lookback   = _lookback_days()
+    now        = datetime.now(timezone.utc)
+    CHUNK_DAYS = 30
+    PER_CHUNK  = 700                       # 1チャンク(≒1ヶ月)あたりの走査上限（高密度でも1ヶ月分カバー）
+    n_chunks   = (lookback + CHUNK_DAYS - 1) // CHUNK_DAYS
+    window_start = (now - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
-    # マッチした全ブロックを収集（予算カットしない。docs は created_at 降順＝新しい順）
-    matched = []
-    for d in docs:
-        summ = d.get("summary", "")
-        if not summ:
+    matched, scanned_total = [], 0
+    for i in range(n_chunks):
+        chunk_end   = now - timedelta(days=i * CHUNK_DAYS)
+        chunk_start = now - timedelta(days=min((i + 1) * CHUNK_DAYS, lookback))
+        try:
+            docs = list(summaries_col.find(
+                {"summary": {"$exists": True},
+                 "created_at": {"$gte": chunk_start.isoformat(), "$lt": chunk_end.isoformat()}},
+                {"summary": 1, "created_at": 1, "retro_date": 1},
+                sort=[("created_at", -1)],
+            ).limit(PER_CHUNK))
+        except Exception as e:
+            print(f"[WARN] summaries 取得失敗(chunk{i}): {e}")
             continue
-        date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
-        hits = [ln.strip() for ln in summ.split("\n")
-                if ln.strip() and any(n in ln.lower() for n in needles_l)]
-        if not hits:
-            continue
-        matched.append((date, f"[{date}]\n" + "\n".join(hits)))
+        scanned_total += len(docs)
+        for d in docs:
+            summ = d.get("summary", "")
+            if not summ:
+                continue
+            date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
+            hits = [ln.strip() for ln in summ.split("\n")
+                    if ln.strip() and any(n in ln.lower() for n in needles_l)]
+            if not hits:
+                continue
+            matched.append((date, f"[{date}]\n" + "\n".join(hits)))
 
     # 月ごと按分で数ヶ月を満遍なく代表させる（直近偏重の予算切りを回避）
     selected = _select_across_months(matched, MAX_SUMMARY_CHARS)
     selected.sort(key=lambda x: x[0])   # 時系列順（古→新）でプロンプトへ＝変遷が読みやすい
 
-    # 診断: マッチ期間 vs 実採用期間（按分が効いて古い月まで採れているか）
+    # 診断: 窓全体を走査したか（走査件数＋窓開始日）／マッチ期間／実採用期間
+    print(f"[focus][debug] 走査={scanned_total}件 窓開始={window_start}（ここまでクエリ済＝これ以前のマッチが無ければ当時別名/不在）")
     if matched:
         md = [d for d, _ in matched]
         sd = [d for d, _ in selected]
