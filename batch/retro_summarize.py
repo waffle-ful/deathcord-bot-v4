@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 
 # --- 環境変数 ---
-TARGET_DATE_STR    = os.environ["TARGET_DATE"]           # YYYY-MM-DD
+TARGET_DATE_STR    = os.environ.get("TARGET_DATE", "")   # YYYY-MM-DD（backfillから import する際は未設定でも可）
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_GUILD_ID   = int(os.environ["DISCORD_GUILD_ID"])
 CHANNEL_IDS_RAW    = os.environ.get("DISCORD_CHANNEL_IDS", "")
@@ -328,38 +328,55 @@ def post_to_discord(summary: str, target_date: date_cls, msg_count: int):
         time.sleep(0.5)
     print("[post] Discord投稿完了")
 
+def _build_log_text(messages: list[dict]) -> str:
+    def _fmt(m: dict) -> str:
+        uid = m.get("author_id", "")
+        who = f"{m['author']}(uid:{uid})" if uid else m["author"]
+        return f"[{m['timestamp'][11:16]}] #{m['channel']} {who}: {m['content']}"
+    return "\n".join(_fmt(m) for m in messages)[:40000]
+
+
+def run_for_date(target_date: date_cls, client_ai: genai.Client, col,
+                 skip_existing: bool = False, post: bool = True) -> str:
+    """1日分の遡及日報を生成・保存（必要なら投稿）。
+    戻り値: "skipped"（既存）/ "empty"（メッセージ無し）/ "done"（生成）。
+    backfill から再利用するため client_ai と col は呼び出し側で1回だけ作って渡す。"""
+    iso = target_date.isoformat()
+    if skip_existing and col.find_one({"retro_date": iso}):
+        print(f"[retro] {iso} は既存のためスキップ")
+        return "skipped"
+
+    print(f"[retro] 対象日: {iso}")
+    messages = fetch_day_logs(target_date)
+    if not messages:
+        print(f"[retro] {iso} メッセージなし。")
+        return "empty"
+
+    log_text = _build_log_text(messages)
+    context  = fetch_context_summaries(col, target_date, CONTEXT_DAYS)
+
+    print("[retro] 要約生成中...")
+    summary = generate_summary(client_ai, log_text, context)
+
+    save_to_mongodb(col, summary, target_date, len(messages))
+    if post:
+        post_to_discord(summary, target_date, len(messages))
+    return "done"
+
+
 def main():
     try:
         target_date = date_cls.fromisoformat(TARGET_DATE_STR)
     except ValueError:
-        print(f"[ERROR] 日付フォーマット不正: {TARGET_DATE_STR}")
+        print(f"[ERROR] 日付フォーマット不正: {TARGET_DATE_STR!r}")
         return
 
-    print(f"[retro] 対象日: {target_date.isoformat()}")
     print(f"[debug] Fetching channels for guild {DISCORD_GUILD_ID}...")
-
-    messages = fetch_day_logs(target_date)
-    if not messages:
-        print("[retro] メッセージなし。")
-        return
-
-    def _fmt_line(m: dict) -> str:
-        uid = m.get("author_id", "")
-        who = f"{m['author']}(uid:{uid})" if uid else m["author"]
-        return f"[{m['timestamp'][11:16]}] #{m['channel']} {who}: {m['content']}"
-
-    log_text = "\n".join(_fmt_line(m) for m in messages)[:40000]
-
-    mongo = MongoClient(MONGODB_URI)
-    col = mongo[DB_NAME]["summaries"]
-    context = fetch_context_summaries(col, target_date, CONTEXT_DAYS)
-
-    print("[retro] 要約生成中...")
     client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    summary = generate_summary(client_ai, log_text, context)
+    mongo     = MongoClient(MONGODB_URI)
+    col       = mongo[DB_NAME]["summaries"]
 
-    save_to_mongodb(col, summary, target_date, len(messages))
-    post_to_discord(summary, target_date, len(messages))
+    run_for_date(target_date, client_ai, col, skip_existing=False, post=True)
     print("[retro] 完了！")
 
 if __name__ == "__main__":
