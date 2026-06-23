@@ -151,29 +151,33 @@ def fetch_day_logs(target_date: date_cls) -> list[dict]:
         ch_name = ch.get("name", str(ch_id))
         print(f"[fetch] Reading #{ch_name}...")
 
-        last_id = after_sf
+        last_id  = after_sf
+        ch_count = 0
 
         for _ in range(50):
-            params = {"limit": 100, "after": str(last_id), "before": str(before_sf)}
+            # after のみでページング。before は Discord 仕様で after と排他（同時指定は
+            # 未定義動作で before が無視され翌日以降まで溢れる＝15,858件バグの原因）。
+            # before_sf は手動境界チェックで対象日の終端を越えたら打ち切る。
+            params = {"limit": 100, "after": str(last_id)}
             batch  = _api_get(f"/channels/{ch_id}/messages", params=params)
 
             if not batch or not isinstance(batch, list):
                 break
 
-            # ID昇順にソート
-            batch_sorted = sorted(batch, key=lambda x: int(x["id"]))
+            batch_sorted = sorted(batch, key=lambda x: int(x["id"]))  # ID昇順（古い順）
 
+            crossed = False
             for msg in batch_sorted:
+                if int(msg["id"]) >= before_sf:    # 対象日の終端を越えた＝翌日以降
+                    crossed = True
+                    break
                 m_id = msg["id"]
                 if m_id in seen_ids:
                     continue
-
                 seen_ids.add(m_id)
                 author = msg.get("author", {})
-
                 if author.get("bot") or msg.get("webhook_id"):
                     continue
-
                 all_messages.append({
                     "channel":   ch_name,
                     "author":    author.get("global_name") or author.get("username", ""),
@@ -181,21 +185,24 @@ def fetch_day_logs(target_date: date_cls) -> list[dict]:
                     "timestamp": msg.get("timestamp", ""),
                     "content":   msg.get("content", ""),
                 })
+                ch_count += 1
 
-            # 取得件数に関わらず必ずlast_idを最新IDに進める
             new_last_id = int(batch_sorted[-1]["id"])
-
-            # IDが進まない or 100件未満（ページ末尾）ならbreak
-            if new_last_id <= last_id or len(batch) < 100:
+            if crossed or new_last_id <= last_id or len(batch) < 100:
                 break
 
             last_id = new_last_id
             time.sleep(0.4)
 
+        if ch_count:
+            print(f"[fetch]   #{ch_name}: {ch_count}件")
         time.sleep(0.2)  # チャンネル間のレート制限対策
 
     # 全チャンネルのメッセージを時系列順に並び替え
     all_messages.sort(key=lambda m: m["timestamp"])
+    if all_messages:
+        print(f"[fetch] 取得期間 {all_messages[0]['timestamp'][:10]}〜{all_messages[-1]['timestamp'][:10]} "
+              f"(対象日={target_date.isoformat()}) ← 対象日と一致しなければ日境界異常")
     print(f"[fetch] Final unique messages count: {len(all_messages)}")
     return all_messages
 
