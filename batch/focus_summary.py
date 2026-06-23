@@ -42,8 +42,8 @@ JST            = timezone(timedelta(hours=9))
 FETCH_DAYS     = 7    # 直近何日分の生ログを取得するか
 SUMMARY_LOOKBACK_DAYS = 90     # 要約アーカイブを何日分さかのぼるか
 SUMMARY_MAX_DOCS      = 1200   # 走査する要約ドキュメント上限（安全弁。90日×12件/日≈1080をカバー）
-MAX_LOG_CHARS         = 25000  # 生ログをプロンプトに入れる最大文字数（旧10000の切り詰めを撤廃）
-MAX_SUMMARY_CHARS     = 12000  # 要約抜粋をプロンプトに入れる最大文字数
+MAX_LOG_CHARS         = 10000  # 生ログ(直近7日)は「最近の断面」の補助なので絞る（長期偏重を優先）
+MAX_SUMMARY_CHARS     = 16000  # 長期アーカイブが主役。月ごと按分でこの予算を数ヶ月に配分する
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
 
 # 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
@@ -320,6 +320,40 @@ def build_member_needles(system_col, users_col) -> list[str]:
     return [v for v in variants if v and len(v) >= 2]
 
 
+def _select_across_months(matched: list, budget: int) -> list:
+    """matched=[(date, block)]（新しい順）を、月ごとに予算を按分して選ぶ。
+    直近偏重の「新しい順で予算切り」をやめ、各月を必ず代表させる。
+    余った予算は全体の新しい順で埋める。返りは (date, block) のリスト（順不同）。
+    """
+    if not matched:
+        return []
+    buckets = {}                       # "YYYY-MM" -> [(date, block)]（月内も新しい順）
+    for date, block in matched:
+        buckets.setdefault(date[:7], []).append((date, block))
+    months = sorted(buckets)           # 古→新
+    share  = max(1, budget // len(months))
+
+    selected, chosen, total = [], set(), 0
+    # 第1パス: 各月に share まで（月内は新しい順）→ 全月を代表させる
+    for m in months:
+        used = 0
+        for item in buckets[m]:
+            block = item[1]
+            if used + len(block) > share:
+                continue
+            selected.append(item); chosen.add(id(block))
+            used += len(block); total += len(block)
+    # 第2パス: 余り予算を全体の新しい順で埋める
+    if total < budget:
+        for item in matched:           # 新しい順
+            block = item[1]
+            if id(block) in chosen or total + len(block) > budget:
+                continue
+            selected.append(item); chosen.add(id(block))
+            total += len(block)
+    return selected
+
+
 def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     """summaries アーカイブ（永久保持）から、needle を含む行だけを
     新しい順に MAX_SUMMARY_CHARS まで抜き出してテキスト化する。
@@ -344,9 +378,8 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
         print(f"[WARN] summaries 取得失敗: {e}")
         return ""
 
-    blocks, total = [], 0
-    matched_dates = []   # 予算に関係なくマッチした全ブロックの日付（診断用）
-    dropped = 0          # 予算超過で出力から落とした数（診断用）
+    # マッチした全ブロックを収集（予算カットしない。docs は created_at 降順＝新しい順）
+    matched = []
     for d in docs:
         summ = d.get("summary", "")
         if not summ:
@@ -356,18 +389,19 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
                 if ln.strip() and any(n in ln.lower() for n in needles_l)]
         if not hits:
             continue
-        block = f"[{date}]\n" + "\n".join(hits)
-        matched_dates.append(date)
-        if total + len(block) > MAX_SUMMARY_CHARS:
-            dropped += 1   # 予算超過分は出力に入れないが、統計のため走査は続ける
-            continue
-        blocks.append(block)
-        total += len(block)
+        matched.append((date, f"[{date}]\n" + "\n".join(hits)))
 
-    # 診断: マッチが何ヶ月分あるか／予算で何件落としたか／コレクション全体の最古
-    if matched_dates:
-        print(f"[focus][debug] needleマッチ={len(matched_dates)}件 期間={min(matched_dates)}〜{max(matched_dates)} "
-              f"／出力採用={len(blocks)}件 予算超過で除外={dropped}件")
+    # 月ごと按分で数ヶ月を満遍なく代表させる（直近偏重の予算切りを回避）
+    selected = _select_across_months(matched, MAX_SUMMARY_CHARS)
+    selected.sort(key=lambda x: x[0])   # 時系列順（古→新）でプロンプトへ＝変遷が読みやすい
+
+    # 診断: マッチ期間 vs 実採用期間（按分が効いて古い月まで採れているか）
+    if matched:
+        md = [d for d, _ in matched]
+        sd = [d for d, _ in selected]
+        n_months = len({d[:7] for d in sd})
+        print(f"[focus][debug] needleマッチ={len(matched)}件 期間={min(md)}〜{max(md)} "
+              f"／按分採用={len(selected)}件 採用期間={min(sd)}〜{max(sd)} ({n_months}ヶ月分)")
     try:
         oldest = summaries_col.find_one(
             {"summary": {"$exists": True}},
@@ -380,8 +414,9 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     except Exception:
         pass
 
-    print(f"[focus] 関連サマリ: {len(blocks)}ブロック ({total}文字)")
-    return "\n\n".join(blocks)
+    total = sum(len(b) for _, b in selected)
+    print(f"[focus] 関連サマリ: {len(selected)}ブロック ({total}文字)")
+    return "\n\n".join(b for _, b in selected)
 
 
 # =============================================================================
@@ -758,11 +793,6 @@ def main():
     # 長期アーカイブ（summaries）から関連行を抽出
     print(f"[focus] 過去{SUMMARY_LOOKBACK_DAYS}日の要約アーカイブを検索中...")
     summary_text = fetch_relevant_summaries(summaries_col, needles)
-
-    # 診断: 抽出された長期サマリが「濃い本人記述」か「grepノイズ」か見極めるためのプレビュー
-    if summary_text:
-        _preview = summary_text[:1800]
-        print(f"[focus][debug] summary_text プレビュー（全{len(summary_text)}字中先頭{len(_preview)}字）↓↓↓\n{_preview}\n[focus][debug] ↑↑↑ preview end")
 
     if not log_text and not summary_text:
         print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
