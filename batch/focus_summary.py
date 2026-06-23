@@ -345,6 +345,8 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
         return ""
 
     blocks, total = [], 0
+    matched_dates = []   # 予算に関係なくマッチした全ブロックの日付（診断用）
+    dropped = 0          # 予算超過で出力から落とした数（診断用）
     for d in docs:
         summ = d.get("summary", "")
         if not summ:
@@ -355,10 +357,28 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
         if not hits:
             continue
         block = f"[{date}]\n" + "\n".join(hits)
+        matched_dates.append(date)
         if total + len(block) > MAX_SUMMARY_CHARS:
-            break  # 新しい順なので、ここで打ち切れば直近を優先して保持
+            dropped += 1   # 予算超過分は出力に入れないが、統計のため走査は続ける
+            continue
         blocks.append(block)
         total += len(block)
+
+    # 診断: マッチが何ヶ月分あるか／予算で何件落としたか／コレクション全体の最古
+    if matched_dates:
+        print(f"[focus][debug] needleマッチ={len(matched_dates)}件 期間={min(matched_dates)}〜{max(matched_dates)} "
+              f"／出力採用={len(blocks)}件 予算超過で除外={dropped}件")
+    try:
+        oldest = summaries_col.find_one(
+            {"summary": {"$exists": True}},
+            {"created_at": 1, "retro_date": 1},
+            sort=[("created_at", 1)],
+        )
+        if oldest:
+            od = oldest.get("retro_date") or str(oldest.get("created_at", ""))[:10]
+            print(f"[focus][debug] summariesコレクション最古ドキュメント={od}（アーカイブの実深度）")
+    except Exception:
+        pass
 
     print(f"[focus] 関連サマリ: {len(blocks)}ブロック ({total}文字)")
     return "\n\n".join(blocks)
