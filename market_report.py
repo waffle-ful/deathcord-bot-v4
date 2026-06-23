@@ -38,7 +38,7 @@ SYMBOLS = {
 
 WEBHOOK_URL        = os.environ["DISCORD_WEBHOOK_URL"]
 GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
-MONGODB_URI        = os.environ.get("MONGODB_URI", "")
+MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL", "")
 SUMMARY_CHANNEL_ID = os.environ.get("SUMMARY_CHANNEL_ID", "")
 BOT_TOKEN          = os.environ.get("DISCORD_BOT_TOKEN", "")
 MODEL              = "models/gemma-3-27b-it"

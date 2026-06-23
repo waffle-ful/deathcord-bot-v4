@@ -32,7 +32,7 @@ CHANNEL_IDS        = [int(c.strip()) for c in CHANNEL_IDS_RAW.split(",") if c.st
 EXCLUDE_IDS_RAW    = os.environ.get("EXCLUDE_CHANNEL_IDS", "")
 EXCLUDE_IDS        = set(int(c.strip()) for c in EXCLUDE_IDS_RAW.split(",") if c.strip())
 GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
-MONGODB_URI        = os.environ["MONGODB_URI"]
+MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
 
 MODEL          = "models/gemma-4-31b-it"
@@ -44,6 +44,7 @@ SUMMARY_LOOKBACK_DAYS = 90     # 要約アーカイブを何日分さかのぼ�
 SUMMARY_MAX_DOCS      = 1200   # 走査する要約ドキュメント上限（安全弁。90日×12件/日≈1080をカバー）
 MAX_LOG_CHARS         = 25000  # 生ログをプロンプトに入れる最大文字数（旧10000の切り詰めを撤廃）
 MAX_SUMMARY_CHARS     = 12000  # 要約抜粋をプロンプトに入れる最大文字数
+MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
 
 # =============================================================================
 # プロンプト
@@ -54,6 +55,9 @@ MEMBER_FOCUS_PROMPT = """\
 両方を突き合わせ、長期の傾向と直近の動きの両面から、
 「{name}」というメンバーの発言・言及に絞って分析し、
 この人物についての詳細な観察レポートを書いてください。
+冒頭に「これまでに蓄積した既知情報」が提示される場合があります。それは過去の分析の蓄積であり、
+今回のログ・要約で裏付け・更新・新情報の追加を行い、矛盾があれば新しい証拠を優先してください。
+古い情報の単なる引き写しは避け、変化や新事実を重視すること。
 前置き・導入文は不要です。各セクションの見出しから即座に書き始めてください。
 
 ## 発言の口調・語彙
@@ -249,19 +253,53 @@ def filter_logs(msgs: list[dict], needles: list[str] = None) -> str:
 # 長期アーカイブ（summaries）からの絞り込み
 # =============================================================================
 
-def build_member_needles(system_col) -> list[str]:
-    """FOCUS_NAME と、nickname_map 上で同一人物を指すエイリアス群を集める。"""
+def _strip_title_decoration(name: str) -> set[str]:
+    """「二つ名」本名 / 【二つ名】本名 等の装飾を剥がして素の名前候補を返す。
+    例: 「わっふる教団司祭」チャコ → {'わっふる教団司祭', 'チャコ'}。
+    /as の title が Discord 表示名に「title」付きで反映されるため、summaries/生ログ上の
+    素の呼称（チャコ）と表示名（装飾付き）がズレてヒットしない問題に対応。"""
+    out = set()
+    if not name:
+        return out
+    stripped = re.sub(r"[「」『』【】《》〈〉\[\]()（）\"'`･・|]", " ", name)
+    tokens   = [t for t in stripped.split() if len(t) >= 2]
+    out.update(tokens)
+    joined = "".join(tokens)
+    if len(joined) >= 2:
+        out.add(joined)
+    return out
+
+
+def build_member_needles(system_col, users_col) -> list[str]:
+    """フォーカス対象を summaries/生ログで拾うための検索語を集める。
+    FOCUS_NAME（装飾付き表示名）・素名・users.name/title・nickname_map の相互展開を統合。"""
     variants = {FOCUS_NAME}
+    variants |= _strip_title_decoration(FOCUS_NAME)
+
+    # users ドキュメントの記録名・二つ名も候補に
     try:
-        doc  = system_col.find_one({"_id": "nickname_map"}) or {}
-        nmap = doc.get("map", {})
-        for alias, canon in nmap.items():
-            if canon == FOCUS_NAME or alias == FOCUS_NAME:
-                variants.add(alias)
-                variants.add(canon)
+        udoc = users_col.find_one({"_id": FOCUS_TARGET}, {"name": 1, "title": 1}) or {}
+        for key in ("name", "title"):
+            if udoc.get(key):
+                variants.add(udoc[key])
+                variants |= _strip_title_decoration(udoc[key])
+    except Exception as e:
+        print(f"[WARN] users doc 読込失敗: {e}")
+
+    # nickname_map: variants のいずれかに一致する alias/canon を相互展開（2パスで推移的に）
+    try:
+        ndoc = system_col.find_one({"_id": "nickname_map"}) or {}
+        nmap = ndoc.get("map", {})
+        for _ in range(2):
+            for alias, canon in nmap.items():
+                if alias in variants or canon in variants:
+                    variants.add(alias)
+                    variants.add(canon)
     except Exception as e:
         print(f"[WARN] nickname_map 読込失敗: {e}")
-    return [v for v in variants if v]
+
+    # 1文字は誤爆するので2文字以上のみ採用
+    return [v for v in variants if v and len(v) >= 2]
 
 
 def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
@@ -309,6 +347,80 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
 
 
 # =============================================================================
+# 既知情報の読み返し（Tier2・member専用）
+# =============================================================================
+
+# profile / simple_profile のフィールド表示名（両形に対応）
+_PROFILE_LABELS = {
+    "tone":                "口調",
+    "communication_style": "コミュ特徴",
+    "vocabulary":          "語彙・口癖",
+    "personality":         "性格",
+    "background":          "立場・背景",
+    "relations":           "関係性",
+    "interests_vibe":      "関心・雰囲気",
+    "birthday":            "誕生日",
+    "vibe":                "雰囲気",          # simple_profile
+    "tone_tags":           "口調タグ",        # simple_profile（list）
+}
+
+
+def load_member_context(users_col) -> str:
+    """対象メンバーについて過去に蓄積した profile/claims/memories を読み返す（積み上げ式）。
+
+    embedding は巨大なのでプロンプトには載せない（content/category/date のみ）。
+    profile は $set 上書きなので戻しても劣化しないが、claims/memories は append-store の
+    ため、戻した内容が言い換えで再抽出されると near-dup が溜まる。dedup 側を正規化して防ぐ
+    （save_memories_from_focus の _dedup_key を参照）。
+    """
+    doc = users_col.find_one({"_id": FOCUS_TARGET}) or {}
+    if not doc:
+        return ""
+
+    prof  = doc.get("profile") or {}
+    sprof = doc.get("simple_profile") or {}
+    sections = []
+
+    # プロフィール（booster profile 優先、無い項目は simple_profile で補う）
+    prof_lines = []
+    for k, label in _PROFILE_LABELS.items():
+        v = prof.get(k) or sprof.get(k)
+        if not v:
+            continue
+        if isinstance(v, list):
+            v = "・".join(str(x) for x in v if x)
+        if v:
+            prof_lines.append(f"- {label}: {v}")
+    for k, label in [("hobbies", "趣味"), ("memo", "メモ")]:
+        v = prof.get(k)
+        if v:
+            joined = "・".join(str(x) for x in v if x)
+            if joined:
+                prof_lines.append(f"- {label}: {joined}")
+    if prof_lines:
+        sections.append("◆既存プロフィール\n" + "\n".join(prof_lines))
+
+    # claims（append+cap20、末尾が新しい）→ 新しい順に最大15件
+    claims = [c.get("content", "") for c in (doc.get("claims") or []) if c.get("content")]
+    if claims:
+        cl = "\n".join(f"- {c}" for c in reversed(claims[-15:]))
+        sections.append("◆過去の主張(claims)\n" + cl)
+
+    # memories（先頭が新しい MRU、embedding は載せない）→ 最大20件
+    ml = []
+    for m in (doc.get("memories") or [])[:20]:
+        c = m.get("content", "")
+        if not c:
+            continue
+        tag = "/".join(x for x in (m.get("category", ""), m.get("date", "")) if x)
+        ml.append(f"- [{tag}] {c}" if tag else f"- {c}")
+    if ml:
+        sections.append("◆過去の記憶(memories)\n" + "\n".join(ml))
+
+    return "\n\n".join(sections)
+
+
+# =============================================================================
 # AI処理
 # =============================================================================
 
@@ -317,7 +429,8 @@ def _extract_retry_wait(err: str) -> float:
     return float(m.group(1)) + 2.0 if m else 60.0
 
 
-def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str | None:
+def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
+            temperature: float = 0.3) -> str | None:
     for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
         for attempt in range(5):
             try:
@@ -325,7 +438,7 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
                     model=model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        temperature=0.3,
+                        temperature=temperature,
                         max_output_tokens=max_tokens,
                     ),
                 )
@@ -340,9 +453,10 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
                     wait = _extract_retry_wait(err)
                     print(f"[WARN] 429 ({label}) attempt{attempt+1}, {wait:.1f}s待機...")
                     time.sleep(wait)
-                elif "503" in err or "UNAVAILABLE" in err:
+                elif any(s in err for s in ("503", "UNAVAILABLE", "500", "INTERNAL")):
+                    # 500 INTERNAL / 503 UNAVAILABLE は一時障害が多い → backoff してリトライ
                     wait = (attempt + 1) * 20
-                    print(f"[WARN] 503 ({label}) attempt{attempt+1}, {wait}s待機...")
+                    print(f"[WARN] 500/503 ({label}) attempt{attempt+1}, {wait}s待機...")
                     time.sleep(wait)
                 else:
                     print(f"[ERROR] {label}: {e}")
@@ -350,13 +464,19 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000) -> str
     return None
 
 
-def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = "") -> str | None:
+def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = "",
+                    member_context: str = "") -> str | None:
     if FOCUS_TYPE == "member":
         prompt = MEMBER_FOCUS_PROMPT.format(name=FOCUS_NAME, days=FETCH_DAYS)
     else:
         prompt = KEYWORD_FOCUS_PROMPT.format(keyword=FOCUS_NAME, days=FETCH_DAYS)
 
     parts = []
+    if member_context:
+        parts.append(
+            f"【これまでに蓄積した既知情報（過去の分析結果。今回の証拠で検証・更新せよ）】\n"
+            f"{member_context[:MAX_MEMBER_CONTEXT_CHARS]}"
+        )
     if summary_text:
         parts.append(
             f"【長期の要約アーカイブ（過去{SUMMARY_LOOKBACK_DAYS}日・{FOCUS_NAME}関連の行を抽出）】\n"
@@ -404,6 +524,14 @@ def save_profile(users_col, profile: dict):
     print(f"[profile] {FOCUS_NAME}のプロフィールを更新: {list(updates.keys())}")
 
 
+def _dedup_key(s: str) -> str:
+    """near-dup 照合用の正規化キー。Tier2 で既知情報を戻すと言い換え再抽出が起きるため、
+    大小文字・空白・末尾句読点を畳んで軽い言い換え重複を弾く（完全な意味dedupはTier3領域）。"""
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", "", s)
+    return s.strip("。.!?！？、,，・")
+
+
 def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
     """focusレポートからmemories・claimsを抽出してユーザーに保存"""
     prompt = f"""以下は「{FOCUS_NAME}」についての観察レポートです。
@@ -421,26 +549,29 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 【観察レポート】
 {report[:3000]}"""
 
+    # call_ai 経由で MODEL→MODEL_FALLBACK のリトライ/フォールバックに乗せる
+    # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
+    raw = call_ai(client_ai, prompt, max_tokens=500, temperature=0.1)
+    if not raw:
+        print("[WARN] focus memories extract: 空/失敗（スキップ）")
+        return
     try:
-        resp = client_ai.models.generate_content(
-            model="models/gemma-3-27b-it",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=500),
-        )
-        raw  = getattr(resp, "text", "").strip().replace("```json", "").replace("```", "").strip()
+        raw  = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
     except Exception as e:
-        print(f"[WARN] focus memories extract: {e}")
+        print(f"[WARN] focus memories extract parse: {e}")
         return
 
     doc = users_col.find_one({"_id": FOCUS_TARGET}) or {}
     now = datetime.now(timezone.utc)
 
-    # claims更新
+    # claims更新（正規化キーで near-dup も弾く・intra-batch も seen で防ぐ）
     new_claims = []
-    existing_claims = {c.get("content","") for c in doc.get("claims", [])}
+    seen_claims = {_dedup_key(c.get("content","")) for c in doc.get("claims", [])}
     for c in data.get("claims", []):
-        if c and c not in existing_claims:
+        key = _dedup_key(c)
+        if c and key and key not in seen_claims:
+            seen_claims.add(key)
             new_claims.append({
                 "content": c[:200],
                 "date":    now.isoformat(),
@@ -448,13 +579,15 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
             })
     all_claims = (doc.get("claims", []) + new_claims)[-20:]
 
-    # memories更新（Embedding付与）
+    # memories更新（Embedding付与・正規化キーで near-dup を弾く）
     new_memories = []
-    existing_mems = {m.get("content","") for m in doc.get("memories", [])}
+    seen_mems = {_dedup_key(m.get("content","")) for m in doc.get("memories", [])}
     for m in data.get("memories", []):
         text = m.get("content","")
-        if not text or text in existing_mems:
+        key  = _dedup_key(text)
+        if not text or not key or key in seen_mems:
             continue
+        seen_mems.add(key)
         vec = []
         try:
             er = client_ai.models.embed_content(
@@ -561,7 +694,7 @@ def main():
 
     # フォーカス対象の検索語（member はエイリアスまで展開）
     if FOCUS_TYPE == "member":
-        needles = build_member_needles(system_col)
+        needles = build_member_needles(system_col, users_col)
         print(f"[focus] 名前バリアント: {needles}")
     else:
         needles = list({FOCUS_TARGET, FOCUS_NAME})
@@ -580,10 +713,15 @@ def main():
         print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
         return
 
-    # レポート生成（長期要約 + 直近生ログ）
+    # 既知情報の読み返し（Tier2・member専用：過去のprofile/claims/memoriesを積み上げ）
+    member_context = load_member_context(users_col) if FOCUS_TYPE == "member" else ""
+    if member_context:
+        print(f"[focus] 既知情報を読み込み: {len(member_context)}文字")
+
+    # レポート生成（既知情報 + 長期要約 + 直近生ログ）
     print("[focus] レポート生成中...")
     client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    report    = generate_report(client_ai, log_text, summary_text)
+    report    = generate_report(client_ai, log_text, summary_text, member_context)
     if not report:
         print("[focus] レポート生成失敗")
         return

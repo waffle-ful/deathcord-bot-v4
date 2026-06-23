@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from pymongo import MongoClient, DESCENDING
 
-MONGODB_URI = os.environ["MONGODB_URI"]
+MONGODB_URI = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 DB_NAME     = "discord_bot_db"
 COLLECTION  = "summaries"
 INPUT_PATH  = "/tmp/summary_result.json"

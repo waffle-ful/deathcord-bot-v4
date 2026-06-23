@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MONGODB_URI    = os.environ["MONGODB_URI"]
+MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 MODEL          = "models/gemma-4-31b-it"
 MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
 DB_NAME        = "discord_bot_db"

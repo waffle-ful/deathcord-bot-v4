@@ -123,14 +123,16 @@ retro_summarize.py (batch/)
 ```
 focus_summary.py
     ├ 環境変数: FOCUS_TYPE, FOCUS_TARGET, FOCUS_NAME
-    ├ 情報源は2系統（Tier1 で拡張済み）:
+    ├ 情報源は3系統（Tier1+Tier2 で拡張済み）:
     │   ① 直近 FETCH_DAYS=7 日の生ログ（Discord REST, filter_logs で絞り込み、最大 MAX_LOG_CHARS=25000 字）
     │   ② summaries アーカイブ（created_at >= 過去 SUMMARY_LOOKBACK_DAYS=90 日, 安全弁 SUMMARY_MAX_DOCS=1200,
     │       fetch_relevant_summaries が needle を含む行のみ新しい順に MAX_SUMMARY_CHARS=12000 字まで抽出。retro 要約も含む）
+    │   ③ 既知情報（Tier2・member のみ）: load_member_context が users.profile/simple_profile + claims + memories
+    │       を MAX_MEMBER_CONTEXT_CHARS=4000 字まで整形。embedding は載せない。プロンプト先頭に「検証・更新せよ」と注入
     ├ FOCUS_TYPE="member": needle = FOCUS_NAME + system.nickname_map のエイリアス展開
     │   （build_member_needles）。愛称呼びの発言・言及も拾う
-    │   → プロンプト: MEMBER_FOCUS_PROMPT
-    │   → 書戻: users.profile 更新 + claims + memories（embedding 付与）
+    │   → プロンプト: MEMBER_FOCUS_PROMPT（既知情報の引き写し禁止・変化重視を指示）
+    │   → 書戻: users.profile 更新 + claims + memories（embedding 付与・_dedup_key で near-dup を弾く）
     ├ FOCUS_TYPE="keyword": needle = keyword。生ログは部分文字列一致で収集
     │   → プロンプト: KEYWORD_FOCUS_PROMPT
     └ Discord 投稿
@@ -139,6 +141,13 @@ focus_summary.py
 > **Tier1 拡張 (2026-06)**: 旧実装は直近7日生ログを先頭1万字に切り詰めるだけで、永久保持の `summaries`
 > アーカイブを未使用だった（情報ロスの主因）。現在は長期要約 + 直近生ログの両方を投入し、member は
 > nickname_map のエイリアスまで絞り込み対象を広げる。embedding 不要・両 focus モードに有効。
+>
+> **Tier2 拡張 (2026-06・member のみ)**: 過去に書き戻した `profile/claims/memories` を `load_member_context`
+> で読み返し、プロンプト先頭に「既知情報（検証・更新せよ）」として注入＝積み上げ式。旧実装は毎回ゼロから
+> 7日で再構築して捨てていた。**注意（フィードバックループ）**: 既知情報を戻す＋「引き写し禁止」指示により
+> 言い換え再抽出が起き、完全一致 dedup をすり抜けて claims/memories に near-dup が溜まる懸念がある。対策として
+> `_dedup_key`（大小文字・空白・末尾句読点を畳む正規化）で軽い言い換え重複を弾く。profile は `$set` 上書きなので
+> 戻しても劣化しない。真の意味 dedup は Tier3（embedding）領域。
 > （keyword の意味検索 RAG = 各 summary への embedding キャッシュ付与は Tier3 として未実装）
 
 ## 副業スクリプト（root 直下）
