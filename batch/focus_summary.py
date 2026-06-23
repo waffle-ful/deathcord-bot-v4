@@ -380,18 +380,6 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     n_chunks   = (lookback + CHUNK_DAYS - 1) // CHUNK_DAYS
     window_start = (now - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
-    # 診断: created_at の型不一致(文字列 vs BSON Date)で古い doc を取りこぼしていないか。
-    # 文字列フィルタは Date 型 created_at をマッチしない（MongoDB は型ごとに別ソート/別範囲）。
-    try:
-        since_dt = now - timedelta(days=lookback)
-        c_str  = summaries_col.count_documents({"summary": {"$exists": True}, "created_at": {"$gte": since_dt.isoformat()}})
-        c_date = summaries_col.count_documents({"summary": {"$exists": True}, "created_at": {"$gte": since_dt}})
-        c_all  = summaries_col.count_documents({"summary": {"$exists": True}})
-        print(f"[focus][debug] 年窓内 文字列比較={c_str}件 / datetime比較={c_date}件 ｜ コレクション全体={c_all}件 "
-              f"（datetime比較が大きいなら created_at が Date 型で文字列フィルタが取りこぼし）")
-    except Exception as e:
-        print(f"[WARN] created_at 型診断失敗: {e}")
-
     matched, scanned_total = [], 0
     for i in range(n_chunks):
         chunk_end   = now - timedelta(days=i * CHUNK_DAYS)
