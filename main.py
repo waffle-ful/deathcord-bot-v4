@@ -3077,9 +3077,11 @@ async def focus_cmd(
     payload = {
         "ref": "main",
         "inputs": {
-            "focus_type":   focus_type,
-            "focus_target": focus_target,
-            "focus_name":   focus_name,
+            "focus_type":    focus_type,
+            "focus_target":  focus_target,
+            "focus_name":    focus_name,
+            # /focus を実行したチャンネルにレポートを投稿させる
+            "focus_channel": str(interaction.channel_id),
         },
     }
 
@@ -3087,7 +3089,6 @@ async def focus_cmd(
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload) as resp:
                 if resp.status == 204:
-                    icon = "👤" if focus_type == "member" else "🔍"
                     icon = "👤" if focus_type == "member" else "🔍"
                     await interaction.followup.send(
                         f"{icon} **{focus_name}** に絞った要約を作成中です！\n数分後にこのチャンネルに投稿されます。"

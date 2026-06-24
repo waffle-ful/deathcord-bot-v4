@@ -34,6 +34,9 @@ EXCLUDE_IDS        = set(int(c.strip()) for c in EXCLUDE_IDS_RAW.split(",") if c
 GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
+# /focus を実行したチャンネルへ投稿する。未指定（手動dispatch等）の場合は
+# 従来どおり SUMMARY_CHANNEL_ID にフォールバックする。
+FOCUS_CHANNEL_ID   = os.environ.get("FOCUS_CHANNEL_ID", "").strip() or SUMMARY_CHANNEL_ID
 
 MODEL          = "models/gemma-4-31b-it"
 MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
@@ -817,7 +820,7 @@ def post_report(report: str):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-    url     = f"https://discord.com/api/v10/channels/{SUMMARY_CHANNEL_ID}/messages"
+    url     = f"https://discord.com/api/v10/channels/{FOCUS_CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
     for i in range(0, len(embeds), 10):
         resp = requests.post(url, headers=headers,

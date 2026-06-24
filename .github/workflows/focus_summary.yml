@@ -15,6 +15,10 @@ on:
         description: '表示名'
         required: true
         type: string
+      focus_channel:
+        description: '/focus を実行したチャンネルID（投稿先）'
+        required: false
+        type: string
 
 jobs:
   focus:
@@ -39,6 +43,7 @@ jobs:
           FOCUS_TYPE:          ${{ github.event.inputs.focus_type }}
           FOCUS_TARGET:        ${{ github.event.inputs.focus_target }}
           FOCUS_NAME:          ${{ github.event.inputs.focus_name }}
+          FOCUS_CHANNEL_ID:    ${{ github.event.inputs.focus_channel }}
           DISCORD_BOT_TOKEN:   ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID:    ${{ secrets.DISCORD_GUILD_ID }}
           DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
