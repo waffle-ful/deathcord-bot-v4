@@ -135,6 +135,18 @@ SECTION_ICONS_KEYWORD = {
     "盛り上がった": "🔥", "結論": "✅", "関連": "🔗",
 }
 
+# analyze_personality.py が profile.bigfive に書く5因子（TIPI-J / 小塩ら2012）。
+# focus は読むだけ＝bigfive の所有者は analyze_personality のみ（書き戻さず較正値を汚さない）。
+# バッチ間で import しない方針なので表示順を固定するためここに複製する。
+BIGFIVE_FACTORS_JA = {
+    "openness":          "開放性",
+    "conscientiousness": "誠実性",
+    "extraversion":      "外向性",
+    "agreeableness":     "協調性",
+    "neuroticism":       "情緒不安定さ",
+}
+CONF_JA = {"low": "低", "mid": "中", "high": "高"}
+
 
 # =============================================================================
 # ログ取得
@@ -538,6 +550,67 @@ def load_member_context(users_col) -> str:
 
 
 # =============================================================================
+# Big Five 連携（member専用・analyze_personality.py の profile.bigfive を読むだけ）
+# =============================================================================
+
+def load_bigfive(users_col) -> dict | None:
+    """対象メンバーの profile.bigfive を返す。性格診断オプトアウト者は None。
+
+    bigfive は analyze_personality.py が TIPI-J で較正して書く唯一の所有者なので、
+    focus は読むだけで書き戻さない（較正値を vibe で汚さないため）。
+    personality_optout の人は分析自体を拒否しているので focus でも開示しない
+    （古い bigfive が残っていても出さない）。
+    """
+    doc = users_col.find_one(
+        {"_id": FOCUS_TARGET},
+        {"profile.bigfive": 1, "personality_optout": 1},
+    ) or {}
+    if doc.get("personality_optout") is True:
+        return None
+    bf = (doc.get("profile") or {}).get("bigfive")
+    return bf if isinstance(bf, dict) and any(
+        isinstance(bf.get(k), dict) for k in BIGFIVE_FACTORS_JA
+    ) else None
+
+
+def render_bigfive_for_prompt(bigfive: dict) -> str:
+    """LLMプロンプト用：較正済み参考基準としての Big Five テキスト。
+    band/confidence/evidence のみ（score は内部較正用なので出さない）。"""
+    lines = []
+    for key, label in BIGFIVE_FACTORS_JA.items():
+        f = bigfive.get(key)
+        if not isinstance(f, dict) or not f.get("band"):
+            continue
+        conf = CONF_JA.get(f.get("confidence"), f.get("confidence") or "?")
+        line = f"- {label}: {f['band']}（確信:{conf}）"
+        ev = f.get("evidence")
+        if ev and str(ev) not in ("null", "None"):
+            line += f" ／根拠例: {str(ev)[:80]}"
+        lines.append(line)
+    if not lines:
+        return ""
+    dp = bigfive.get("data_points")
+    foot = f"\n（{dp}発言からの推定）" if dp else ""
+    return "\n".join(lines) + foot
+
+
+def render_bigfive_for_embed(bigfive: dict) -> dict | None:
+    """Discord埋め込み用フィールド：LLMの気分に左右されず較正値を確実に表示する。
+    bands+confidence のみ＋確定診断ではない旨の注記。"""
+    rows = []
+    for key, label in BIGFIVE_FACTORS_JA.items():
+        f = bigfive.get(key)
+        if not isinstance(f, dict) or not f.get("band"):
+            continue
+        conf = CONF_JA.get(f.get("confidence"), "?")
+        rows.append(f"**{label}** {f['band']}（確信:{conf}）")
+    if not rows:
+        return None
+    val = "\n".join(rows) + "\n※検証済み尺度TIPI-Jによるチャットからの推定。確定診断ではありません。"
+    return {"name": "🧬 性格傾向（Big Five / TIPI-J推定）", "value": val[:1020], "inline": False}
+
+
+# =============================================================================
 # AI処理
 # =============================================================================
 
@@ -591,15 +664,24 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
 
 
 def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = "",
-                    member_context: str = "") -> str | None:
+                    member_context: str = "", bigfive_text: str = "") -> str | None:
     if FOCUS_TYPE == "member":
         prompt = MEMBER_FOCUS_PROMPT.format(name=FOCUS_NAME, days=FETCH_DAYS)
     else:
         prompt = KEYWORD_FOCUS_PROMPT.format(keyword=FOCUS_NAME, days=FETCH_DAYS)
 
-    # 並び順: 既知情報 → 直近生ログ → 長期アーカイブ(最後=高アテンション位置)。
+    # 並び順: 較正基準 → 既知情報 → 直近生ログ → 長期アーカイブ(最後=高アテンション位置)。
     # 長期データを末尾に置き、時系列見出しで活用を強制する。
     parts = []
+    # Big Five は「上書き対象の古い分析」ではなく検証済みの“測定値”なので、
+    # member_context（=検証・更新せよ）とは別 part で較正基準として提示する。
+    # （独立 part にすることで member_context の [:4000] トランケにも巻き込まれない）
+    if bigfive_text:
+        parts.append(
+            "【性格傾向の較正済み参考基準（検証済み心理尺度 TIPI-J / Big Five によるチャット推定。"
+            "安易に上書きせず、今回の観察をこれと整合させ、一致点・相違点があれば言及すること）】\n"
+            f"{bigfive_text}"
+        )
     if member_context:
         parts.append(
             f"【これまでに蓄積した既知情報（過去の分析結果。今回の証拠で検証・更新せよ）】\n"
@@ -774,7 +856,7 @@ def _split_for_field(text: str, limit: int = 1020) -> list[str]:
     return chunks
 
 
-def post_report(report: str):
+def post_report(report: str, bigfive: dict | None = None):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
     title_str  = f"{icon} {FOCUS_NAME} のフォーカス要約"
@@ -792,6 +874,11 @@ def post_report(report: str):
             sections.append((title, body))
 
     fields = []
+    # Big Five 較正値を冒頭フィールドに（LLM出力に依存せず確実に表示）
+    if bigfive:
+        bf_field = render_bigfive_for_embed(bigfive)
+        if bf_field:
+            fields.append(bf_field)
     for title, body in sections:
         icon_c = next((v for k, v in ICONS.items() if k in title), "📋")
         # 1024字超のセクションは切り捨てず、続きフィールドに分割して全文表示
@@ -871,10 +958,18 @@ def main():
     if member_context:
         print(f"[focus] 既知情報を読み込み: {len(member_context)}文字")
 
-    # レポート生成（既知情報 + 長期要約 + 直近生ログ）
+    # Big Five 連携（member専用：analyze_personality の TIPI-J 推定を較正基準として読む）
+    bigfive      = load_bigfive(users_col) if FOCUS_TYPE == "member" else None
+    bigfive_text = render_bigfive_for_prompt(bigfive) if bigfive else ""
+    if bigfive_text:
+        present = [BIGFIVE_FACTORS_JA[k] for k in BIGFIVE_FACTORS_JA
+                   if isinstance(bigfive.get(k), dict)]
+        print(f"[focus] Big Five 連携: {present}")
+
+    # レポート生成（較正基準 + 既知情報 + 長期要約 + 直近生ログ）
     print("[focus] レポート生成中...")
     client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    report    = generate_report(client_ai, log_text, summary_text, member_context)
+    report    = generate_report(client_ai, log_text, summary_text, member_context, bigfive_text)
     if not report:
         print("[focus] レポート生成失敗")
         return
@@ -892,8 +987,8 @@ def main():
         time.sleep(3)
         save_memories_from_focus(client_ai, users_col, report)
 
-    # Discord投稿
-    post_report(report)
+    # Discord投稿（member は Big Five 較正値を冒頭フィールドに付与）
+    post_report(report, bigfive=bigfive)
     print("[focus] 完了！")
 
 
