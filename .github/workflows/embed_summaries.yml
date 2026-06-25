@@ -9,9 +9,9 @@ on:
         default: '1000'
         type: string
       sleep:
-        description: '1件ごとのスリープ秒（無料枠レート保護・既定 0.5）'
+        description: '1件ごとのスリープ秒（無料枠TPM≈30k保護・既定 3.5＝~15doc/分）'
         required: false
-        default: '0.5'
+        default: '3.5'
         type: string
 
 jobs:
