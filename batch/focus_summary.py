@@ -21,6 +21,8 @@ from pymongo import MongoClient
 from google import genai
 from google.genai import types
 
+from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
+
 FOCUS_TYPE    = os.environ["FOCUS_TYPE"]    # "member" or "keyword"
 FOCUS_TARGET  = os.environ["FOCUS_TARGET"]  # user_id or keyword
 FOCUS_NAME    = os.environ["FOCUS_NAME"]    # 表示名
@@ -48,6 +50,11 @@ SUMMARY_LOOKBACK_DAYS_KEYWORD = 730    # keyword: トピックは深い歴史を
 MAX_LOG_CHARS         = 10000  # 生ログ(直近7日)は「最近の断面」の補助なので絞る（長期偏重を優先）
 MAX_SUMMARY_CHARS     = 24000  # 長期アーカイブが主役。月ごと按分でこの予算を1〜2年に配分する
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
+# Tier3 意味検索（keyword専用）。doc重心 vs 短い検索語 の cosine は圧縮・密集しがちなので
+# 閾値は低めに置き、毎回 top-N の sim を必ずログする＝実測で調整する（推測で固定しない）。
+KEYWORD_SEM_THRESHOLD = float(os.environ.get("KEYWORD_SEM_THRESHOLD", "0.45"))
+KEYWORD_SEM_TOPK      = int(os.environ.get("KEYWORD_SEM_TOPK", "20"))   # 意味検索で追加採用する最大doc数
+EMBED_BLOCK_CHARS     = 1000   # 意味検索で当たった doc から載せる本文の上限（needle行抽出と違い全文系なので絞る）
 
 # 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
 # 構築失敗時は None（=SDKデフォルト）にフォールバックしてモジュール読込を壊さない。
@@ -134,6 +141,18 @@ SECTION_ICONS_KEYWORD = {
     "概要": "📌", "議論の流れ": "🔄", "関わった": "👥",
     "盛り上がった": "🔥", "結論": "✅", "関連": "🔗",
 }
+
+# analyze_personality.py が profile.bigfive に書く5因子（TIPI-J / 小塩ら2012）。
+# focus は読むだけ＝bigfive の所有者は analyze_personality のみ（書き戻さず較正値を汚さない）。
+# バッチ間で import しない方針なので表示順を固定するためここに複製する。
+BIGFIVE_FACTORS_JA = {
+    "openness":          "開放性",
+    "conscientiousness": "誠実性",
+    "extraversion":      "外向性",
+    "agreeableness":     "協調性",
+    "neuroticism":       "情緒不安定さ",
+}
+CONF_JA = {"low": "低", "mid": "中", "high": "高"}
 
 
 # =============================================================================
@@ -387,12 +406,15 @@ def _select_across_months(matched: list, budget: int) -> list:
     return selected
 
 
-def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
-    """summaries アーカイブ（永久保持）から、needle を含む行だけを
-    新しい順に MAX_SUMMARY_CHARS まで抜き出してテキスト化する。
+def fetch_relevant_summaries(summaries_col, needles: list[str], query_embedding=None) -> str:
+    """summaries アーカイブ（永久保持）から関連ブロックを抽出してテキスト化する。
 
-    要約は全員分の内容を含むため、フォーカス対象を含む行のみに絞って
-    ノイズとトークン消費を抑える。retro 要約も歴史的文脈として含める。
+    ハイブリッド recall（keyword の Tier3）:
+      ① needle（文字列一致）= 確実な行レベル抽出。recall の【床】。member/keyword 共通。
+      ② 意味検索（query_embedding 指定時=keyword専用）= needle に掛からないが意味的に近い
+         doc を doc重心 embedding の cosine で救済。①で当たった doc は除外（重複回避）。
+    両者を月按分（_select_across_months）に合流させ、時系列の分散を保ったまま予算配分する。
+    needle ブロックを先に matched へ積む＝月バケツ内で精密な needle が曖昧な意味検索より優先される。
     """
     needles_l = [n.lower() for n in needles if n]
     if not needles_l:
@@ -408,7 +430,16 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     n_chunks   = (lookback + CHUNK_DAYS - 1) // CHUNK_DAYS
     window_start = (now - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
+    # embedding は 3072次元で重い。意味検索する keyword モードのときだけ射影する
+    # （member は意味検索しないので全 doc のベクトル転送は純粋な無駄）。
+    proj = {"summary": 1, "created_at": 1, "retro_date": 1}
+    if query_embedding is not None:
+        proj["embedding"] = 1
+
     matched, scanned_total = [], 0
+    # emb_seen は embedding を持つ doc の【総数】(needle該当も含む)＝バックフィル進捗の真の指標。
+    # sem_cands は needle 非該当のみ（意味検索の救済対象）。両者を分けて数える。
+    sem_cands, emb_seen = [], 0
     for i in range(n_chunks):
         chunk_end   = now - timedelta(days=i * CHUNK_DAYS)
         chunk_start = now - timedelta(days=min((i + 1) * CHUNK_DAYS, lookback))
@@ -416,7 +447,7 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
             docs = list(summaries_col.find(
                 {"summary": {"$exists": True},
                  "created_at": {"$gte": chunk_start.isoformat(), "$lt": chunk_end.isoformat()}},
-                {"summary": 1, "created_at": 1, "retro_date": 1},
+                proj,
                 sort=[("created_at", -1)],
             ).limit(PER_CHUNK))
         except Exception as e:
@@ -430,9 +461,34 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
             date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
             hits = [ln.strip() for ln in summ.split("\n")
                     if ln.strip() and any(n in ln.lower() for n in needles_l)]
-            if not hits:
-                continue
-            matched.append((date, f"[{date}]\n" + "\n".join(hits)))
+            emb = d.get("embedding") if query_embedding is not None else None
+            if emb:
+                emb_seen += 1
+            if hits:
+                matched.append((date, f"[{date}]\n" + "\n".join(hits)))
+            elif emb:
+                # needle 非該当 doc のみ意味検索の候補に（needle 該当は①で精密に拾えている）
+                sem_cands.append((cosine(query_embedding, emb), date, summ))
+
+    # 意味検索: 閾値以上の上位 K doc を needle ブロックの【後】に積む（月バケツ内で needle 優先）
+    sem_selected = 0
+    if query_embedding is not None:
+        sem_cands.sort(key=lambda x: x[0], reverse=True)
+        # 床を割らない: 閾値で誰も通らなくても needle 結果はそのまま返る
+        for sim, date, summ in sem_cands:
+            if sim < KEYWORD_SEM_THRESHOLD or sem_selected >= KEYWORD_SEM_TOPK:
+                break
+            block = (f"[{date}]\n（意味検索 sim={sim:.2f}・キーワード非含有だが関連）\n"
+                     f"{summ.strip()[:EMBED_BLOCK_CHARS]}")
+            matched.append((date, block))
+            sem_selected += 1
+        # 閾値調整のための実測ログ（推測で閾値を決めない・top10の sim と日付を必ず出す）
+        top = sem_cands[:10]
+        top_str = " ".join(f"{s:.2f}({dt})" for s, dt, _ in top) if top else "なし"
+        print(f"[focus][sem] embedding付きdoc(全)={emb_seen}件 意味検索候補(needle非該当)={len(sem_cands)}件 "
+              f"候補top10sim={top_str}")
+        print(f"[focus][sem] 閾値={KEYWORD_SEM_THRESHOLD} 採用={sem_selected}/{KEYWORD_SEM_TOPK} "
+              f"（embedding付きdoc(全)=0なら未バックフィル／sim全部低なら重心がぼやけ過ぎ＝閾値下げ or 無効化検討）")
 
     # 月ごと按分で数ヶ月を満遍なく代表させる（直近偏重の予算切りを回避）
     selected = _select_across_months(matched, MAX_SUMMARY_CHARS)
@@ -444,7 +500,7 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
         md = [d for d, _ in matched]
         sd = [d for d, _ in selected]
         n_months = len({d[:7] for d in sd})
-        print(f"[focus][debug] needleマッチ={len(matched)}件 期間={min(md)}〜{max(md)} "
+        print(f"[focus][debug] 全マッチ(needle+意味)={len(matched)}件 期間={min(md)}〜{max(md)} "
               f"／按分採用={len(selected)}件 採用期間={min(sd)}〜{max(sd)} ({n_months}ヶ月分)")
     try:
         oldest = summaries_col.find_one(
@@ -538,6 +594,67 @@ def load_member_context(users_col) -> str:
 
 
 # =============================================================================
+# Big Five 連携（member専用・analyze_personality.py の profile.bigfive を読むだけ）
+# =============================================================================
+
+def load_bigfive(users_col) -> dict | None:
+    """対象メンバーの profile.bigfive を返す。性格診断オプトアウト者は None。
+
+    bigfive は analyze_personality.py が TIPI-J で較正して書く唯一の所有者なので、
+    focus は読むだけで書き戻さない（較正値を vibe で汚さないため）。
+    personality_optout の人は分析自体を拒否しているので focus でも開示しない
+    （古い bigfive が残っていても出さない）。
+    """
+    doc = users_col.find_one(
+        {"_id": FOCUS_TARGET},
+        {"profile.bigfive": 1, "personality_optout": 1},
+    ) or {}
+    if doc.get("personality_optout") is True:
+        return None
+    bf = (doc.get("profile") or {}).get("bigfive")
+    return bf if isinstance(bf, dict) and any(
+        isinstance(bf.get(k), dict) for k in BIGFIVE_FACTORS_JA
+    ) else None
+
+
+def render_bigfive_for_prompt(bigfive: dict) -> str:
+    """LLMプロンプト用：較正済み参考基準としての Big Five テキスト。
+    band/confidence/evidence のみ（score は内部較正用なので出さない）。"""
+    lines = []
+    for key, label in BIGFIVE_FACTORS_JA.items():
+        f = bigfive.get(key)
+        if not isinstance(f, dict) or not f.get("band"):
+            continue
+        conf = CONF_JA.get(f.get("confidence"), f.get("confidence") or "?")
+        line = f"- {label}: {f['band']}（確信:{conf}）"
+        ev = f.get("evidence")
+        if ev and str(ev) not in ("null", "None"):
+            line += f" ／根拠例: {str(ev)[:80]}"
+        lines.append(line)
+    if not lines:
+        return ""
+    dp = bigfive.get("data_points")
+    foot = f"\n（{dp}発言からの推定）" if dp else ""
+    return "\n".join(lines) + foot
+
+
+def render_bigfive_for_embed(bigfive: dict) -> dict | None:
+    """Discord埋め込み用フィールド：LLMの気分に左右されず較正値を確実に表示する。
+    bands+confidence のみ＋確定診断ではない旨の注記。"""
+    rows = []
+    for key, label in BIGFIVE_FACTORS_JA.items():
+        f = bigfive.get(key)
+        if not isinstance(f, dict) or not f.get("band"):
+            continue
+        conf = CONF_JA.get(f.get("confidence"), "?")
+        rows.append(f"**{label}** {f['band']}（確信:{conf}）")
+    if not rows:
+        return None
+    val = "\n".join(rows) + "\n※検証済み尺度TIPI-Jによるチャットからの推定。確定診断ではありません。"
+    return {"name": "🧬 性格傾向（Big Five / TIPI-J推定）", "value": val[:1020], "inline": False}
+
+
+# =============================================================================
 # AI処理
 # =============================================================================
 
@@ -591,15 +708,24 @@ def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
 
 
 def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = "",
-                    member_context: str = "") -> str | None:
+                    member_context: str = "", bigfive_text: str = "") -> str | None:
     if FOCUS_TYPE == "member":
         prompt = MEMBER_FOCUS_PROMPT.format(name=FOCUS_NAME, days=FETCH_DAYS)
     else:
         prompt = KEYWORD_FOCUS_PROMPT.format(keyword=FOCUS_NAME, days=FETCH_DAYS)
 
-    # 並び順: 既知情報 → 直近生ログ → 長期アーカイブ(最後=高アテンション位置)。
+    # 並び順: 較正基準 → 既知情報 → 直近生ログ → 長期アーカイブ(最後=高アテンション位置)。
     # 長期データを末尾に置き、時系列見出しで活用を強制する。
     parts = []
+    # Big Five は「上書き対象の古い分析」ではなく検証済みの“測定値”なので、
+    # member_context（=検証・更新せよ）とは別 part で較正基準として提示する。
+    # （独立 part にすることで member_context の [:4000] トランケにも巻き込まれない）
+    if bigfive_text:
+        parts.append(
+            "【性格傾向の較正済み参考基準（検証済み心理尺度 TIPI-J / Big Five によるチャット推定。"
+            "安易に上書きせず、今回の観察をこれと整合させ、一致点・相違点があれば言及すること）】\n"
+            f"{bigfive_text}"
+        )
     if member_context:
         parts.append(
             f"【これまでに蓄積した既知情報（過去の分析結果。今回の証拠で検証・更新せよ）】\n"
@@ -774,7 +900,7 @@ def _split_for_field(text: str, limit: int = 1020) -> list[str]:
     return chunks
 
 
-def post_report(report: str):
+def post_report(report: str, bigfive: dict | None = None):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
     title_str  = f"{icon} {FOCUS_NAME} のフォーカス要約"
@@ -792,6 +918,11 @@ def post_report(report: str):
             sections.append((title, body))
 
     fields = []
+    # Big Five 較正値を冒頭フィールドに（LLM出力に依存せず確実に表示）
+    if bigfive:
+        bf_field = render_bigfive_for_embed(bigfive)
+        if bf_field:
+            fields.append(bf_field)
     for title, body in sections:
         icon_c = next((v for k, v in ICONS.items() if k in title), "📋")
         # 1024字超のセクションは切り捨てず、続きフィールドに分割して全文表示
@@ -858,9 +989,22 @@ def main():
     log_text = filter_logs(msgs, needles) if msgs else ""
     print(f"[focus] 対象生ログ: {len(log_text)}文字")
 
-    # 長期アーカイブ（summaries）から関連行を抽出
+    # Gemini クライアントは要約検索(keyword の意味検索 embedding)でも使うので先に作る
+    client_ai = genai.Client(api_key=GEMINI_API_KEY)
+
+    # keyword の Tier3: 検索語を embedding（RETRIEVAL_QUERY）。失敗時は None＝needle のみに自然降格
+    query_embedding = None
+    if FOCUS_TYPE == "keyword":
+        try:
+            query_embedding = embed_query(client_ai, FOCUS_TARGET)
+            print(f"[focus] keyword 意味検索ON: query embedding dim="
+                  f"{len(query_embedding) if query_embedding else 0}")
+        except Exception as e:
+            print(f"[focus] query embedding 失敗（needleのみで続行）: {e}")
+
+    # 長期アーカイブ（summaries）から関連行を抽出（keyword は needle+意味検索のハイブリッド）
     print(f"[focus] 過去{_lookback_days()}日の要約アーカイブを検索中...")
-    summary_text = fetch_relevant_summaries(summaries_col, needles)
+    summary_text = fetch_relevant_summaries(summaries_col, needles, query_embedding)
 
     if not log_text and not summary_text:
         print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
@@ -871,10 +1015,17 @@ def main():
     if member_context:
         print(f"[focus] 既知情報を読み込み: {len(member_context)}文字")
 
-    # レポート生成（既知情報 + 長期要約 + 直近生ログ）
+    # Big Five 連携（member専用：analyze_personality の TIPI-J 推定を較正基準として読む）
+    bigfive      = load_bigfive(users_col) if FOCUS_TYPE == "member" else None
+    bigfive_text = render_bigfive_for_prompt(bigfive) if bigfive else ""
+    if bigfive_text:
+        present = [BIGFIVE_FACTORS_JA[k] for k in BIGFIVE_FACTORS_JA
+                   if isinstance(bigfive.get(k), dict)]
+        print(f"[focus] Big Five 連携: {present}")
+
+    # レポート生成（較正基準 + 既知情報 + 長期要約 + 直近生ログ）
     print("[focus] レポート生成中...")
-    client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    report    = generate_report(client_ai, log_text, summary_text, member_context)
+    report = generate_report(client_ai, log_text, summary_text, member_context, bigfive_text)
     if not report:
         print("[focus] レポート生成失敗")
         return
@@ -892,8 +1043,8 @@ def main():
         time.sleep(3)
         save_memories_from_focus(client_ai, users_col, report)
 
-    # Discord投稿
-    post_report(report)
+    # Discord投稿（member は Big Five 較正値を冒頭フィールドに付与）
+    post_report(report, bigfive=bigfive)
     print("[focus] 完了！")
 
 

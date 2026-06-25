@@ -1,0 +1,40 @@
+name: summaries 埋め込みバックフィル（focus Tier3 意味検索）
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_run:
+        description: '1回の最大処理件数（既定 1000・再実行で続行可）'
+        required: false
+        default: '1000'
+        type: string
+      sleep:
+        description: '1件ごとのスリープ秒（無料枠レート保護・既定 0.5）'
+        required: false
+        default: '0.5'
+        type: string
+
+jobs:
+  embed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # 5h以内（6h連続稼働は避ける）
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements-batch.txt
+
+      - name: 既存 summaries に embedding を付与（再実行で続行可）
+        env:
+          EMBED_MAX_PER_RUN: ${{ github.event.inputs.max_per_run }}
+          EMBED_SLEEP:       ${{ github.event.inputs.sleep }}
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
+          MONGODB_URI:       ${{ secrets.MONGODB_URI }}
+        run: python batch/embed_summaries.py

@@ -40,6 +40,12 @@ def main():
         "created_at":    result.get("created_at", datetime.now(timezone.utc).isoformat()),
         "fetched_at":    result.get("fetched_at", ""),
     }
+    # focus Tier3: summarize.py が付けた embedding があれば保存（無ければフィールド自体作らない
+    # → embed_summaries.py のバックフィルが {embedding:{$exists:False}} で拾えるようにする）。
+    emb = result.get("embedding")
+    if emb:
+        new_record["embedding"] = emb
+        print(f"[mongodb] embedding 同梱: dim={len(emb)}")
     inserted = col.insert_one(new_record)
     total    = col.count_documents({})
     print(f"[mongodb] Inserted: {inserted.inserted_id} (total: {total} records)")
