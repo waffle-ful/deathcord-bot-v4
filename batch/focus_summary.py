@@ -437,7 +437,9 @@ def fetch_relevant_summaries(summaries_col, needles: list[str], query_embedding=
         proj["embedding"] = 1
 
     matched, scanned_total = [], 0
-    sem_cands, sem_with_emb = [], 0       # 意味検索候補 (sim, date, summary) と embedding付きdoc数
+    # emb_seen は embedding を持つ doc の【総数】(needle該当も含む)＝バックフィル進捗の真の指標。
+    # sem_cands は needle 非該当のみ（意味検索の救済対象）。両者を分けて数える。
+    sem_cands, emb_seen = [], 0
     for i in range(n_chunks):
         chunk_end   = now - timedelta(days=i * CHUNK_DAYS)
         chunk_start = now - timedelta(days=min((i + 1) * CHUNK_DAYS, lookback))
@@ -459,14 +461,14 @@ def fetch_relevant_summaries(summaries_col, needles: list[str], query_embedding=
             date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
             hits = [ln.strip() for ln in summ.split("\n")
                     if ln.strip() and any(n in ln.lower() for n in needles_l)]
+            emb = d.get("embedding") if query_embedding is not None else None
+            if emb:
+                emb_seen += 1
             if hits:
                 matched.append((date, f"[{date}]\n" + "\n".join(hits)))
-            elif query_embedding is not None:
+            elif emb:
                 # needle 非該当 doc のみ意味検索の候補に（needle 該当は①で精密に拾えている）
-                emb = d.get("embedding")
-                if emb:
-                    sem_with_emb += 1
-                    sem_cands.append((cosine(query_embedding, emb), date, summ))
+                sem_cands.append((cosine(query_embedding, emb), date, summ))
 
     # 意味検索: 閾値以上の上位 K doc を needle ブロックの【後】に積む（月バケツ内で needle 優先）
     sem_selected = 0
@@ -483,9 +485,10 @@ def fetch_relevant_summaries(summaries_col, needles: list[str], query_embedding=
         # 閾値調整のための実測ログ（推測で閾値を決めない・top10の sim と日付を必ず出す）
         top = sem_cands[:10]
         top_str = " ".join(f"{s:.2f}({dt})" for s, dt, _ in top) if top else "なし"
-        print(f"[focus][sem] embedding付きdoc={sem_with_emb}件 候補top10sim={top_str}")
+        print(f"[focus][sem] embedding付きdoc(全)={emb_seen}件 意味検索候補(needle非該当)={len(sem_cands)}件 "
+              f"候補top10sim={top_str}")
         print(f"[focus][sem] 閾値={KEYWORD_SEM_THRESHOLD} 採用={sem_selected}/{KEYWORD_SEM_TOPK} "
-              f"（embedding付きdoc=0なら未バックフィル／sim全部低なら重心がぼやけ過ぎ＝閾値下げ or 無効化検討）")
+              f"（embedding付きdoc(全)=0なら未バックフィル／sim全部低なら重心がぼやけ過ぎ＝閾値下げ or 無効化検討）")
 
     # 月ごと按分で数ヶ月を満遍なく代表させる（直近偏重の予算切りを回避）
     selected = _select_across_months(matched, MAX_SUMMARY_CHARS)

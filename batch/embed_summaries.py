@@ -44,12 +44,12 @@ def main():
     client = genai.Client(api_key=GEMINI_API_KEY)
     col    = MongoClient(MONGODB_URI)[DB_NAME][COLLECTION]
 
-    # embedding 未付与（missing or 空配列）かつ summary 有り。新しい順＝よく引かれる直近から先に埋める
-    # （途中で打ち切られても直近がカバーされるよう）。
-    query = {
-        "summary": {"$exists": True},
-        "$or": [{"embedding": {"$exists": False}}, {"embedding": {"$size": 0}}],
-    }
+    # embedding フィールドが【無い】doc のみ対象。新しい順＝よく引かれる直近から先に埋める。
+    # 重要: プレースホルダは下で embedding:[] を $set して「処理済み」印にする。$size:0 を条件に
+    # 入れると [] 印の doc が永遠に再ヒットし remaining が 0 に到達しない（再実行が終わらない）。
+    # → 「$exists:False のみ」にすれば、[]印=フィールド有り=恒久除外、一過性失敗(未マーク)=再試行、
+    #   の両立になる。書込側は vec があるときしか embedding を作らないので [] は skip 印専用。
+    query = {"summary": {"$exists": True}, "embedding": {"$exists": False}}
     total_missing = col.count_documents(query)
     print(f"[embed] embedding 未付与: {total_missing}件（うち最大 {MAX_PER_RUN}件を今回処理）")
 

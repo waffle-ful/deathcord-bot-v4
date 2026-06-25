@@ -16,6 +16,11 @@ cosine 比較することになり recall が【無言で】死ぬ(エラーに�
 """
 
 EMBED_MODEL     = "models/gemini-embedding-001"
+EMBED_DIM       = 3072   # gemini-embedding-001 のネイティブ次元（正規化済）。
+                         # 明示固定する理由: requirements-batch は google-genai を未ピン(>=)。将来の版で
+                         # 既定次元が変わると、版またぎで埋めた doc 同士の長さが食い違い cosine が無言で
+                         # 0.0 を返す（=embed_util を作った目的そのものの事故）。3072 はネイティブなので
+                         # 明示しても今日の挙動は不変。ここを変えると既存埋め込みは全て要・再バックフィル。
 EMBED_DOC_CHARS = 1800   # 入力上限(~2048トークン)に収める保守的キャップ。auto_truncate も併用。
 
 
@@ -25,7 +30,9 @@ def _embed(client, text, task_type):
     resp = client.models.embed_content(
         model=EMBED_MODEL,
         contents=(text or "")[:EMBED_DOC_CHARS],
-        config=types.EmbedContentConfig(task_type=task_type, auto_truncate=True),
+        config=types.EmbedContentConfig(
+            task_type=task_type, auto_truncate=True, output_dimensionality=EMBED_DIM,
+        ),
     )
     if getattr(resp, "embeddings", None):
         return list(resp.embeddings[0].values)
