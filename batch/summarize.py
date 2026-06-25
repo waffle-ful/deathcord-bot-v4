@@ -16,9 +16,11 @@ from datetime import datetime, timezone
 from google import genai
 from google.genai import types
 
+from embed_util import embed_document   # focus Tier3: summaries 意味検索用 embedding 規約
+
 GEMINI_API_KEY         = os.environ["GEMINI_API_KEY"]
 MODEL_SUMMARY          = "models/gemma-4-31b-it"        # 要約生成用（TPM無制限）
-MODEL_SUMMARY_FALLBACK = "models/gemma-3-27b-it"            # フォールバック
+MODEL_SUMMARY_FALLBACK = "models/gemma-4-26b-a4b-it"       # フォールバック（同世代・別インスタンス。旧 gemma-3-27b-it は現APIで404）
 INPUT_PATH             = "/tmp/logs.json"
 OUTPUT_PATH            = "/tmp/summary_result.json"
 
@@ -163,6 +165,19 @@ def main():
         "fetched_at":    fetched_at,
         "nickname_map":  nickname_map,
     }
+
+    # focus Tier3: summary doc を embedding して result に同梱（update_mongodb が保存）。
+    # 失敗しても要約本体の書き出しは止めない（embedding は補助なので欠落許容＝後でバックフィル可）。
+    try:
+        vec = embed_document(client, summary)
+        if vec:
+            result["embedding"] = vec
+            print(f"[summarize] embedding 付与: dim={len(vec)}")
+        else:
+            print("[summarize] embedding 空（スキップ・後でバックフィル）")
+    except Exception as e:
+        print(f"[summarize] embedding 失敗（スキップ・後でバックフィル）: {e}")
+
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 

@@ -21,6 +21,8 @@ from pymongo import MongoClient
 from google import genai
 from google.genai import types
 
+from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
+
 FOCUS_TYPE    = os.environ["FOCUS_TYPE"]    # "member" or "keyword"
 FOCUS_TARGET  = os.environ["FOCUS_TARGET"]  # user_id or keyword
 FOCUS_NAME    = os.environ["FOCUS_NAME"]    # 表示名
@@ -48,6 +50,11 @@ SUMMARY_LOOKBACK_DAYS_KEYWORD = 730    # keyword: トピックは深い歴史を
 MAX_LOG_CHARS         = 10000  # 生ログ(直近7日)は「最近の断面」の補助なので絞る（長期偏重を優先）
 MAX_SUMMARY_CHARS     = 24000  # 長期アーカイブが主役。月ごと按分でこの予算を1〜2年に配分する
 MAX_MEMBER_CONTEXT_CHARS = 4000  # 既知情報(profile/claims/memories)をプロンプトに入れる最大文字数(Tier2)
+# Tier3 意味検索（keyword専用）。doc重心 vs 短い検索語 の cosine は圧縮・密集しがちなので
+# 閾値は低めに置き、毎回 top-N の sim を必ずログする＝実測で調整する（推測で固定しない）。
+KEYWORD_SEM_THRESHOLD = float(os.environ.get("KEYWORD_SEM_THRESHOLD", "0.45"))
+KEYWORD_SEM_TOPK      = int(os.environ.get("KEYWORD_SEM_TOPK", "20"))   # 意味検索で追加採用する最大doc数
+EMBED_BLOCK_CHARS     = 1000   # 意味検索で当たった doc から載せる本文の上限（needle行抽出と違い全文系なので絞る）
 
 # 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
 # 構築失敗時は None（=SDKデフォルト）にフォールバックしてモジュール読込を壊さない。
@@ -399,12 +406,15 @@ def _select_across_months(matched: list, budget: int) -> list:
     return selected
 
 
-def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
-    """summaries アーカイブ（永久保持）から、needle を含む行だけを
-    新しい順に MAX_SUMMARY_CHARS まで抜き出してテキスト化する。
+def fetch_relevant_summaries(summaries_col, needles: list[str], query_embedding=None) -> str:
+    """summaries アーカイブ（永久保持）から関連ブロックを抽出してテキスト化する。
 
-    要約は全員分の内容を含むため、フォーカス対象を含む行のみに絞って
-    ノイズとトークン消費を抑える。retro 要約も歴史的文脈として含める。
+    ハイブリッド recall（keyword の Tier3）:
+      ① needle（文字列一致）= 確実な行レベル抽出。recall の【床】。member/keyword 共通。
+      ② 意味検索（query_embedding 指定時=keyword専用）= needle に掛からないが意味的に近い
+         doc を doc重心 embedding の cosine で救済。①で当たった doc は除外（重複回避）。
+    両者を月按分（_select_across_months）に合流させ、時系列の分散を保ったまま予算配分する。
+    needle ブロックを先に matched へ積む＝月バケツ内で精密な needle が曖昧な意味検索より優先される。
     """
     needles_l = [n.lower() for n in needles if n]
     if not needles_l:
@@ -420,7 +430,14 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
     n_chunks   = (lookback + CHUNK_DAYS - 1) // CHUNK_DAYS
     window_start = (now - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
+    # embedding は 3072次元で重い。意味検索する keyword モードのときだけ射影する
+    # （member は意味検索しないので全 doc のベクトル転送は純粋な無駄）。
+    proj = {"summary": 1, "created_at": 1, "retro_date": 1}
+    if query_embedding is not None:
+        proj["embedding"] = 1
+
     matched, scanned_total = [], 0
+    sem_cands, sem_with_emb = [], 0       # 意味検索候補 (sim, date, summary) と embedding付きdoc数
     for i in range(n_chunks):
         chunk_end   = now - timedelta(days=i * CHUNK_DAYS)
         chunk_start = now - timedelta(days=min((i + 1) * CHUNK_DAYS, lookback))
@@ -428,7 +445,7 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
             docs = list(summaries_col.find(
                 {"summary": {"$exists": True},
                  "created_at": {"$gte": chunk_start.isoformat(), "$lt": chunk_end.isoformat()}},
-                {"summary": 1, "created_at": 1, "retro_date": 1},
+                proj,
                 sort=[("created_at", -1)],
             ).limit(PER_CHUNK))
         except Exception as e:
@@ -442,9 +459,33 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
             date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
             hits = [ln.strip() for ln in summ.split("\n")
                     if ln.strip() and any(n in ln.lower() for n in needles_l)]
-            if not hits:
-                continue
-            matched.append((date, f"[{date}]\n" + "\n".join(hits)))
+            if hits:
+                matched.append((date, f"[{date}]\n" + "\n".join(hits)))
+            elif query_embedding is not None:
+                # needle 非該当 doc のみ意味検索の候補に（needle 該当は①で精密に拾えている）
+                emb = d.get("embedding")
+                if emb:
+                    sem_with_emb += 1
+                    sem_cands.append((cosine(query_embedding, emb), date, summ))
+
+    # 意味検索: 閾値以上の上位 K doc を needle ブロックの【後】に積む（月バケツ内で needle 優先）
+    sem_selected = 0
+    if query_embedding is not None:
+        sem_cands.sort(key=lambda x: x[0], reverse=True)
+        # 床を割らない: 閾値で誰も通らなくても needle 結果はそのまま返る
+        for sim, date, summ in sem_cands:
+            if sim < KEYWORD_SEM_THRESHOLD or sem_selected >= KEYWORD_SEM_TOPK:
+                break
+            block = (f"[{date}]\n（意味検索 sim={sim:.2f}・キーワード非含有だが関連）\n"
+                     f"{summ.strip()[:EMBED_BLOCK_CHARS]}")
+            matched.append((date, block))
+            sem_selected += 1
+        # 閾値調整のための実測ログ（推測で閾値を決めない・top10の sim と日付を必ず出す）
+        top = sem_cands[:10]
+        top_str = " ".join(f"{s:.2f}({dt})" for s, dt, _ in top) if top else "なし"
+        print(f"[focus][sem] embedding付きdoc={sem_with_emb}件 候補top10sim={top_str}")
+        print(f"[focus][sem] 閾値={KEYWORD_SEM_THRESHOLD} 採用={sem_selected}/{KEYWORD_SEM_TOPK} "
+              f"（embedding付きdoc=0なら未バックフィル／sim全部低なら重心がぼやけ過ぎ＝閾値下げ or 無効化検討）")
 
     # 月ごと按分で数ヶ月を満遍なく代表させる（直近偏重の予算切りを回避）
     selected = _select_across_months(matched, MAX_SUMMARY_CHARS)
@@ -456,7 +497,7 @@ def fetch_relevant_summaries(summaries_col, needles: list[str]) -> str:
         md = [d for d, _ in matched]
         sd = [d for d, _ in selected]
         n_months = len({d[:7] for d in sd})
-        print(f"[focus][debug] needleマッチ={len(matched)}件 期間={min(md)}〜{max(md)} "
+        print(f"[focus][debug] 全マッチ(needle+意味)={len(matched)}件 期間={min(md)}〜{max(md)} "
               f"／按分採用={len(selected)}件 採用期間={min(sd)}〜{max(sd)} ({n_months}ヶ月分)")
     try:
         oldest = summaries_col.find_one(
@@ -945,9 +986,22 @@ def main():
     log_text = filter_logs(msgs, needles) if msgs else ""
     print(f"[focus] 対象生ログ: {len(log_text)}文字")
 
-    # 長期アーカイブ（summaries）から関連行を抽出
+    # Gemini クライアントは要約検索(keyword の意味検索 embedding)でも使うので先に作る
+    client_ai = genai.Client(api_key=GEMINI_API_KEY)
+
+    # keyword の Tier3: 検索語を embedding（RETRIEVAL_QUERY）。失敗時は None＝needle のみに自然降格
+    query_embedding = None
+    if FOCUS_TYPE == "keyword":
+        try:
+            query_embedding = embed_query(client_ai, FOCUS_TARGET)
+            print(f"[focus] keyword 意味検索ON: query embedding dim="
+                  f"{len(query_embedding) if query_embedding else 0}")
+        except Exception as e:
+            print(f"[focus] query embedding 失敗（needleのみで続行）: {e}")
+
+    # 長期アーカイブ（summaries）から関連行を抽出（keyword は needle+意味検索のハイブリッド）
     print(f"[focus] 過去{_lookback_days()}日の要約アーカイブを検索中...")
-    summary_text = fetch_relevant_summaries(summaries_col, needles)
+    summary_text = fetch_relevant_summaries(summaries_col, needles, query_embedding)
 
     if not log_text and not summary_text:
         print(f"[focus] 「{FOCUS_NAME}」に関する情報が見つかりませんでした。")
@@ -968,8 +1022,7 @@ def main():
 
     # レポート生成（較正基準 + 既知情報 + 長期要約 + 直近生ログ）
     print("[focus] レポート生成中...")
-    client_ai = genai.Client(api_key=GEMINI_API_KEY)
-    report    = generate_report(client_ai, log_text, summary_text, member_context, bigfive_text)
+    report = generate_report(client_ai, log_text, summary_text, member_context, bigfive_text)
     if not report:
         print("[focus] レポート生成失敗")
         return
