@@ -21,7 +21,10 @@ EMBED_DIM       = 3072   # gemini-embedding-001 のネイティブ次元（正�
                          # 既定次元が変わると、版またぎで埋めた doc 同士の長さが食い違い cosine が無言で
                          # 0.0 を返す（=embed_util を作った目的そのものの事故）。3072 はネイティブなので
                          # 明示しても今日の挙動は不変。ここを変えると既存埋め込みは全て要・再バックフィル。
-EMBED_DOC_CHARS = 1800   # 入力上限(~2048トークン)に収める保守的キャップ。auto_truncate も併用。
+EMBED_DOC_CHARS = 1500   # 入力をモデル上限(~2048トークン)の十分内側に収める保守的キャップ。
+                         # 注意: auto_truncate は使えない（Developer API では非対応＝Enterprise専用パラメータ）。
+                         # 安全網が無いので超過すると API エラー＝その doc が無言でスキップされる穴になる。
+                         # 日本語は最悪 1字≒1トークンなので 1500字なら 2048 に余裕を持って収まる。
 
 
 def _embed(client, text, task_type):
@@ -31,7 +34,7 @@ def _embed(client, text, task_type):
         model=EMBED_MODEL,
         contents=(text or "")[:EMBED_DOC_CHARS],
         config=types.EmbedContentConfig(
-            task_type=task_type, auto_truncate=True, output_dimensionality=EMBED_DIM,
+            task_type=task_type, output_dimensionality=EMBED_DIM,
         ),
     )
     if getattr(resp, "embeddings", None):
