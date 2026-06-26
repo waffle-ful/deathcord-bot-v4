@@ -11,6 +11,7 @@ import hmac
 import time
 import math
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 # --- 新SDK (Context Caching対応) ---
 from google import genai
 from google.genai import types
@@ -1039,9 +1040,14 @@ async def get_butler_history(user_id: str) -> list[dict]:
     doc = await users_col.find_one({"_id": user_id})
     return doc.get("butler_history", []) if doc else []
 
-async def save_butler_history(user_id: str, role: str, content: str):
+async def save_butler_history(user_id: str, role: str, content: str, persona: str | None = None):
+    """会話履歴を保存。assistant発言にはその時の実効人格(persona)を必ずタグ付けする
+    （人格を切替えても前人格の口調が履歴経由で混線するのを防ぐため・format_historyで使用）。"""
     history = await get_butler_history(user_id)
-    history.append({"role": role, "content": content})
+    entry = {"role": role, "content": content}
+    if persona:
+        entry["persona"] = persona
+    history.append(entry)
     if len(history) > BUTLER_HISTORY_MAX * 2:
         history = history[-(BUTLER_HISTORY_MAX * 2):]
     await users_col.update_one(
@@ -1398,16 +1404,24 @@ def _is_emotionally_significant(text: str) -> bool:
     return any(m in text for m in markers)
 
 
-def format_history(history: list[dict]) -> str:
-    """会話履歴を整形。感情的に重要な発言には★マークを付与して
-    AIが優先的に参照できるようにする。"""
+def format_history(history: list[dict], current_persona: str | None = None) -> str:
+    """会話履歴を整形。感情的に重要な発言には★マークを付与してAIが優先的に参照できるようにする。
+    人格混線対策: 現在の人格(current_persona)と異なる人格で生成された過去のメイド発言は、
+    口調を漏らさないよう中立プレースホルダに置換する（主人側の発言は全て保持）。"""
     if not history:
         return "（初めてのご挨拶）"
     lines = []
     for h in history:
-        prefix = "主人" if h["role"] == "user" else "メイド"
-        mark   = "★" if (h["role"] == "user" and _is_emotionally_significant(h["content"])) else ""
-        lines.append(f"{mark}{prefix}: {h['content']}")
+        if h["role"] == "user":
+            mark = "★" if _is_emotionally_significant(h["content"]) else ""
+            lines.append(f"{mark}主人: {h['content']}")
+        else:
+            p = h.get("persona")
+            if current_persona and p and p != current_persona:
+                # 別人格の発言＝口調の手本にさせない（内容はmemories/profileに残るので文脈は失われない）
+                lines.append("メイド: （別の人格で応答）")
+            else:
+                lines.append(f"メイド: {h['content']}")
     return "\n".join(lines)
 
 
@@ -1662,7 +1676,7 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     history = await get_butler_history(uid)
     base_prompt = personality["booster_prompt"].format(
         name=display_name,
-        history=format_history(history),
+        history=format_history(history, personality_key),
         content=content,
     )
     # profileはブースター由来の詳細情報。なければsimple_profileで補完
@@ -1805,10 +1819,12 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         "「正確な総括は /report（特定の日は /retroreport）をご利用ください」と案内せよ。"
         "ただし上に【関連する過去の記録】が提示されていれば、それは参照して具体的に答えてよい"
         "（提示が無い事柄を在るように作るのは禁止）。\n"
-        "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。"
+        "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。\n"
+        "- 【口調の固定】これまでの会話に別の口調のメイド発言が混ざっていても、それに引きずられるな。"
+        "今のあなたの人格の口調だけで話せ。"
     )
     prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt + "\n\n" + honesty
-    return prompt, personality
+    return prompt, personality, personality_key
 
 
 async def _maid_respond_inner(message: discord.Message, is_booster: bool = False, extra_context: str = ""):
@@ -1837,7 +1853,7 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         print(f"[WARN] channel_context取得失敗: {ce}")
 
     try:
-        prompt, personality = await _build_prompt(uid, message.author.display_name, raw_content, channel_context, extra_context)
+        prompt, personality, personality_key = await _build_prompt(uid, message.author.display_name, raw_content, channel_context, extra_context)
     except Exception as e:
         print(f"[ERROR] _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         await message.reply("（メイドは今、混乱しております…）")
@@ -1857,7 +1873,7 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
 
     if "（" not in ai_text:
         await save_butler_history(uid, "user", raw_content[:200])
-        await save_butler_history(uid, "assistant", ai_text)
+        await save_butler_history(uid, "assistant", ai_text, persona=personality_key)
         await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
         asyncio.create_task(extract_and_save_profile(
             uid, message.author.display_name, raw_content, ai_text
@@ -1873,7 +1889,7 @@ async def maid_respond_cmd(interaction: discord.Interaction, content: str):
     raw_content = content.strip() or "こんにちは"
 
     try:
-        prompt, personality = await _build_prompt(uid, interaction.user.display_name, raw_content)
+        prompt, personality, personality_key = await _build_prompt(uid, interaction.user.display_name, raw_content)
     except Exception as e:
         print(f"[ERROR] maid_respond_cmd _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         await interaction.followup.send("（メイドは今、混乱しております…）", ephemeral=True)
@@ -1889,7 +1905,7 @@ async def maid_respond_cmd(interaction: discord.Interaction, content: str):
 
     if "（" not in ai_text:
         await save_butler_history(uid, "user", raw_content[:200])
-        await save_butler_history(uid, "assistant", ai_text)
+        await save_butler_history(uid, "assistant", ai_text, persona=personality_key)
         await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
         asyncio.create_task(extract_and_save_profile(
             uid, interaction.user.display_name, raw_content, ai_text
@@ -2241,9 +2257,13 @@ async def on_message(message: discord.Message):
                 "parent_channel_id": str(message.channel.parent_id) if is_thread else "",
                 "created_at":        datetime.datetime.now(datetime.timezone.utc),
             })
+        except DuplicateKeyError:
+            # 同一メッセージの再配信（Gateway resume / デプロイ時の一時的な2インスタンス共存）。
+            # _id=message.id が既存＝処理済みなので、ここで打ち切って二重応答・二重XPを防ぐ。
+            return
         except Exception as _log_e:
-            if "duplicate" not in str(_log_e).lower():
-                print(f"[WARN] messages log failed: {_log_e}")
+            # ログ失敗（重複以外）では返信を止めない＝そのまま処理続行
+            print(f"[WARN] messages log failed: {_log_e}")
 
         uid        = str(message.author.id)
         now        = datetime.datetime.now(datetime.timezone.utc)
@@ -2704,6 +2724,9 @@ async def set_title_cmd(interaction: discord.Interaction, title: str):
 @client.tree.command(name="maid", description="メイドに話しかける（メンションでも会話できます）")
 @app_commands.describe(message="メイドに伝えたいこと")
 async def maid_cmd(interaction: discord.Interaction, message: str):
+    # /maid 二重応答の切り分け用ログ: 同一idが2回=再配信/2インスタンス、別idが2回=二重送信、
+    # ログ1回で2通見える=defer+followupの表示問題。次の発生時にこのログで原因を確定する。
+    print(f"[maid_cmd] interaction.id={interaction.id} user={interaction.user.id}")
     await interaction.response.defer()
     await maid_respond_cmd(interaction, message)
 
