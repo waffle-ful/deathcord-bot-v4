@@ -670,24 +670,34 @@ async def _embed_query_for_summaries(text: str) -> list[float] | None:
 # 過去日報の採用閾値。doc重心 vs 短いクエリの cosine は圧縮・密集して低めに出る（focus Tier3 と同性質）。
 # batch/focus_summary.py の KEYWORD_SEM_THRESHOLD=0.45 と揃える。ログの best= を見て env で調整可。
 SUMMARY_SIM_THRESHOLD = float(os.environ.get("SUMMARY_SIM_THRESHOLD", "0.45"))
-# 1回の検索で読む summaries の上限（現状 ~900 件。将来大幅に増えたらキャッシュ/索引へ移行）。
+# 1回の検索で読む summaries の上限（現状 ~970 件。将来大幅に増えたらキャッシュ/索引へ移行）。
 SUMMARY_SCAN_LIMIT    = 3000
 
+# 過去日報検索の発火トリガー。memories(個人記憶)用とは別系統にし、サーバーの歴史・過去メンバー
+# 想起に寄せて拡張（dense embedding は固有名詞に弱いので、人の出入り系の語で確実に発火させる）。
+SUMMARY_TRIGGER_WORDS = MEMORY_TRIGGER_WORDS + [
+    # 人の出入り・過去メンバー
+    "メンバー", "常連", "古参", "新人", "やめた", "辞めた", "抜けた", "卒業", "引退",
+    "いなくなった", "来なくなった", "入った", "加入", "いたよね", "いた人",
+    # 起源・歴史
+    "元々", "もともと", "最初", "きっかけ", "結成", "始まり", "過去", "歴史", "当初",
+]
 
-async def search_summaries(query: str, top_k: int = 2) -> list[dict]:
-    """過去日報(サーバー全体)の意味検索。「去年の夏なにあった」等のピンポイント想起用。
 
-    ① ゲート: トリガー語を含み、かつ8文字以上のときだけ実行。
-       ※トリガー語には「最近/あれ/確か/夏」等の頻出語も含むので、想起以外でも発火しうる。
-         発火1回 = embed1回＋summaries全件(~900)読込＋cosine。低トラフィックなホームギルド前提のコスト感。
-         （ギルドが大きくなったら SUMMARY_SCAN_LIMIT 超でキャッシュ/索引へ移行すること。）
+async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = None) -> list[dict]:
+    """過去日報(サーバー全体)の意味検索＋名前の語彙一致ハイブリッド。「去年いた○○覚えてる?」等の想起用。
+
+    ① ゲート: SUMMARY_TRIGGER_WORDS を含み、かつ8文字以上のときだけ実行。
        ※「総括して」系（集計）はトリガー語に当たらず発火しない＝/report 案件と棲み分け（意図的）。
-    ② embedding 付き summary を全件 in-Python cosine（retro日報も含める＝歴史想起が目的）。
-    ③ 閾値以上の上位 top_k を返す。該当なしは [] （memories と違い最近フォールバックはしない）。
+       ※発火1回 = embed1回＋summaries全件(~970)読込＋cosine。低トラフィックなホームギルド前提のコスト感。
+    ② 意味検索: embedding 付き summary を全件 in-Python cosine（retro日報も含める＝歴史想起が目的）。
+    ③ 名前ハイブリッド(needle): dense embedding は固有名詞一致が弱い。nick_map の名前/別名が
+       クエリに出ていたら、その名前を含む summary を cosine 順で別途拾う（閾値未満でも採用）＝名前recallの主役。
+    ④ needle を優先しつつ意味検索結果と統合・重複排除して上位 top_k を返す。該当なしは []。
     """
     if len(query) < 8:
         return []
-    if not any(w in query for w in MEMORY_TRIGGER_WORDS):
+    if not any(w in query for w in SUMMARY_TRIGGER_WORDS):
         return []
     qvec = await _embed_query_for_summaries(query)
     if not qvec:
@@ -701,6 +711,15 @@ async def search_summaries(query: str, top_k: int = 2) -> list[dict]:
     except Exception as e:
         print(f"[summary] find失敗: {e}")
         return []
+
+    # クエリに登場する既知の名前を収集（別名↔正式名の両形で summary 側を引けるよう両方入れる）。
+    present_names = set()
+    for alias, canon in (nick_map or {}).items():
+        a, c = str(alias), str(canon)
+        if (len(a) >= 2 and a in query) or (len(c) >= 2 and c in query):
+            present_names.update([a, c])
+    present_names = {n for n in present_names if len(n) >= 2}
+
     scored = []
     for d in docs:
         emb = d.get("embedding")
@@ -711,10 +730,29 @@ async def search_summaries(query: str, top_k: int = 2) -> list[dict]:
         return []
     scored.sort(key=lambda t: t[0], reverse=True)
     best = scored[0][0]
-    top  = [d for sc, d in scored if sc >= SUMMARY_SIM_THRESHOLD][:top_k]
-    print(f"[summary] cosine best={best:.3f} thr={SUMMARY_SIM_THRESHOLD:.2f} ({len(top)}/{len(scored)}件)")
+
+    # ③ needle: 名前を含む doc を cosine 順で（閾値未満でも採用）。
+    needle = ([d for _, d in scored if any(n in d.get("summary", "") for n in present_names)][:top_k]
+              if present_names else [])
+    # ② semantic: 閾値以上
+    semantic = [d for sc, d in scored if sc >= SUMMARY_SIM_THRESHOLD]
+
+    # ④ needle 優先で統合・重複排除（_id でユニーク化）
+    merged, seen = [], set()
+    for d in needle + semantic:
+        k = d.get("_id")
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(d)
+        if len(merged) >= top_k:
+            break
+
+    print(f"[summary] best={best:.3f} thr={SUMMARY_SIM_THRESHOLD:.2f} "
+          f"needle={len(needle)} sem≥thr={len(semantic)} → {len(merged)}件 "
+          f"names={list(present_names) or 'なし'}")
     out = []
-    for d in top:
+    for d in merged:
         date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
         out.append({"date": date, "summary": d.get("summary", "")})
     return out
@@ -1661,12 +1699,12 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
 
     # 過去日報の意味検索（発火時のみ）: 「去年/あの時」等の想起クエリに、創作でなく実データで答えるため。
     try:
-        past_records = await search_summaries(content, top_k=2)
+        past_records = await search_summaries(content, top_k=3, nick_map=nick_map)
         if past_records:
-            # build_smart_summary で重要セクション（直近の話題・注目の発言等）を先頭に寄せてから抜粋。
-            # 生の先頭は「## 全体の雰囲気」固定で内容が薄いため、並べ替えてから切る。
+            # build_smart_summary で重要セクション（直近の話題・注目の発言・メンバー関係等）を先頭に
+            # 寄せてから抜粋。生の先頭は「## 全体の雰囲気」固定で内容が薄いため、並べ替えてから切る。
             rec_lines = "\n".join(
-                f"・{r['date']}頃: {' '.join(build_smart_summary(r['summary']).split())[:400]}"
+                f"・{r['date']}頃: {' '.join(build_smart_summary(r['summary']).split())[:600]}"
                 for r in past_records
             )
             parts.append(
