@@ -69,6 +69,11 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_BOOSTER        = "models/gemini-3.1-flash-lite"          # メイン (会話用・高速)
 MODEL_FALLBACK       = "models/gemma-4-26b-a4b-it"            # フォールバック (Gemma 4 26B) ※Render.comでlocation errorが出たらgemini-3.1-flash-liteへ戻すこと
 MODEL_GENERAL_FB     = "models/gemini-3.1-flash-lite"          # バックグラウンド処理用
+# 裏処理（profile/claims抽出等・速度不問）は gemma-4 に寄せる。理由: flash-lite は無料枠の容量429
+# （深夜＝欧米ビジネス時間帯に共有プールが枯れる）に弱く、裏処理まで巻き込まれる。gemma-4 は TPM が
+# 実質潤沢で容量に余裕があり、品質も同等以上（遅さは撃ちっぱなしの裏処理では無関係）。
+# 注意: gemma-4 は thinking 予算を出力トークンから食うため、必ず大きめの max_output_tokens を渡すこと。
+MODEL_BACKGROUND     = "models/gemma-4-26b-a4b-it"            # 裏処理用（gemma-4・速度不問・容量に強い）
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
 # --- ランク・ロール設定 ---
@@ -903,9 +908,9 @@ JSON形式で返せ。含まれない場合は null を返せ。
 
         raw = await asyncio.to_thread(
             gemini_client.models.generate_content,
-            model=MODEL_BOOSTER,
+            model=MODEL_BACKGROUND,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=50),
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=3000),  # gemma-4 thinking予算込み
         )
         text = raw.text.strip().replace("```json", "").replace("```", "").strip()
         if text and text != "null":
@@ -1102,9 +1107,9 @@ async def extract_and_save_profile(uid: str, display_name: str, user_msg: str, b
         )
         raw = await asyncio.to_thread(
             gemini_client.models.generate_content,
-            model=MODEL_BOOSTER,
+            model=MODEL_BACKGROUND,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=300),
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=3000),  # gemma-4 thinking予算込み
         )
         text = raw.text.strip().replace("```json", "").replace("```", "").strip()
         extracted = json.loads(text)
@@ -1604,7 +1609,7 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
 【{name}の発言ログ】
 {utterances}"""
 
-        tone_raw  = await _call_model(MODEL_GENERAL_FB, tone_prompt)
+        tone_raw  = await _call_model(MODEL_BACKGROUND, tone_prompt)
         tone_data = {}
         if tone_raw:
             try:
@@ -1633,7 +1638,7 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
 【要約ログ】
 {summaries_text[:3000]}"""
 
-        ctx_raw  = await _call_model(MODEL_GENERAL_FB, ctx_prompt)
+        ctx_raw  = await _call_model(MODEL_BACKGROUND, ctx_prompt)
         ctx_data = {}
         if ctx_raw:
             try:
