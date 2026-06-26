@@ -610,11 +610,16 @@ def load_bigfive(users_col) -> dict | None:
         {"profile.bigfive": 1, "personality_optout": 1},
     ) or {}
     if doc.get("personality_optout") is True:
+        print("[focus] Big Five: 対象が personality_optout=True のため非表示")
         return None
     bf = (doc.get("profile") or {}).get("bigfive")
-    return bf if isinstance(bf, dict) and any(
-        isinstance(bf.get(k), dict) for k in BIGFIVE_FACTORS_JA
-    ) else None
+    if isinstance(bf, dict) and any(isinstance(bf.get(k), dict) for k in BIGFIVE_FACTORS_JA):
+        return bf
+    # 無音だと「バグか未生成か」が切り分けられないので理由を出す（analyze_personality が
+    # profile.bigfive を書く唯一の所有者。focus が profile を作っても bigfive は埋まらない）。
+    print("[focus] Big Five: profile.bigfive 未生成（analyze_personality がこのユーザー未分析）。"
+          "daily_tasks.yml を実行すれば次回 /focus から表示される")
+    return None
 
 
 def render_bigfive_for_prompt(bigfive: dict) -> str:
