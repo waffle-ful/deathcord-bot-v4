@@ -639,6 +639,87 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     return memories[:top_k]  # 関連記憶なし → 最近の記憶
 
 
+async def _embed_query_for_summaries(text: str) -> list[float] | None:
+    """過去日報(summaries)意味検索用のクエリ埋め込み。
+
+    ※規約は batch/embed_util.py（summaries embedding の唯一の真実）に一致させる:
+      model=gemini-embedding-001 / task_type=RETRIEVAL_QUERY / output_dimensionality=3072。
+      これがズレると summaries の RETRIEVAL_DOCUMENT 埋め込みと別空間になり cosine が
+      無言で劣化する。memories 用の _get_embedding（task_type 無し・既定次元）とは別系統
+      なので【流用してはいけない】。embed は generateContent と別クォータなので _rate_record しない。
+    """
+    try:
+        resp = await asyncio.to_thread(
+            gemini_client.models.embed_content,
+            model="models/gemini-embedding-001",
+            contents=(text or "")[:1500],
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=3072,
+            ),
+        )
+        if getattr(resp, "embeddings", None):
+            return list(resp.embeddings[0].values)
+        if getattr(resp, "embedding", None):       # 旧形状フォールバック
+            return list(resp.embedding.values)
+    except Exception as e:
+        print(f"[WARN] summary query embedding: {e}")
+    return None
+
+
+# 過去日報の採用閾値。doc重心 vs 短いクエリの cosine は圧縮・密集して低めに出る（focus Tier3 と同性質）。
+# batch/focus_summary.py の KEYWORD_SEM_THRESHOLD=0.45 と揃える。ログの best= を見て env で調整可。
+SUMMARY_SIM_THRESHOLD = float(os.environ.get("SUMMARY_SIM_THRESHOLD", "0.45"))
+# 1回の検索で読む summaries の上限（現状 ~900 件。将来大幅に増えたらキャッシュ/索引へ移行）。
+SUMMARY_SCAN_LIMIT    = 3000
+
+
+async def search_summaries(query: str, top_k: int = 2) -> list[dict]:
+    """過去日報(サーバー全体)の意味検索。「去年の夏なにあった」等のピンポイント想起用。
+
+    ① ゲート: トリガー語を含み、かつ8文字以上のときだけ実行。
+       ※トリガー語には「最近/あれ/確か/夏」等の頻出語も含むので、想起以外でも発火しうる。
+         発火1回 = embed1回＋summaries全件(~900)読込＋cosine。低トラフィックなホームギルド前提のコスト感。
+         （ギルドが大きくなったら SUMMARY_SCAN_LIMIT 超でキャッシュ/索引へ移行すること。）
+       ※「総括して」系（集計）はトリガー語に当たらず発火しない＝/report 案件と棲み分け（意図的）。
+    ② embedding 付き summary を全件 in-Python cosine（retro日報も含める＝歴史想起が目的）。
+    ③ 閾値以上の上位 top_k を返す。該当なしは [] （memories と違い最近フォールバックはしない）。
+    """
+    if len(query) < 8:
+        return []
+    if not any(w in query for w in MEMORY_TRIGGER_WORDS):
+        return []
+    qvec = await _embed_query_for_summaries(query)
+    if not qvec:
+        return []
+    try:
+        cursor = summaries_col.find(
+            {"embedding": {"$exists": True, "$ne": []}},
+            {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1},
+        )
+        docs = await cursor.to_list(length=SUMMARY_SCAN_LIMIT)
+    except Exception as e:
+        print(f"[summary] find失敗: {e}")
+        return []
+    scored = []
+    for d in docs:
+        emb = d.get("embedding")
+        if not emb or len(emb) != len(qvec):   # 次元不一致は安全にスキップ
+            continue
+        scored.append((_cosine(qvec, emb), d))
+    if not scored:
+        return []
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best = scored[0][0]
+    top  = [d for sc, d in scored if sc >= SUMMARY_SIM_THRESHOLD][:top_k]
+    print(f"[summary] cosine best={best:.3f} thr={SUMMARY_SIM_THRESHOLD:.2f} ({len(top)}/{len(scored)}件)")
+    out = []
+    for d in top:
+        date = d.get("retro_date") or str(d.get("created_at", ""))[:10]
+        out.append({"date": date, "summary": d.get("summary", "")})
+    return out
+
+
 async def _extract_claims_and_memories(uid: str, display_name: str, user_msg: str):
     """会話からclaims・memoriesを抽出して保存（バックグラウンド）"""
     try:
@@ -1018,6 +1099,40 @@ def _bigfive_brief(bigfive: dict) -> str | None:
     return "、".join(parts) if parts else None
 
 
+# Big Five の高/低バンド → メイドの「接し方」への変換（会話用）。
+# 口調・芸風は人格プロンプトが優先。ここは“配慮の方向性”だけを与える（論破メイド等の芸風は崩さない）。
+_BF_DIRECTIVE_HIGH = {
+    "neuroticism":       "情緒が揺れやすい相手。詰めずに安心感を優先し、断定や追い込みは避けて受け止める。",
+    "extraversion":      "社交的な相手。テンポよく話を広げ、こちらからも話題を振ってよい。",
+    "openness":          "好奇心が強い相手。抽象的・新しい話題や踏み込んだ問いも歓迎されやすい。",
+    "conscientiousness": "きっちりした相手。具体的で整理された・筋道立てた返答を好む。",
+    "agreeableness":     "思いやり重視の相手。温かく受け止め、角の立つ言い方は避ける。",
+}
+_BF_DIRECTIVE_LOW = {
+    "neuroticism":       "落ち着いた相手。率直な指摘や少し踏み込んだ話も受け止められる。",
+    "extraversion":      "物静かな相手。質問攻めにせず、相手のペースを尊重して静かに寄り添う。",
+    "openness":          "現実志向の相手。奇抜さより具体的・実用的な話を。",
+    "conscientiousness": "おおらかな相手。細かい段取りより要点を軽快に。",
+    "agreeableness":     "是々非々の相手。過度なお世辞・同調は避け、率直さと論理を重んじる。",
+}
+
+
+def _bigfive_directives(bigfive: dict) -> str | None:
+    """高/低バンドの因子だけを接し方の指示に変換（中はスキップ）。"""
+    if not isinstance(bigfive, dict):
+        return None
+    lines = []
+    for f in FACTOR_JA:
+        seg = bigfive.get(f)
+        if not isinstance(seg, dict):
+            continue
+        if seg.get("band") == "高" and f in _BF_DIRECTIVE_HIGH:
+            lines.append("- " + _BF_DIRECTIVE_HIGH[f])
+        elif seg.get("band") == "低" and f in _BF_DIRECTIVE_LOW:
+            lines.append("- " + _BF_DIRECTIVE_LOW[f])
+    return "\n".join(lines) if lines else None
+
+
 # 自己-行動 乖離レイヤー（PERSONALITY_SPEC.md レイヤーB拡張・SOKA重み付け）
 #   自己申告(bigfive_self) と 客観行動(behavior_signals.pct) のギャップを、行動が自己と
 #   同等以上に妥当な因子に限って「振り返るきっかけ」として提示する。LLM推定(bigfive)は使わない
@@ -1102,8 +1217,9 @@ def add_bigfive_fields(embed: discord.Embed, profile: dict, optout: bool = False
         )
 
 
-def format_profile(profile: dict, xp: int, rank_name: str, title: str) -> str:
-    """プロフィール情報を読みやすい文字列に変換してプロンプトへ埋め込む"""
+def format_profile(profile: dict, xp: int, rank_name: str, title: str, optout: bool = False) -> str:
+    """プロフィール情報を読みやすい文字列に変換してプロンプトへ埋め込む。
+    optout=True（personality_optout）の人には推定由来(bigfive)を出さず、自己申告(bigfive_self)のみ使う。"""
     if not profile and xp == 0:
         return ""
     lines = ["【このユーザーの情報】"]
@@ -1118,7 +1234,9 @@ def format_profile(profile: dict, xp: int, rank_name: str, title: str) -> str:
         lines.append(f"- 趣味・好きなもの: {', '.join(profile['hobbies'])}")
     if profile.get("personality"):
         lines.append(f"- 性格: {profile['personality']}")
-    _bf_brief = _bigfive_brief(profile.get("bigfive_self") or profile.get("bigfive") or {})
+    # optout 者には推定(bigfive)を使わず自己申告(bigfive_self)のみ。
+    _bf_src = profile.get("bigfive_self") or (None if optout else profile.get("bigfive")) or {}
+    _bf_brief = _bigfive_brief(_bf_src)
     if _bf_brief:
         lines.append(f"- 性格傾向(Big Five): {_bf_brief}")
     if profile.get("communication_style"):
@@ -1477,7 +1595,11 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
             profile["relations"] = sp["relations"]
 
     rank_name, _, _, _ = get_rank_info(xp)
-    profile_text = format_profile(profile, xp, rank_name, title)
+    optout       = bool(user_doc.get("personality_optout"))  # 推定オプトアウト者には分析由来を出さない
+    profile_text = format_profile(profile, xp, rank_name, title, optout=optout)
+    # Big Five を「接し方の指示」に変換（optout者は自己申告のみ）。芸風は人格プロンプトが優先。
+    _bf_src       = profile.get("bigfive_self") or (None if optout else profile.get("bigfive")) or {}
+    bf_directives = _bigfive_directives(_bf_src)
 
     try:
         raw_summary   = await get_latest_summary()
@@ -1511,6 +1633,10 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         parts.append("【このチャンネルの直前の会話（文脈として参照せよ）】\n" + channel_context)
     if profile_text:
         parts.append(profile_text)
+    if bf_directives:
+        parts.append(
+            "【この相手への接し方（性格傾向より・口調や芸風は人格設定を優先し崩すな）】\n" + bf_directives
+        )
 
     # claims（論破メイドのみ）
     if personality_key == "angry":
@@ -1533,6 +1659,22 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     except Exception as e:
         print(f"[WARN] _build_prompt search_memories失敗: {e}")
 
+    # 過去日報の意味検索（発火時のみ）: 「去年/あの時」等の想起クエリに、創作でなく実データで答えるため。
+    try:
+        past_records = await search_summaries(content, top_k=2)
+        if past_records:
+            # build_smart_summary で重要セクション（直近の話題・注目の発言等）を先頭に寄せてから抜粋。
+            # 生の先頭は「## 全体の雰囲気」固定で内容が薄いため、並べ替えてから切る。
+            rec_lines = "\n".join(
+                f"・{r['date']}頃: {' '.join(build_smart_summary(r['summary']).split())[:400]}"
+                for r in past_records
+            )
+            parts.append(
+                "【関連する過去の記録（サーバー全体・日付つき・確認できた範囲のみ）】\n" + rec_lines
+            )
+    except Exception as e:
+        print(f"[WARN] _build_prompt search_summaries失敗: {e}")
+
     if smart_summary:
         parts.append("【サーバーの最新状況（優先度順）】\n" + smart_summary)
 
@@ -1545,10 +1687,11 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         "- 上に挙げた資料（直前の会話・会話履歴・過去の記憶・サーバー要約）に無い固有名詞・"
         "出来事・数字を、事実であるかのように断定するな。確証がなければ創作せず、"
         "「正確には分かりません／覚えていません」と述べよ。\n"
-        "- あなたはログ全文検索や全期間の集計・総括はできない。「抽出します」「総括します」"
-        "など能力外のことを約束するな。年間・月間のまとめや過去の振り返りを求められたら、"
-        "手元の情報で答えられる範囲だけ答え、"
-        "「正確な総括は /report（特定の日は /retroreport）をご利用ください」と案内せよ。\n"
+        "- 全期間の集計・網羅的な総括（年間/月間のまとめ）はできない。「全部抽出します」"
+        "「総括します」と約束するな。総括を求められたら手元の情報の範囲で答え、"
+        "「正確な総括は /report（特定の日は /retroreport）をご利用ください」と案内せよ。"
+        "ただし上に【関連する過去の記録】が提示されていれば、それは参照して具体的に答えてよい"
+        "（提示が無い事柄を在るように作るのは禁止）。\n"
         "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。"
     )
     prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt + "\n\n" + honesty
