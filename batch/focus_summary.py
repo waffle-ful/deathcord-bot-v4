@@ -154,6 +154,25 @@ BIGFIVE_FACTORS_JA = {
 }
 CONF_JA = {"low": "低", "mid": "中", "high": "高"}
 
+# MBTI風ラベル（16personalities形式）＝Big Five の「とっつきやすい表示レイヤー」。
+# 土台の TIPI-J スコアは一切変えず【表示専用】。学術的には Big Five が本体で MBTI は参考
+# （二分で粒度を捨て、神経症傾向の軸が無い）。神経症傾向は 16personalities の
+# -A(自己主張)/-T(激動) として反映し、5因子すべてをラベルに乗せる。
+# 各タプル: (factor, 高側文字, 低側文字, 高側和名, 低側和名)
+MBTI_AXES = [
+    ("extraversion",      "E", "I", "外向",   "内向"),
+    ("openness",          "N", "S", "直観",   "現実"),
+    ("agreeableness",     "F", "T", "協調",   "思考寄り"),
+    ("conscientiousness", "J", "P", "計画",   "柔軟"),
+]
+MBTI_NEURO = ("neuroticism", "T", "A", "激動", "自己主張")  # 高→Turbulent(-T) / 低→Assertive(-A)
+MBTI_NAMES = {
+    "INTJ": "建築家", "INTP": "論理学者", "ENTJ": "指揮官",     "ENTP": "討論者",
+    "INFJ": "提唱者", "INFP": "仲介者",   "ENFJ": "主人公",     "ENFP": "広報運動家",
+    "ISTJ": "管理者", "ISFJ": "擁護者",   "ESTJ": "幹部",       "ESFJ": "領事官",
+    "ISTP": "巨匠",   "ISFP": "冒険家",   "ESTP": "起業家",     "ESFP": "エンターテイナー",
+}
+
 
 # =============================================================================
 # ログ取得
@@ -643,9 +662,46 @@ def render_bigfive_for_prompt(bigfive: dict) -> str:
     return "\n".join(lines) + foot
 
 
+def _mbti_letter(f, hi: str, lo: str):
+    """因子dictから二分文字を返す。score優先(>=50→高側)、無ければband、決まらなければ None。
+    score(0-100, 中点50=スケール中点)は内部較正値で表示はしないが、二分の判定には使う。"""
+    if not isinstance(f, dict):
+        return None
+    sc = f.get("score")
+    if isinstance(sc, (int, float)):
+        return hi if sc >= 50 else lo
+    b = f.get("band")
+    if b == "高":
+        return hi
+    if b == "低":
+        return lo
+    return None  # 中で score 無し → 未確定
+
+
+def derive_mbti_label(bigfive: dict) -> str:
+    """Big Five から16personalities風の参考ラベル行を作る（表示専用・土台は変えない）。
+    確定した軸だけ文字化し未確定は ? 。4軸そろったときだけ和名タイプを付ける。"""
+    core, friendly = [], []
+    for factor, hi, lo, jhi, jlo in MBTI_AXES:
+        ltr = _mbti_letter(bigfive.get(factor), hi, lo)
+        core.append(ltr)
+        if ltr:
+            friendly.append(f"{jhi if ltr == hi else jlo}{ltr}")
+    nf, nhi, nlo, njhi, njlo = MBTI_NEURO
+    nltr   = _mbti_letter(bigfive.get(nf), nhi, nlo)
+    suffix = f"-{nltr}" if nltr else ""
+    if nltr:
+        friendly.append(f"{njhi if nltr == nhi else njlo}-{nltr}")
+
+    code = "".join(c or "?" for c in core) + suffix
+    name = MBTI_NAMES.get("".join(core)) if all(core) else None
+    head = f"参考タイプ: {code}（{name}）" if name else f"参考タイプ: {code}（型名は軸が揃うと確定）"
+    return head + ("\n　" + " ／".join(friendly) if friendly else "")
+
+
 def render_bigfive_for_embed(bigfive: dict) -> dict | None:
     """Discord埋め込み用フィールド：LLMの気分に左右されず較正値を確実に表示する。
-    bands+confidence のみ＋確定診断ではない旨の注記。"""
+    冒頭に16personalities風の参考ラベル（表示専用・Big Fiveから機械変換）＋ bands+confidence。"""
     rows = []
     for key, label in BIGFIVE_FACTORS_JA.items():
         f = bigfive.get(key)
@@ -655,7 +711,8 @@ def render_bigfive_for_embed(bigfive: dict) -> dict | None:
         rows.append(f"**{label}** {f['band']}（確信:{conf}）")
     if not rows:
         return None
-    val = "\n".join(rows) + "\n※検証済み尺度TIPI-Jによるチャットからの推定。確定診断ではありません。"
+    val = (derive_mbti_label(bigfive) + "\n────────\n" + "\n".join(rows)
+           + "\n※TIPI-J推定。参考タイプはBig Fiveから機械変換した表示用ラベル（確定診断ではありません）。")
     return {"name": "🧬 性格傾向（Big Five / TIPI-J推定）", "value": val[:1020], "inline": False}
 
 
