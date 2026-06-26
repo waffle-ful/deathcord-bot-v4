@@ -5,41 +5,57 @@ on:
     - cron: '0 15 * * *'   # 毎日 UTC 15:00 = JST 深夜0:00
   workflow_dispatch:
 
+# 3つの分析は独立した別ジョブに分割（旧: 1ジョブ3ステップで合計が60分timeoutを食い潰し
+# 全体キャンセル＝Big Five保存まで巻き添えになっていた）。各ジョブに個別 timeout を与え、
+# needs+if:always() で「前段の成否に関わらず順番に実行」＝レート競合を避けつつ相互独立に完走させる。
 jobs:
-  daily:
+  personality:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 90    # gemma-4は遅い。25人×3呼び出し分の余裕
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          # キャッシュ無効化: discord.py削除後の requirements-batch.txt を確実に反映させる
-
-      - name: Install dependencies
-        run: pip install -r requirements-batch.txt
-
+      - run: pip install -r requirements-batch.txt
       - name: 性格分析（Big Five/TIPI-J・全メンバー対象・1回最大25人ローテーション）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/analyze_personality.py
 
-      - name: 非ブースター簡易分析（要約ログから発言パターン抽出）
+  nonbooster:
+    needs: personality
+    if: ${{ always() }}    # personality がコケても独立に走らせる
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-batch.txt
+      - name: 非ブースター簡易分析（要約ログから発言パターン抽出・1回最大20人）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/analyze_nonbooster.py
 
-      # 日報投稿は post_summary.yml に分離（独立ワークフロー化）。
-      # analyze_* のタイムアウトで日報がキャンセルされる問題を回避するため、このジョブからは外した。
-
+  enrich:
+    needs: nonbooster
+    if: ${{ always() }}    # 前段の成否に関わらず実行
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-batch.txt
       - name: claims・memories補完（retroreportから長期記憶を補充）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/enrich_memories.py
+
+      # 日報投稿は post_summary.yml に分離済（独立ワークフロー）。

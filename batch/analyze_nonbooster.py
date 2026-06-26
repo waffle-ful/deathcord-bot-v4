@@ -40,6 +40,9 @@ except Exception as _e:
     SAFETY_OFF = None
 DB_NAME        = "discord_bot_db"
 SUMMARY_DAYS   = 10  # 直近5日分（精度向上のため3→5に拡大）
+# 1回の最大処理人数。安全策修正でLLM呼び出しが成功＝低速化したため、無制限だと
+# daily_tasks の60分ジョブtimeoutを食い潰す。未分析優先のローテーションで複数日に分散。
+MAX_NB_PER_RUN = int(os.environ.get("NB_MAX_PER_RUN", "20"))
 
 
 ANALYZE_PROMPT = """\
@@ -48,7 +51,7 @@ ANALYZE_PROMPT = """\
 
 言及が少ない・見つからない場合は全項目nullにしてください。
 推測・捏造は絶対にしないでください。ログに根拠がある情報のみ記載してください。
-必ずJSON形式のみで返してください。前置き・説明文・\`\`\`は不要です。
+必ずJSON形式のみで返してください。前置き・説明文・```は不要です。
 
 出力形式:
 {{
@@ -211,18 +214,22 @@ def main():
     nick_map = (mongo[DB_NAME]["system"].find_one({"_id": "nickname_map"}) or {}).get("map", {})
     print(f"[nonbooster] nickname_map: {len(nick_map)} aliases")
 
-    client  = genai.Client(api_key=GEMINI_API_KEY)
-    success = 0
-    skipped = 0
+    # D: 要約に登場する人だけ対象（無駄打ち削減）。さらに未分析(simple_profile.analyzed_at
+    # 無し)→古い順に並べ、MAX_NB_PER_RUN で打ち切る＝1回の実行時間を有界にしつつ複数日で全員巡回。
+    mentioned = [d for d in targets
+                 if is_mentioned(d.get("name", str(d["_id"])), nick_map, summaries_text)]
+    skipped   = len(targets) - len(mentioned)
+    mentioned.sort(key=lambda d: (d.get("simple_profile") or {}).get("analyzed_at") or "")
+    batch     = mentioned[:MAX_NB_PER_RUN]
+    print(f"[nonbooster] 言及あり={len(mentioned)}人 / 今回処理={len(batch)}人 (cap {MAX_NB_PER_RUN}/run)")
 
-    for doc in targets:
+    client  = genai.Client(api_key=GEMINI_API_KEY)
+    now     = datetime.now(timezone.utc)
+    success = 0
+
+    for doc in batch:
         name = doc.get("name", str(doc["_id"]))
         uid  = doc["_id"]
-
-        # D: 要約に一度も登場しない人はAPIを呼ばずスキップ（無駄打ち削減・タイムアウト回避）
-        if not is_mentioned(name, nick_map, summaries_text):
-            skipped += 1
-            continue
 
         print(f"[nonbooster] Analyzing {name}...")
 
@@ -235,12 +242,17 @@ def main():
         result = parse_json(raw, name) if raw else None
 
         if not result:
+            # 言及ありなのにデータ無し → analyzed_at だけ刻んでローテーションを前進させる
+            # （毎回 cap 枠を食い潰さないため。次の巡回で再挑戦される）
             print(f"[nonbooster] No data for {name}, skipping.")
+            users_col.update_one({"_id": uid},
+                                 {"$set": {"simple_profile.analyzed_at": now.isoformat()}})
             time.sleep(1)
             continue
 
         existing = doc.get("simple_profile", {})
         merged   = merge_simple_profile(existing, result)
+        merged["analyzed_at"] = now.isoformat()
 
         users_col.update_one(
             {"_id": uid},
@@ -251,8 +263,8 @@ def main():
         success += 1
         time.sleep(3)
 
-    print(f"[nonbooster] Completed. {success}/{len(targets)} users analyzed. "
-          f"{skipped} skipped (要約に未登場・API未呼出).")
+    print(f"[nonbooster] Completed. {success}/{len(batch)} 処理 "
+          f"(言及あり{len(mentioned)}人中・cap {MAX_NB_PER_RUN})。{skipped} skipped (要約に未登場).")
 
 
 if __name__ == "__main__":
