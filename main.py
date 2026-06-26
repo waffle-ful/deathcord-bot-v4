@@ -1406,8 +1406,10 @@ def _is_emotionally_significant(text: str) -> bool:
 
 def format_history(history: list[dict], current_persona: str | None = None) -> str:
     """会話履歴を整形。感情的に重要な発言には★マークを付与してAIが優先的に参照できるようにする。
-    人格混線対策: 現在の人格(current_persona)と異なる人格で生成された過去のメイド発言は、
-    口調を漏らさないよう中立プレースホルダに置換する（主人側の発言は全て保持）。"""
+    人格混線対策: 現在の人格(current_persona)で生成されたと確認できるメイド発言だけ口調をそのまま見せ、
+    それ以外（別人格の発言＋人格タグの無い修正前=レガシー発言）は中立プレースホルダに置換する。
+    こうしないと、過疎で履歴が入れ替わらない場合に古い「ざぁ〜こ♡」等が居座って口調が混線する。
+    （主人側の発言は全て保持・内容はmemories/profileに残るので文脈は失われない）"""
     if not history:
         return "（初めてのご挨拶）"
     lines = []
@@ -1416,9 +1418,8 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
             mark = "★" if _is_emotionally_significant(h["content"]) else ""
             lines.append(f"{mark}主人: {h['content']}")
         else:
-            p = h.get("persona")
-            if current_persona and p and p != current_persona:
-                # 別人格の発言＝口調の手本にさせない（内容はmemories/profileに残るので文脈は失われない）
+            # 現人格タグと一致する発言のみ口調を見せる。タグ無し(レガシー)・別人格は中立化。
+            if current_persona and h.get("persona") != current_persona:
                 lines.append("メイド: （別の人格で応答）")
             else:
                 lines.append(f"メイド: {h['content']}")
@@ -1820,8 +1821,8 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         "ただし上に【関連する過去の記録】が提示されていれば、それは参照して具体的に答えてよい"
         "（提示が無い事柄を在るように作るのは禁止）。\n"
         "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。\n"
-        "- 【口調の固定】これまでの会話に別の口調のメイド発言が混ざっていても、それに引きずられるな。"
-        "今のあなたの人格の口調だけで話せ。"
+        "- 【口調の固定】今のあなたの人格の口調だけで話せ。これまでの会話や履歴に"
+        "別の人格の口調・決め台詞・語尾が混ざっていても、絶対に真似たり引きずられたりするな。"
     )
     prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt + "\n\n" + honesty
     return prompt, personality, personality_key
