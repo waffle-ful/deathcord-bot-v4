@@ -33,6 +33,19 @@ MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 MODEL          = "models/gemma-4-31b-it"
 MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
 DB_NAME        = "discord_bot_db"
+
+# 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
+# focus_summary.py の call_ai と同方針（2026-06-23 に focus が踏んだ「全リトライ空レスポンス」
+# の真因＝safety ブロック or thinking 予算不足。同じ対策をこちらにも適用する）。
+try:
+    SAFETY_OFF = [
+        types.SafetySetting(category=c, threshold="BLOCK_NONE")
+        for c in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                  "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
+    ]
+except Exception as _e:
+    print(f"[WARN] safety_settings 構築失敗（デフォルト使用）: {_e}")
+    SAFETY_OFF = None
 MIN_CONV_COUNT = 30   # 10→30。10発言で性格を断定するのは統計的に無謀なため引き上げ
 SUMMARY_DAYS   = 7
 
@@ -156,7 +169,7 @@ def _extract_retry_wait(err: str) -> float:
     return float(m.group(1)) + 2.0 if m else 60.0
 
 
-def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 500) -> str | None:
+def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 1500) -> str | None:
     for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
         for attempt in range(5):
             try:
@@ -166,12 +179,21 @@ def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 500) -> str 
                     config=types.GenerateContentConfig(
                         temperature=0.2,
                         max_output_tokens=max_tokens,
+                        safety_settings=SAFETY_OFF,
                     ),
                 )
                 text = getattr(resp, "text", None)
                 if text and text.strip():
                     return text.strip()
-                print(f"[WARN] {label}: 空レスポンス attempt{attempt+1}")
+                # 空の理由を診断（finish_reason=MAX_TOKENS なら thinking 食い潰し→max_tokens不足）
+                try:
+                    cand = (getattr(resp, "candidates", None) or [None])[0]
+                    fr   = getattr(cand, "finish_reason", None)
+                    sr   = getattr(cand, "safety_ratings", None)
+                    pf   = getattr(resp, "prompt_feedback", None)
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1} finish={fr} pf={pf} safety={sr}")
+                except Exception:
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1}")
                 time.sleep(5)
             except Exception as e:
                 err = str(e)
@@ -500,7 +522,7 @@ def infer_bigfive(client: genai.Client, name: str, utterances: list[str]) -> dic
         signals=signals_to_text(signals),
         utterances="\n".join(f"- {u}" for u in utterances),
     )
-    raw = call_gemma(client, prompt, max_tokens=1200)
+    raw = call_gemma(client, prompt, max_tokens=3000)   # 10項目JSON＋gemma-4 thinking予算の余裕
     parsed = parse_json(raw, name)
     if not parsed or "items" not in parsed:
         return None
@@ -515,7 +537,7 @@ def analyze_tone(client: genai.Client, name: str, utterances: list[str]) -> dict
     if not utterances:
         return None
     text = "\n".join(f"- {u}" for u in utterances)
-    raw = call_gemma(client, TONE_PROMPT.format(name=name, utterances=text), max_tokens=300)
+    raw = call_gemma(client, TONE_PROMPT.format(name=name, utterances=text), max_tokens=1500)
     return parse_json(raw, name)
 
 
@@ -525,7 +547,7 @@ def analyze_context(client: genai.Client, name: str, summaries_text: str) -> dic
     raw = call_gemma(
         client,
         CONTEXT_PROMPT.format(name=name, days=SUMMARY_DAYS, summaries=summaries_text),
-        max_tokens=800,
+        max_tokens=2000,
     )
     return parse_json(raw, name)
 
