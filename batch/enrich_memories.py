@@ -27,6 +27,17 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 MODEL          = "models/gemma-4-31b-it"
 MODEL_FB       = "models/gemma-4-26b-a4b-it"
+
+# 内部バッチなので safety ブロックで空レスポンスにならないよう緩和（analyze_personality/focus と同方針）。
+try:
+    SAFETY_OFF = [
+        types.SafetySetting(category=c, threshold="BLOCK_NONE")
+        for c in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                  "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
+    ]
+except Exception as _e:
+    print(f"[WARN] safety_settings 構築失敗（デフォルト使用）: {_e}")
+    SAFETY_OFF = None
 EMBED_MODEL    = "models/gemini-embedding-001"
 DB_NAME        = "discord_bot_db"
 SUMMARY_DAYS   = 7
@@ -77,12 +88,18 @@ def call_ai(client: genai.Client, prompt: str) -> str | None:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
-                        max_output_tokens=600,
+                        max_output_tokens=1500,
+                        safety_settings=SAFETY_OFF,
                     ),
                 )
                 text = getattr(resp, "text", "").strip()
                 if text:
                     return text
+                try:
+                    cand = (getattr(resp, "candidates", None) or [None])[0]
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1} finish={getattr(cand, 'finish_reason', None)}")
+                except Exception:
+                    print(f"[WARN] {label}: 空レスポンス attempt{attempt+1}")
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
