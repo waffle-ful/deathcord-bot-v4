@@ -670,6 +670,9 @@ async def _embed_query_for_summaries(text: str) -> list[float] | None:
 # 過去日報の採用閾値。doc重心 vs 短いクエリの cosine は圧縮・密集して低めに出る（focus Tier3 と同性質）。
 # batch/focus_summary.py の KEYWORD_SEM_THRESHOLD=0.45 と揃える。ログの best= を見て env で調整可。
 SUMMARY_SIM_THRESHOLD = float(os.environ.get("SUMMARY_SIM_THRESHOLD", "0.45"))
+# この embedding 空間は全docが高cosineに密集し絶対閾値が選別にならない（実測: 全969件が0.45超）。
+# そこで意味採用は「best からこの差以内」の相対gapを併用＝際立って似たdocだけ拾う。env調整可。
+SUMMARY_SEM_REL_GAP   = float(os.environ.get("SUMMARY_SEM_REL_GAP", "0.05"))
 # 1回の検索で読む summaries の上限（現状 ~970 件。将来大幅に増えたらキャッシュ/索引へ移行）。
 SUMMARY_SCAN_LIMIT    = 3000
 
@@ -734,8 +737,10 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
     # ③ needle: 名前を含む doc を cosine 順で（閾値未満でも採用）。
     needle = ([d for _, d in scored if any(n in d.get("summary", "") for n in present_names)][:top_k]
               if present_names else [])
-    # ② semantic: 閾値以上
-    semantic = [d for sc, d in scored if sc >= SUMMARY_SIM_THRESHOLD]
+    # ② semantic: 絶対閾値(floor)＋best相対gap。圧縮分布で絶対閾値が効かないため、best 近傍だけ採用＝
+    #    「際立って似た doc」のみ。名前needleが無い質問で無関係な日報を注入するのを抑える。
+    sem_floor = max(SUMMARY_SIM_THRESHOLD, best - SUMMARY_SEM_REL_GAP)
+    semantic  = [d for sc, d in scored if sc >= sem_floor]
 
     # ④ needle 優先で統合・重複排除（_id でユニーク化）
     merged, seen = [], set()
@@ -748,8 +753,8 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
         if len(merged) >= top_k:
             break
 
-    print(f"[summary] best={best:.3f} thr={SUMMARY_SIM_THRESHOLD:.2f} "
-          f"needle={len(needle)} sem≥thr={len(semantic)} → {len(merged)}件 "
+    print(f"[summary] best={best:.3f} floor={sem_floor:.2f} "
+          f"needle={len(needle)} sem={len(semantic)} → {len(merged)}件 "
           f"names={list(present_names) or 'なし'}")
     out = []
     for d in merged:
