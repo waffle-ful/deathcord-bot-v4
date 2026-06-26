@@ -2086,6 +2086,7 @@ class MyBot(discord.Client):
         self.loop.create_task(weekly_ranking_task())
         self.loop.create_task(idle_chatter_task())
         self.loop.create_task(init_invite_snapshot(self))
+        self.loop.create_task(_load_advocate_flags())
 
 async def init_invite_snapshot(bot: discord.Client):
     await bot.wait_until_ready()
@@ -2464,6 +2465,11 @@ async def on_message(message: discord.Message):
             nb_chance = NB_TALK_CHANCE_TOPIC if has_topic else NB_TALK_CHANCE
             if random.random() < nb_chance:
                 asyncio.create_task(maid_respond_queued(message))
+
+        # 自動弁護: 武装中のみ。管理者が非管理者メンバーを一方的に責める対立を保守的に検知して割り込む。
+        # （cheap な in-memory フラグで判定し、ほとんどのメッセージでは即抜ける）
+        if _advocate_auto_armed and message.content.strip() and message.channel.id != BUTLER_CHANNEL_ID:
+            asyncio.create_task(_maybe_auto_advocate(message))
 
     except Exception as e:
         print(f"[ERROR] on_message: {e}")
@@ -3459,6 +3465,366 @@ async def stopmimic_cmd(interaction: discord.Interaction):
         )
     else:
         await interaction.response.send_message("進行中のミミックはありません。", ephemeral=True)
+
+
+# =============================================================================
+# 弁護機能（擁護） & レスバ機能
+# -----------------------------------------------------------------------------
+# 弁護: 管理人と利益相反する状況で、利害のない立場として特定メンバーの「側の言い分」を
+#       公平に代弁する。中立な"裁定者"ではなく"弁護人"。事実は捏造させず、筋論・公平さで守る。
+#   - 手動 /弁護 …… 全員が利用可。クールダウン＋ログ。管理人は透明なマスタースイッチで全体停止可
+#                    （こっそり個別検閲はしない＝悪用対策はレート制限＋ログ＋全体ON/OFFで担保）。
+#   - 自動       …… 管理人が /弁護モード auto:on で武装した時のみ。管理者が非管理者メンバーを
+#                    一方的に責める対立を検知し、保守的に（強クールダウン＋LLMゲート）割り込む。
+# レスバ: 論破人格で特定メンバーに議論を吹っかける（お遊び）。対象は /レスバ拒否 でオプトアウト可。
+# =============================================================================
+ADVOCATE_ICON          = "⚖️"
+ADVOCATE_CD_SECONDS    = 90       # 同一チャンネルでの手動弁護クールダウン
+ADVOCATE_AUTO_GAP_MIN  = 30       # 自動弁護: 同一対象への最小再発火間隔（分）
+ADVOCATE_AUTO_CD_SEC   = 300      # 自動弁護: サーバー全体クールダウン（秒）
+ADVOCATE_GATE_CD_SEC   = 45       # 自動弁護: 同一チャンネルでのLLMゲート再評価の最小間隔（NO連発時のコスト抑制）
+RESUBA_ICON            = "💢"
+RESUBA_CD_SECONDS      = 60       # 同一チャンネルでのレスバ・クールダウン
+
+# 自動検知の前段フィルタ（これ単体では発火しない。管理者発言＋対象メンション＋LLMゲートが揃って初めて発火）
+CONFLICT_HINT_WORDS = [
+    "ふざけ", "いい加減", "迷惑", "やめろ", "やめて", "警告", "ルール", "規約", "違反",
+    "なんで", "なんなん", "ありえ", "は？", "ダメ", "だめ", "出てけ", "出て行け", "通報",
+    "勝手に", "二度と", "責任", "謝", "反省", "態度", "失礼", "ふざけんな", "黙",
+]
+
+# システムフラグ（system_col に永続化）。on_message の高頻度パスでは DB を叩かず in-memory キャッシュを見る。
+_advocate_auto_armed: bool = False                          # /弁護モード auto の現在値（キャッシュ）
+_advocate_cd: dict[int, datetime.datetime] = {}             # channel_id -> 最終手動弁護
+_advocate_auto_cd: dict[str, datetime.datetime] = {}        # target_uid -> 最終自動弁護
+_advocate_auto_last: datetime.datetime | None = None        # 自動弁護のサーバー全体・最終時刻
+_advocate_gate_cd: dict[int, datetime.datetime] = {}        # channel_id -> 最終ゲート評価（NO連発時のコスト抑制）
+_resuba_cd: dict[int, datetime.datetime] = {}               # channel_id -> 最終レスバ
+
+
+async def _get_flag(flag_id: str, default: bool = False) -> bool:
+    doc = await system_col.find_one({"_id": flag_id})
+    return bool(doc.get("value", default)) if doc else default
+
+
+async def _set_flag(flag_id: str, value: bool):
+    await system_col.update_one({"_id": flag_id}, {"$set": {"value": value}}, upsert=True)
+
+
+async def _load_advocate_flags():
+    """起動時に自動弁護フラグを in-memory キャッシュへ読み込む。"""
+    global _advocate_auto_armed
+    try:
+        await client.wait_until_ready()
+        _advocate_auto_armed = await _get_flag("advocate_auto", False)
+        print(f"[INFO] 自動弁護モード: {'ON' if _advocate_auto_armed else 'OFF'}")
+    except Exception as e:
+        print(f"[WARN] _load_advocate_flags失敗: {e}")
+
+
+async def _recent_channel_text(channel, before=None, limit: int = 10) -> str:
+    """直近の人間の発言を古い順テキストで返す（弁護・ゲートの文脈用）。"""
+    lines = []
+    try:
+        async for m in channel.history(limit=limit + 4, before=before):
+            if m.author.bot:
+                continue
+            text = re.sub(r"<@!?\d+>", "", m.content).strip()
+            if text:
+                lines.append(f"{m.author.display_name}: {text}")
+            if len(lines) >= limit:
+                break
+    except Exception as e:
+        print(f"[WARN] _recent_channel_text失敗: {e}")
+    lines.reverse()
+    return "\n".join(lines)
+
+
+ADVOCATE_PROMPT = """あなたは、このコミュニティに利害関係を持たない中立的な立場の人物です。
+いま「{target}」さんが、管理者や他のメンバーとの間で、不利な立場・対立的な状況に置かれている可能性があります。
+あなたの役割は、感情的な対立を鎮め、{target} さんの「側の言い分・事情」を公平に代弁することです。
+
+【厳守する原則（人格や口調の演出より優先）】
+- あなたは中立な"裁定者"ではなく、{target} さんのための"弁護人"です。「どちらが正しいか」を断定してはいけません。「{target} さんの側には、こういう見方・事情・善意があり得る」という形で提示してください。
+- 事実を捏造してはいけません。{target} さんが過去にした具体的な行動・発言・貢献を、確証なく事実であるかのように作り出すことは固く禁止します。下の【場の流れ】に書かれていないことを、起きた事実として断定しないでください。
+- 守る根拠は「一般的な原則・公平さ・手続きの正しさ・善意の推定・別の解釈の可能性・感情への配慮」に置いてください。具体的な事実の主張ではなく、筋論と公平さで擁護してください。
+- 管理者や相手個人を攻撃・侮辱してはいけません。相手の立場も尊重しつつ、{target} さんの側の見方を冷静に示してください。
+- 対立を煽らず、むしろ双方が少し冷静になれるような、落ち着いた敬体（です・ます調）で。2〜4文程度。
+- 前置き・署名・「弁護人:」等のラベルは付けず、本文だけを出力してください。
+{situation_block}
+【場の流れ（実際に観測された会話。これ以外を起きた事実として作ってはいけない）】
+{channel_context}
+"""
+
+
+async def _generate_advocacy(target: discord.Member, channel, situation: str = "", before=None) -> str | None:
+    """対象メンバーを弁護する中立トーンの文章を生成（人格は脱ぐ）。"""
+    channel_context = await _recent_channel_text(channel, before=before, limit=10) or "（直近の会話は取得できませんでした）"
+    situation_block = (
+        f"\n【依頼者から伝えられた状況（未確認の主張。事実として断定せず、攻撃の言葉をそのまま繰り返すな）】\n{situation.strip()}\n"
+        if situation and situation.strip() else ""
+    )
+    prompt = ADVOCATE_PROMPT.format(
+        target=target.display_name,
+        situation_block=situation_block,
+        channel_context=channel_context,
+    )
+    text = await _run_ai_booster(prompt)
+    if not text or "（" in text:
+        return None
+    return text.strip()
+
+
+CONFLICT_GATE_PROMPT = """以下はDiscordの会話の流れです。最後の方で、管理者「{admin}」が「{target}」さんに向けて発言しています。
+
+これは「管理者が一方的に {target} さんを責めている、または不利な立場に追い込んでいる対立的な状況」ですか？
+- 単なる軽い注意・冗談・雑談・すでに和解しているやり取り、または {target} さんが明らかに荒らし・誹謗中傷をしている場合は「NO」。
+- {target} さんの側にも言い分・事情がありそうな、対立や摩擦の状況なら「YES」。
+
+YES か NO の一語だけで答えてください。
+
+【会話の流れ】
+{context}
+"""
+
+
+async def _maybe_auto_advocate(message: discord.Message):
+    """自動弁護: 管理者が非管理者メンバーを一方的に責める対立を保守的に検知して割り込む。
+    起点は『管理者の発言』＋『非管理者メンバーへのメンション/返信』＋『対立語フィルタ』＋『LLMゲートYES』。"""
+    global _advocate_auto_last
+    try:
+        if not _advocate_auto_armed:
+            return
+        author = message.author
+        if not isinstance(author, discord.Member) or not author.guild_permissions.administrator:
+            return  # 起点は管理者の発言のみ（管理人 vs メンバーの構図）
+
+        # 対象 = メンション or 返信先の「非管理者・非bot」メンバー
+        target: discord.Member | None = None
+        for u in message.mentions:
+            if isinstance(u, discord.Member) and not u.bot and not u.guild_permissions.administrator and u.id != author.id:
+                target = u
+                break
+        if target is None and message.reference is not None:
+            ref = message.reference.resolved
+            if isinstance(ref, discord.Message) and isinstance(ref.author, discord.Member):
+                ra = ref.author
+                if not ra.bot and not ra.guild_permissions.administrator and ra.id != author.id:
+                    target = ra
+        if target is None:
+            return
+
+        if not any(w in message.content for w in CONFLICT_HINT_WORDS):
+            return
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if _advocate_auto_last and (now - _advocate_auto_last).total_seconds() < ADVOCATE_AUTO_CD_SEC:
+            return
+        last_t = _advocate_auto_cd.get(str(target.id))
+        if last_t and (now - last_t).total_seconds() < ADVOCATE_AUTO_GAP_MIN * 60:
+            return
+
+        # ゲート評価の連打抑制: 同一チャンネルで直近に評価していればスキップ（NO連発のコストを抑える）
+        gate_last = _advocate_gate_cd.get(message.channel.id)
+        if gate_last and (now - gate_last).total_seconds() < ADVOCATE_GATE_CD_SEC:
+            return
+        _advocate_gate_cd[message.channel.id] = now
+
+        context = await _recent_channel_text(message.channel, before=None, limit=12)
+        if not context:
+            return
+        gate = await _run_ai_booster(CONFLICT_GATE_PROMPT.format(
+            admin=author.display_name, target=target.display_name, context=context,
+        ))
+        # 「YES」一語のみを採用（"YESとは言えません" 等の誤発火を防ぐ）。判定不能は fail-safe で発火しない。
+        g = (gate or "").strip().upper()
+        if not (g.startswith("YES") and len(g) <= 6):
+            return
+
+        text = await _generate_advocacy(
+            target, message.channel,
+            situation="この場で管理者が対象メンバーに強い言葉を向けています（自動検知）。",
+        )
+        if not text:
+            return
+
+        _advocate_auto_last = now
+        _advocate_auto_cd[str(target.id)] = now
+        await message.channel.send(
+            f"{ADVOCATE_ICON} {text}\n-# 利害のない立場からの代弁です（自動・管理人がオフにできます: /弁護モード）"
+        )
+        try:
+            await system_col.insert_one({
+                "type": "advocate_log", "mode": "auto",
+                "target_id": str(target.id), "target_name": target.display_name,
+                "admin_id": str(author.id), "admin_name": author.display_name,
+                "channel_id": str(message.channel.id),
+                "at": now.isoformat(),
+            })
+        except Exception:
+            pass
+        print(f"[advocate/auto] {target.display_name} を弁護")
+    except Exception as e:
+        print(f"[ERROR] _maybe_auto_advocate: {e}")
+
+
+@client.tree.command(name="弁護", description="利害のない立場から、指定メンバーの側の言い分を公平に代弁する")
+@app_commands.describe(member="弁護してほしいメンバー", context="状況・経緯（任意・あると精度が上がる）")
+async def advocate_cmd(interaction: discord.Interaction, member: discord.Member, context: str = ""):
+    if not await check_home_guild(interaction):
+        return
+    # 透明なマスタースイッチ: 管理人が全体停止している間は公然と断る（こっそり個別検閲はしない）
+    if not await _get_flag("advocate_manual", True):
+        await interaction.response.send_message(
+            "弁護機能は現在、管理人によって停止されています。", ephemeral=True
+        )
+        return
+    if member.bot:
+        await interaction.response.send_message("botは弁護できません。", ephemeral=True)
+        return
+    # クールダウン（チャンネル単位・スパム防止）
+    now = datetime.datetime.now(datetime.timezone.utc)
+    last = _advocate_cd.get(interaction.channel_id)
+    if last and (now - last).total_seconds() < ADVOCATE_CD_SECONDS:
+        remain = int(ADVOCATE_CD_SECONDS - (now - last).total_seconds())
+        await interaction.response.send_message(
+            f"弁護はこのチャンネルでは連続で使えません。あと約{remain}秒お待ちください。", ephemeral=True
+        )
+        return
+    _advocate_cd[interaction.channel_id] = now
+
+    await interaction.response.defer(ephemeral=False)
+    text = await _generate_advocacy(member, interaction.channel, situation=context)
+    if not text:
+        await interaction.followup.send("（うまく言葉がまとまりませんでした…少し時間を置いて再度お試しください）", ephemeral=True)
+        return
+    await asyncio.sleep(_rate_get_wait_seconds())
+    await interaction.followup.send(
+        f"{ADVOCATE_ICON} **{member.display_name} さんの弁護**\n{text}\n-# 利害のない立場からの代弁です。事実認定ではありません。"
+    )
+    try:
+        await system_col.insert_one({
+            "type": "advocate_log", "mode": "manual",
+            "target_id": str(member.id), "target_name": member.display_name,
+            "invoker_id": str(interaction.user.id), "invoker_name": interaction.user.display_name,
+            "channel_id": str(interaction.channel_id),
+            "context": context[:300],
+            "at": now.isoformat(),
+        })
+    except Exception:
+        pass
+
+
+@client.tree.command(name="弁護モード", description="【管理者】自動弁護の武装/手動弁護の全体ON-OFFを切り替える")
+@app_commands.describe(auto="自動弁護を武装するか（対立を検知して自動で割り込む）", manual="手動 /弁護 コマンド自体を有効にするか")
+@app_commands.default_permissions(administrator=True)
+async def advocate_mode_cmd(interaction: discord.Interaction, auto: bool | None = None, manual: bool | None = None):
+    if not await check_home_guild(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者専用です。", ephemeral=True)
+        return
+    global _advocate_auto_armed
+    changed = []
+    if auto is not None:
+        await _set_flag("advocate_auto", auto)
+        _advocate_auto_armed = auto
+        changed.append(f"自動弁護: **{'ON（武装）' if auto else 'OFF'}**")
+    if manual is not None:
+        await _set_flag("advocate_manual", manual)
+        changed.append(f"手動 /弁護: **{'有効' if manual else '停止'}**")
+
+    cur_auto   = _advocate_auto_armed
+    cur_manual = await _get_flag("advocate_manual", True)
+    status = (
+        f"現在の設定\n"
+        f"・自動弁護（対立検知で自動割り込み）: **{'ON' if cur_auto else 'OFF'}**\n"
+        f"・手動 /弁護 コマンド: **{'有効' if cur_manual else '停止'}**"
+    )
+    body = ("✅ 更新しました\n" + "\n".join(changed) + "\n\n" + status) if changed else status
+    await interaction.response.send_message(body, ephemeral=True)
+
+
+async def _generate_resuba(target: discord.Member, topic: str = "") -> str | None:
+    """論破人格で対象に議論を吹っかける一撃の挑発を生成（お遊び）。"""
+    persona = PERSONALITIES["angry"]
+    doc = await users_col.find_one({"_id": str(target.id)}, {"claims": {"$slice": -8}}) or {}
+    claims = doc.get("claims", [])
+    topic_clause = (
+        f"お題は「{topic.strip()}」。この話題で議論を仕掛けろ。"
+        if topic and topic.strip()
+        else "お題は自由。相手が言いそうなこと・最近の話題から、議論になりそうな論点を一つ選んで仕掛けろ。"
+    )
+    directive = (
+        f"これは誰かへの返信ではなく、あなたから「{target.display_name}」に自分から仕掛けるレスバ（言葉の打ち合い）です。\n"
+        f"{topic_clause}\n"
+        "相手を軽く挑発しつつ、反論したくなる論点を一つ投げて議論を吹っかけてください。"
+        "ただし容姿・人格の全否定など本気で傷つける罵倒は禁止。あくまで知的なレスバ・お遊びの範囲で。"
+        "前置きや「レスバ:」等のラベルなし・本文のみ・150文字以内。"
+    )
+    base = persona["booster_prompt"].format(
+        name=target.display_name,
+        history="（これは新たに仕掛けるレスバ。過去の個別会話履歴は使いません）",
+        content=directive,
+    )
+    if claims:
+        claim_lines = "\n".join(f"・{c['content']}" for c in claims)
+        prompt = f"【{target.display_name} が過去に言った主張（隙があれば突いてよい・無理に使わなくてよい）】\n{claim_lines}\n\n---\n{base}"
+    else:
+        prompt = base
+    text = await _run_ai_booster(prompt)
+    if not text or "（" in text:
+        return None
+    return text.strip()
+
+
+@client.tree.command(name="resuba", description="論破メイドが指定メンバーにレスバを仕掛ける（お遊び）")
+@app_commands.describe(member="レスバを仕掛ける相手", topic="お題（任意）")
+async def resuba_cmd(interaction: discord.Interaction, member: discord.Member, topic: str = ""):
+    if not await check_home_guild(interaction):
+        return
+    if member.bot or member.id == interaction.client.user.id:
+        await interaction.response.send_message("botにはレスバを仕掛けられません。", ephemeral=True)
+        return
+    # 対象のオプトアウト確認（巻き込まれたくない人を守る）
+    tdoc = await users_col.find_one({"_id": str(member.id)}, {"resuba_optout": 1}) or {}
+    if tdoc.get("resuba_optout"):
+        await interaction.response.send_message(
+            f"{member.display_name} さんはレスバ対象外に設定しています。", ephemeral=True
+        )
+        return
+    now = datetime.datetime.now(datetime.timezone.utc)
+    last = _resuba_cd.get(interaction.channel_id)
+    if last and (now - last).total_seconds() < RESUBA_CD_SECONDS:
+        remain = int(RESUBA_CD_SECONDS - (now - last).total_seconds())
+        await interaction.response.send_message(
+            f"レスバはこのチャンネルでは連続で使えません。あと約{remain}秒お待ちください。", ephemeral=True
+        )
+        return
+    _resuba_cd[interaction.channel_id] = now
+
+    await interaction.response.defer(ephemeral=False)
+    text = await _generate_resuba(member, topic)
+    if not text:
+        await interaction.followup.send("（今はうまく仕掛けられませんでした…）", ephemeral=True)
+        return
+    await asyncio.sleep(_rate_get_wait_seconds())
+    persona = PERSONALITIES["angry"]
+    await interaction.followup.send(f"{persona['icon']} {member.mention} {text}")
+
+
+@client.tree.command(name="レスバ拒否", description="自分をレスバの対象外にする/戻すを切り替える")
+async def resuba_optout_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}, {"resuba_optout": 1}) or {}
+    new_val = not bool(doc.get("resuba_optout"))
+    await users_col.update_one({"_id": uid}, {"$set": {"resuba_optout": new_val}}, upsert=True)
+    if new_val:
+        await interaction.response.send_message("✅ あなたをレスバ対象外に設定しました。/resuba で指名されなくなります。", ephemeral=True)
+    else:
+        await interaction.response.send_message("✅ レスバ対象外を解除しました。再び /resuba の対象になります。", ephemeral=True)
 
 
 def _build_retro_embeds(doc: dict) -> list[dict]:
