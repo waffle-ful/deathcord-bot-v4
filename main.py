@@ -91,6 +91,56 @@ _invite_snapshot: dict[str, int] = {}
 STREAK_BONUSES = {3: 100, 7: 300, 30: 1000}  # 連続日数: XP
 GRADUATE_REMOVE_ROLE_IDS: set[int] = {1417840244711100566}
 
+# 職階の階層（層）: 職階に「深い意味」を持たせる背骨。層が上がるほどメイドの“内心の評価”が深化する。
+# コンサル/アムウェイのピンレベル型＝報酬を上に積んで登る価値を作る設計。境界は RANK_STAGES の名称群に一致。
+#   補助者層: スタッフ/アソシエイト/シニア   管理者層: マネージャー〜シニアエグゼクティブ
+#   幹部層: プラチナム〜エメラルド            上級執行部: ダイヤモンド〜トリプルダイヤモンド
+#   名誉・諮問: クラウン〜プレジデント
+RANK_TIERS = [
+    {"min_xp": 0,       "emoji": "🔰", "name": "補助者層",   "treat": "まだ日の浅い新入りとして、基本の距離感で接する。"},
+    {"min_xp": 1_000,   "emoji": "💼", "name": "管理者層",   "treat": "一人前として信頼している。少し砕けた親しみを滲ませてよい。"},
+    {"min_xp": 12_000,  "emoji": "👔", "name": "幹部層",     "treat": "幹部として一目置いている。特別な相手として扱ってよい。"},
+    {"min_xp": 75_000,  "emoji": "💠", "name": "上級執行部", "treat": "別格の存在として深く敬意を抱いている。"},
+    {"min_xp": 260_000, "emoji": "👑", "name": "名誉・諮問", "treat": "伝説級の特別な主人として、最大級の特別扱いをしてよい。"},
+]
+
+def get_rank_tier(xp: int) -> dict:
+    t = RANK_TIERS[0]
+    for tier in RANK_TIERS:
+        if xp >= tier["min_xp"]:
+            t = tier
+    return t
+
+# ランク連動パーク: 「職階が上がっても何も起きない」を解消する解放機能。
+# 報酬は“あえて上に寄せて”登る価値を作る（最初の報酬は管理職＝マネージャー以上）。
+# 解放xpは各ランクの閾値に一致させ、補助者層(0〜500)にはパークを置かない。
+PERK_MYMAID_XP    = 1_000   # マネージャー（管理職入り・最初の褒美）: 専属メイド人格
+PERK_CALLME_XP    = 2_000   # シニアマネージャー: メイドにどう呼ばれたいか設定
+PERK_MEMORY_XP    = 4_000   # エグゼクティブ: 思い出してくれる記憶が増える(3→5)
+PERK_MAIDTITLE_XP = 7_000   # シニアエグゼクティブ: メイドが二つ名を授ける
+PERK_HONORIFIC_XP = 12_000  # プラチナム（幹部層）: 特別な敬称＋さらに記憶力(5→7)
+PERK_ELITE_XP     = 75_000  # ダイヤモンド（上級執行部）: 称号フレーム＋最上級の待遇
+RANK_PERKS = [
+    {"xp": PERK_MYMAID_XP,    "name": "専属メイド人格", "desc": "/mymaid で、自分への返信だけ好きな人格にできる"},
+    {"xp": PERK_CALLME_XP,    "name": "メイドの呼び方", "desc": "/callme で、メイドにどう呼ばれたいか指定できる"},
+    {"xp": PERK_MEMORY_XP,    "name": "記憶力アップ",   "desc": "メイドが会話で思い出してくれる記憶が増える"},
+    {"xp": PERK_MAIDTITLE_XP, "name": "二つ名の授与",   "desc": "/maidtitle で、メイドがあなたに二つ名を授ける"},
+    {"xp": PERK_HONORIFIC_XP, "name": "幹部の待遇",     "desc": "メイドが特別な敬称で扱う＋さらに記憶力アップ"},
+    {"xp": PERK_ELITE_XP,     "name": "別格の待遇",     "desc": "プロフィールに層の称号＋メイドが最上級に扱う"},
+]
+
+def next_perk(xp: int) -> dict | None:
+    """まだ解放していない直近のパーク（プレビュー用）。全解放済みなら None。"""
+    return next((p for p in RANK_PERKS if xp < p["xp"]), None)
+
+def memory_topk(xp: int) -> int:
+    """記憶想起数。職階が上がるほど多く思い出す（記憶力アップ・幹部待遇で段階的に増加）。"""
+    if xp >= PERK_HONORIFIC_XP:
+        return 7
+    if xp >= PERK_MEMORY_XP:
+        return 5
+    return 3
+
 # --- ブースター設定 ---
 BOOSTER_ROLE_ID       = 1420309723273756704
 BOOSTER_XP_MULTIPLIER = 1.5
@@ -1587,20 +1637,8 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
 
 async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "", extra_context: str = "") -> tuple[str, dict]:
     """プロンプトとpersonalityを返す。全ユーザー共通でブースター品質のプロンプトを使用。"""
-    personality_key = await get_server_personality()
-    personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
-
-    # 全ユーザー共通: butler_historyを使用（旧nonbooster_historyからのマイグレーション済み）
-    history = await get_butler_history(uid)
-    base_prompt = personality["booster_prompt"].format(
-        name=display_name,
-        history=format_history(history),
-        content=content,
-    )
-
-    # ユーザー情報・サーバー要約をプロンプト先頭に付加
-    # memories.embedding は重い(各3072次元)＆ここでは使わないので射影で除外。
-    # 関連記憶は search_memories() が別途取得する。
+    # ユーザー情報を先に取得（専属メイド人格などランク連動パークを人格決定に使うため）。
+    # memories.embedding は重い(各3072次元)＆ここでは使わないので射影で除外。関連記憶は search_memories() が別途取得する。
     try:
         user_doc = await users_col.find_one(
             {"_id": uid}, {"memories.embedding": 0}
@@ -1611,6 +1649,22 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
 
     xp       = user_doc.get("xp", 0)
     title    = user_doc.get("title", "")
+
+    # 人格: 既定はサーバー共通。ただし専属メイド人格(職階500で解放)を設定済みの人は個人オーバーライド。
+    # サーバー共通のbotニックネームは変えず、この人への返信だけ口調・アイコンが変わる（仕様）。
+    personality_key = await get_server_personality()
+    _ov = user_doc.get("persona_override")
+    if _ov in PERSONALITIES and xp >= PERK_MYMAID_XP:
+        personality_key = _ov
+    personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+
+    # 全ユーザー共通: butler_historyを使用（旧nonbooster_historyからのマイグレーション済み）
+    history = await get_butler_history(uid)
+    base_prompt = personality["booster_prompt"].format(
+        name=display_name,
+        history=format_history(history),
+        content=content,
+    )
     # profileはブースター由来の詳細情報。なければsimple_profileで補完
     profile  = user_doc.get("profile", {})
     sp       = user_doc.get("simple_profile", {})
@@ -1666,6 +1720,28 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         parts.append("【このチャンネルの直前の会話（文脈として参照せよ）】\n" + channel_context)
     if profile_text:
         parts.append(profile_text)
+
+    # ランク連動の関係性パーク: 職階の「層」が上がるほどメイドの“内心の評価”が深まる（職階に深い意味）。
+    # ★最優先の鉄則: これは内心の評価の方向性。人格の芸風（挑発なら見下し口調等）は絶対に崩さず、
+    #   その芸風の範囲で滲ませること。決して人格に反する口調（挑発メイドが急に敬語等）にするな。
+    _tier = get_rank_tier(xp)
+    _rel = [
+        f"この主人の現在の職階は「{rank_name}」（{_tier['name']}）。職階はこのサーバーでの積み重ね・信頼の証。",
+        f"あなたの内心での評価の方向性: {_tier['treat']}",
+    ]
+    _callname = user_doc.get("maid_callname")
+    if _callname and xp >= PERK_CALLME_XP:
+        _rel.append(
+            f"この主人は「{_callname}」と呼ばれたい人。基本はそう呼べ"
+            "（人格固有の煽り呼称がある場合は、その呼び方と自然に混ぜてよい）。"
+        )
+    if xp >= PERK_HONORIFIC_XP:
+        _rel.append("この主人は幹部以上の別格の存在。人格の芸風は保ちつつ、特別な敬称や一段上の特別扱いを滲ませてよい。")
+    parts.append(
+        "【この主人との関係性（内心の評価に反映せよ・口調や芸風は人格設定を絶対優先し崩すな）】\n"
+        + "\n".join(_rel)
+    )
+
     if bf_directives:
         parts.append(
             "【この相手への接し方（性格傾向より・口調や芸風は人格設定を優先し崩すな）】\n" + bf_directives
@@ -1680,7 +1756,7 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
 
     # memories（全人格）: Vector Searchで関連記憶を取得
     try:
-        related_memories = await search_memories(uid, content, top_k=3)
+        related_memories = await search_memories(uid, content, top_k=memory_topk(xp))
         if related_memories:
             mem_lines = "\n".join(
                 f"・{m['content']}（{m.get('date','不明')}頃）"
@@ -2099,6 +2175,21 @@ async def update_member_role(member: discord.Member, current_xp: int, channel=No
             embed.add_field(name="現在の職階", value=f"**{applicable_rank['name']}**", inline=True)
             embed.add_field(name="総XP",       value=f"**{current_xp:,} XP**",           inline=True)
             embed.add_field(name="次の目標",   value=next_info,                           inline=False)
+            # ランク連動パーク: この昇格で解放された機能と、次に解放される機能を見せて動機づける。
+            unlocked_now = next((p for p in RANK_PERKS if p["xp"] == applicable_rank["xp"]), None)
+            if unlocked_now:
+                embed.add_field(
+                    name="🔓 解放された機能",
+                    value=f"**{unlocked_now['name']}**\n{unlocked_now['desc']}",
+                    inline=False,
+                )
+            _np = next_perk(current_xp)
+            if _np:
+                embed.add_field(
+                    name="🔜 次に解放",
+                    value=f"あと **{_np['xp'] - current_xp:,} XP** で『{_np['name']}』",
+                    inline=False,
+                )
             embed.set_thumbnail(url=member.display_avatar.url)
             if channel:
                 try:
@@ -2533,18 +2624,30 @@ async def rank_cmd(interaction: discord.Interaction, member: discord.Member = No
     bump_count = user_data.get("bump_count", 0)
     rank_name, current_floor, next_floor, progress = get_rank_info(xp)
 
+    tier  = get_rank_tier(xp)
     bar   = "█" * (progress // 10) + "░" * (10 - progress // 10)
     embed = discord.Embed(title=f"📊 {target.display_name} のステータス", color=0x3498DB)
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="二つ名", value=f"**{title}**",      inline=False)
-    embed.add_field(name="職階",   value=f"**{rank_name}**",  inline=True)
-    embed.add_field(name="総XP",   value=f"**{xp:,}**",       inline=True)
-    embed.add_field(name="Bump数", value=f"**{bump_count}**", inline=True)
+    embed.add_field(name="二つ名", value=f"**{title}**",                       inline=False)
+    embed.add_field(name="職階",   value=f"**{rank_name}**\n{tier['emoji']} {tier['name']}", inline=True)
+    embed.add_field(name="総XP",   value=f"**{xp:,}**",                        inline=True)
+    embed.add_field(name="Bump数", value=f"**{bump_count}**",                  inline=True)
     embed.add_field(
         name=f"次の職階まで ({progress}%)",
         value=f"`{bar}` {xp - current_floor:,} / {next_floor - current_floor:,} XP",
         inline=False,
     )
+    # ランク連動パーク: 解放済み機能と次の解放を見せて、昇格に意味を持たせる。
+    _unlocked = [p["name"] for p in RANK_PERKS if xp >= p["xp"]]
+    if _unlocked:
+        embed.add_field(name="解放済みのメイド機能", value="・" + "\n・".join(_unlocked), inline=False)
+    _np = next_perk(xp)
+    if _np:
+        embed.add_field(
+            name="🔜 次に解放される機能",
+            value=f"あと **{_np['xp'] - xp:,} XP** で『{_np['name']}』\n{_np['desc']}",
+            inline=False,
+        )
     await interaction.response.send_message(embed=embed)
 
 
@@ -2647,6 +2750,112 @@ async def introduce_cmd(interaction: discord.Interaction):
     ch = client.get_channel(target_id) or interaction.channel
     await ch.send(f"{persona['icon']} {text}")
     await interaction.followup.send("挑発メイドを紹介したよ😏", ephemeral=True)
+
+
+@client.tree.command(name="callme", description="メイドにどう呼ばれたいか設定する（職階シニアマネージャーで解放）")
+@app_commands.describe(name="呼ばれたい呼び方（例: お兄ちゃん、先生）。空にすると解除")
+async def callme_cmd(interaction: discord.Interaction, name: str = ""):
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}) or {}
+    xp  = doc.get("xp", 0)
+    if xp < PERK_CALLME_XP:
+        await interaction.response.send_message(
+            f"この機能はまだロック中だよ。あと **{PERK_CALLME_XP - xp:,} XP**（シニアマネージャー）で"
+            "『メイドの呼び方』が解放される！",
+            ephemeral=True,
+        )
+        return
+    name = name.strip()
+    if len(name) > 12:
+        await interaction.response.send_message("呼び方は12文字以内にしてね！", ephemeral=True)
+        return
+    if not name:
+        await users_col.update_one({"_id": uid}, {"$unset": {"maid_callname": ""}}, upsert=True)
+        await interaction.response.send_message("呼び方の設定を解除したよ。これからは普通に呼ぶね。", ephemeral=True)
+        return
+    await users_col.update_one(
+        {"_id": uid}, {"$set": {"maid_callname": name, "name": interaction.user.name}}, upsert=True
+    )
+    await interaction.response.send_message(
+        f"これからは **「{name}」** って呼ぶね！（メイドとの会話に反映されるよ）", ephemeral=True
+    )
+
+
+@client.tree.command(name="mymaid", description="自分専用のメイド人格を選ぶ（職階マネージャーで解放）")
+async def mymaid_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}) or {}
+    xp  = doc.get("xp", 0)
+    if xp < PERK_MYMAID_XP:
+        await interaction.response.send_message(
+            f"この機能はまだロック中だよ。あと **{PERK_MYMAID_XP - xp:,} XP**（マネージャー＝管理職）で"
+            "『専属メイド人格』が解放される！",
+            ephemeral=True,
+        )
+        return
+    cur       = doc.get("persona_override")
+    cur_label = PERSONALITIES[cur]["label"] if cur in PERSONALITIES else "サーバー共通（未設定）"
+    embed = discord.Embed(
+        title="🎀 専属メイド人格",
+        description=(
+            f"今のあなた専用の人格: **{cur_label}**\n\n"
+            "あなたへの返信だけ、選んだ人格になるよ（サーバー全体は変わらない）。\n下から選んでね。"
+        ),
+        color=0xFF69B4,
+    )
+    view = MyMaidView(invoker=interaction.user)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@client.tree.command(name="maidtitle", description="メイドにあなたの二つ名を授けてもらう（職階シニアエグゼクティブで解放）")
+async def maidtitle_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    doc = await users_col.find_one({"_id": uid}) or {}
+    xp  = doc.get("xp", 0)
+    if xp < PERK_MAIDTITLE_XP:
+        await interaction.response.send_message(
+            f"この機能はまだロック中だよ。あと **{PERK_MAIDTITLE_XP - xp:,} XP**（シニアエグゼクティブ）で"
+            "『二つ名の授与』が解放される！",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer()
+    profile = doc.get("profile", {}) or {}
+    sp      = doc.get("simple_profile", {}) or {}
+    rank_name, _, _, _ = get_rank_info(xp)
+    hints = []
+    if profile.get("personality"): hints.append(f"性格: {profile['personality']}")
+    if profile.get("interests_vibe"): hints.append(f"関心: {profile['interests_vibe']}")
+    if profile.get("tone"): hints.append(f"口調: {profile['tone']}")
+    if sp.get("vibe"): hints.append(f"雰囲気: {sp['vibe']}")
+    hint_text = "\n".join(hints) if hints else "（特筆データなし）"
+
+    personality_key = await get_server_personality()
+    personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+    prompt = f"""あなたはこのサーバーのメイドです。主人「{interaction.user.display_name}」（職階: {rank_name}）に、
+その人らしさを表す「二つ名」を授けてください。
+
+【主人の情報】
+{hint_text}
+
+【ルール】
+- 二つ名のみを出力（前置き・説明・かぎ括弧・絵文字なし）
+- 12文字以内。中二病的でかっこいい、またはその人らしい語感
+- 例:「夜陰の戦術家」「不屈の探求者」「気まぐれな閃光」"""
+    title = await _run_ai_booster(prompt)
+    title = (title or "").strip().strip("「」\"'　 ")[:20]
+    if not title or "（" in title:
+        await interaction.followup.send("……うまく思い浮かばなかった。もう一度試してみて。", ephemeral=True)
+        return
+    await users_col.update_one(
+        {"_id": uid}, {"$set": {"title": title, "name": interaction.user.name}}, upsert=True
+    )
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if member:
+        await apply_nickname(member, title)
+    await interaction.followup.send(
+        f"{personality['icon']} {interaction.user.mention} ……あなたに二つ名を授けよう。\n# 「{title}」"
+    )
 
 
 @client.tree.command(name="myprofile", description="AIが記憶しているあなたの情報を確認する")
@@ -4284,6 +4493,60 @@ class PersonalityView(discord.ui.View):
                 await self.message.edit(view=self)
             except Exception:
                 pass
+
+
+class MyMaidView(discord.ui.View):
+    """/mymaid 用: 自分専用のメイド人格(persona_override)を選ぶ。サーバー共通には影響しない。"""
+    def __init__(self, invoker: discord.Member | discord.User | None = None):
+        super().__init__(timeout=60)
+        self.invoker = invoker
+        for key, data in PERSONALITIES.items():
+            btn = discord.ui.Button(
+                label=data["label"],
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"mymaid_{key}",
+            )
+            btn.callback = self._make_callback(key)
+            self.add_item(btn)
+        reset = discord.ui.Button(
+            label="🔄 サーバー共通に戻す",
+            style=discord.ButtonStyle.danger,
+            custom_id="mymaid_reset",
+        )
+        reset.callback = self._make_callback(None)
+        self.add_item(reset)
+
+    def _make_callback(self, key: str | None):
+        async def callback(interaction: discord.Interaction):
+            # 個人設定なので本人のみ操作可
+            if self.invoker and interaction.user.id != self.invoker.id:
+                await interaction.response.send_message(
+                    "これは他の人の設定パネルだよ。自分で /mymaid を使ってね。", ephemeral=True
+                )
+                return
+            uid = str(interaction.user.id)
+            if key is None:
+                await users_col.update_one({"_id": uid}, {"$unset": {"persona_override": ""}}, upsert=True)
+                desc = "専属人格を解除して、サーバー共通の人格に戻したよ。"
+            else:
+                await users_col.update_one(
+                    {"_id": uid},
+                    {"$set": {"persona_override": key, "name": interaction.user.name}},
+                    upsert=True,
+                )
+                desc = (
+                    f"あなた専用のメイドを **{PERSONALITIES[key]['label']}** にしたよ！\n"
+                    "あなたへの返信だけこの人格になる（サーバー全体は変わらない）。"
+                )
+            for item in self.children:
+                item.disabled = True
+            embed = discord.Embed(title="🎀 専属メイド人格を更新", description=desc, color=0xFF69B4)
+            await interaction.response.edit_message(embed=embed, view=self)
+        return callback
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
 
 
 class LuckyTitleView(discord.ui.View):
