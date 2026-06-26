@@ -1492,7 +1492,11 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
         print(f"[WARN] _build_prompt get_nickname_map失敗: {e}")
         nick_map = {}
 
+    now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     parts = []
+    parts.append(
+        f"【現在日時】{now_jst.strftime('%Y年%m月%d日 %H:%M')}（JST）"
+    )
     parts.append(
         "【応答時の情報優先度】\n"
         "① 直近の話題・感情の波（最優先）\n"
@@ -1532,7 +1536,22 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     if smart_summary:
         parts.append("【サーバーの最新状況（優先度順）】\n" + smart_summary)
 
-    prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt if parts else base_prompt
+    # 人格プロンプトの直後（生成に最も近い位置＝recency で最優先）に置く誠実さルール。
+    # 小型モデルでも効くよう、日付と反ハルシネーションは末尾でも再掲する。
+    honesty = (
+        "【応答の鉄則（人格設定より優先）】\n"
+        f"- 今日は{now_jst.strftime('%Y年%m月%d日')}（JST）。年・日付の話題は必ずこれを基準にせよ。"
+        "聞かれてもいない年を勝手に持ち出すな。\n"
+        "- 上に挙げた資料（直前の会話・会話履歴・過去の記憶・サーバー要約）に無い固有名詞・"
+        "出来事・数字を、事実であるかのように断定するな。確証がなければ創作せず、"
+        "「正確には分かりません／覚えていません」と述べよ。\n"
+        "- あなたはログ全文検索や全期間の集計・総括はできない。「抽出します」「総括します」"
+        "など能力外のことを約束するな。年間・月間のまとめや過去の振り返りを求められたら、"
+        "手元の情報で答えられる範囲だけ答え、"
+        "「正確な総括は /report（特定の日は /retroreport）をご利用ください」と案内せよ。\n"
+        "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。"
+    )
+    prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt + "\n\n" + honesty
     return prompt, personality
 
 
