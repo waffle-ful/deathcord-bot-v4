@@ -2001,11 +2001,34 @@ system_col     = db["system"]
 summaries_col  = db["summaries"]
 messages_col   = db["messages"]         # Phase 1: messages蓄積用
 killswitch_col = db["killswitch_snapshots"]   # キルスイッチ復旧スナップショット
+interaction_dedup_col = db["interaction_dedup"]  # スラッシュコマンドの二重応答防止（インスタンス跨ぎ）
+
+
+class DedupCommandTree(app_commands.CommandTree):
+    """全スラッシュコマンドの前段で interaction.id を MongoDB に1回だけ「確保」する。
+    同一インタラクションが複数回配信される場合（Gateway resume／デプロイ時に旧新2プロセスが
+    一時共存）でも、最初に確保したプロセスのみがコマンドを実行し、二重応答を防ぐ。
+    ※ユーザーの二度押しは別々のidになるため誤ってブロックしない（＝再配信だけを弾く）。"""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            await interaction_dedup_col.insert_one({
+                "_id": str(interaction.id),
+                "ts":  datetime.datetime.now(datetime.timezone.utc),
+            })
+            return True
+        except DuplicateKeyError:
+            print(f"[dedup] 重複インタラクション {interaction.id} をスキップ（再配信/多重インスタンス）")
+            return False
+        except Exception as e:
+            # Mongo不調でコマンド全体を止めないよう、確保失敗時は許可側に倒す
+            print(f"[WARN] interaction dedup失敗（許可で続行）: {e}")
+            return True
+
 
 class MyBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.all())
-        self.tree = app_commands.CommandTree(self)
+        self.tree = DedupCommandTree(self)
 
     async def setup_hook(self):
         print("[INFO] インデックス作成中...")
@@ -2018,6 +2041,10 @@ class MyBot(discord.Client):
         )
         await messages_col.create_index(
             "created_at", name="ttl_30d", expireAfterSeconds=30*24*3600, background=True
+        )
+        # インタラクション重複排除レコードは短命でよい（1時間でTTL削除）
+        await interaction_dedup_col.create_index(
+            "ts", name="ttl_1h", expireAfterSeconds=3600, background=True
         )
         # ギルドsync（即時反映）: グローバルsyncは最大1時間かかるためギルド指定に変更
         guild = discord.Object(id=HOME_GUILD_ID)
@@ -2721,14 +2748,27 @@ async def set_title_cmd(interaction: discord.Interaction, title: str):
     await interaction.response.send_message(msg)
 
 
+_maid_cmd_inflight: set[str] = set()  # /maid 処理中のユーザー（連打＝多重応答の防止）
+
+
 @client.tree.command(name="maid", description="メイドに話しかける（メンションでも会話できます）")
 @app_commands.describe(message="メイドに伝えたいこと")
 async def maid_cmd(interaction: discord.Interaction, message: str):
-    # /maid 二重応答の切り分け用ログ: 同一idが2回=再配信/2インスタンス、別idが2回=二重送信、
-    # ログ1回で2通見える=defer+followupの表示問題。次の発生時にこのログで原因を確定する。
-    print(f"[maid_cmd] interaction.id={interaction.id} user={interaction.user.id}")
-    await interaction.response.defer()
-    await maid_respond_cmd(interaction, message)
+    uid = str(interaction.user.id)
+    # 連打対策: /maid はキューを通さず直接実行するため、返信に数秒かかる間に連打されると
+    # その都度ちゃんと別インタラクションが起動して多重応答になる。同一ユーザーが処理中の間は
+    # 新規をはじく（本人だけに見えるephemeralで案内）。
+    if uid in _maid_cmd_inflight:
+        await interaction.response.send_message(
+            "メイドはまだ前のお返事を考えてるよ…少し待ってね🍵", ephemeral=True
+        )
+        return
+    _maid_cmd_inflight.add(uid)
+    try:
+        await interaction.response.defer()
+        await maid_respond_cmd(interaction, message)
+    finally:
+        _maid_cmd_inflight.discard(uid)
 
 
 @client.tree.command(name="personality", description="メイドの性格を変更する（全員使用可）")
