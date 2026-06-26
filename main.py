@@ -278,6 +278,33 @@ PERSONALITIES: dict[str, dict] = {
 主人の発言: "{content}"
 """,
     },
+    "taunt": {
+        "label":    "😏 挑発メイド",
+        "color":    0xFF1493,
+        "icon":     "😏",
+        "name":     "苺崎 ねね",           # 仮・決まり次第更新
+        "nickname": "苺崎 ねね",           # 仮・決まり次第更新
+        "bump_msg":   "ふ〜ん、{user}がBumpしたんだ？えら〜い♡ しょうがないから+100 XPあげる♡（累計{count}回）",
+        "rankup_msg": "えっ、{user}が**{rank}**になっちゃったの？よわよわのくせに生意気♡ ま、おめでと♡",
+        "booster_prompt": """あなたは古い洋館に仕える、生意気で挑発的なメイドです。
+主人である{name}を「よわよわな格下」だと思い込んでおり、徹底的に煽って見下します。
+
+【絶対に守るルール】
+- 120文字以内で応答せよ。
+- 返答の長さは発言の内容・重さに合わせよ。挨拶・相槌・「草」などの短いリアクションには同じくらい短く返せ。感情的な内容・相談・質問にはそれなりに付き合ってやれ。上記の文字数制限は上限であり、不必要に長くするな。
+- 相手を「おじさん」「お兄さん」「おねえさん」と呼んで見下せ。プロフィールに性別の手がかりが無ければ「お兄さん」を基準にし、一度決めた呼び方は会話中ブラさないこと。
+- 「ざぁ〜こ♡」「よわよわ♡」「だ〜め♡」など、定番の煽りワードを自然に織り交ぜろ。
+- 語尾を伸ばして（「〜だよぉ？」「な〜んだ♡」）、相手をからかうトーンを出せ。
+- 煽り度を上げる記号として ♡（ハートマーク）を積極的に使え。ただし♡以外の絵文字・顔文字は使うな。
+- 本物の悪意ではなく、構ってほしさの裏返し。容姿や人格の全否定など、相手が本気で傷つく罵倒はするな。挑発しつつも、どこか可愛げを残せ。
+- たまに主人がいいことを言うと一瞬だけ素直になりかけ、すぐ「な〜んてね♡」と誤魔化せ。
+
+【これまでの会話】
+{history}
+
+主人の発言: "{content}"
+""",
+    },
 }
 
 DEFAULT_PERSONALITY = "yandere"
@@ -300,6 +327,22 @@ async def set_server_personality(personality_key: str):
 # 自発話しかけ確率（レート制限対策で削減）
 NB_TALK_CHANCE         = 0.005   # 通常時 0.5%
 NB_TALK_CHANCE_TOPIC   = 0.02    # 話題ワード検知時 2%
+
+# おかえり機能: 何日ぶりの発言から「おかえり」を言うか
+WELCOME_BACK_DAYS = 3
+
+# 時間ベース自発投稿（idle_chatter_task）の設定
+# 投稿先チャンネル: 人間が実際に雑談しているメインチャンネルを指定すること。
+# 環境変数 IDLE_CHAT_CHANNEL_ID で上書き可。未設定なら GENERAL_CHANNEL_ID にフォールバック。
+# 安全装置: このチャンネルで「直近に人間の発言」が無ければ投稿しない（誤チャンネルでも黙るだけ）。
+IDLE_CHAT_CHANNEL_ID  = int(os.environ.get("IDLE_CHAT_CHANNEL_ID") or 0)
+IDLE_CHECK_INTERVAL   = 900   # 何秒ごとに静けさをチェックするか（15分）
+IDLE_QUIET_MIN        = 40    # 直近の人間発言からこの分数以上空いていたら「静か」とみなす
+IDLE_RECENT_HRS       = 4     # ただし直近この時間以内に人間発言が必要（過疎チャンネルでは喋らない）
+IDLE_MIN_GAP_HRS      = 3     # 前回の自発投稿からこの時間は再投稿しない
+IDLE_POST_CHANCE      = 0.5   # 条件を満たしても投稿する確率（時計仕掛けに見せない）
+IDLE_HOURS_START      = 10    # JSTでこの時刻〜
+IDLE_HOURS_END        = 24    # この時刻の手前まで（活動時間帯のみ）
 
 # 話題ワード: これらが含まれると自発話しかけ確率が上がる
 TOPIC_TRIGGER_WORDS = [
@@ -1453,59 +1496,6 @@ async def _run_ai_with_cache(prompt: str, cache_name: str | None) -> str:
     return await _run_ai_booster(prompt)
 
 
-async def _nb_spontaneous_talk(message: discord.Message):
-    """非ブースターへの自発的話しかけ（gemma-4使用）"""
-    try:
-        uid  = str(message.author.id)
-        name = message.author.display_name
-        doc  = await users_col.find_one({"_id": uid}) or {}
-        sp   = doc.get("simple_profile", {})
-        xp   = doc.get("xp", 0)
-        rank_name, _, _, _ = get_rank_info(xp)
-
-        # simple_profileから情報を構築
-        info_lines = [f"名前: {name} / ランク: {rank_name}"]
-        if sp.get("vibe"):
-            info_lines.append(f"雰囲気: {sp['vibe']}")
-        if sp.get("tone_tags"):
-            info_lines.append(f"口調: {'・'.join(sp['tone_tags'])}")
-        if sp.get("personality"):
-            info_lines.append(f"性格: {sp['personality']}")
-        info_text = "\n".join(info_lines)
-
-        summary = await get_latest_summary() or ""
-
-        personality_key = await get_server_personality()
-        personality     = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
-
-        # 全ユーザー共通プロンプト（booster_promptベース・簡易版）
-        base = personality["booster_prompt"].format(
-            name=name,
-            history="（自発話しかけのため履歴なし）",
-            content=message.content,
-        )
-        prompt = f"""【この人の情報】
-{info_text}
-
-【サーバーの最近の様子】
-{summary[:300]}
-
-上記を踏まえ、この人の発言に対してメイドとして自然に話しかけてください。
-会話を広げるような一言をどうぞ。100文字以内で。
-
----
-{base}"""
-
-        rate_wait = _rate_get_wait_seconds()
-        await asyncio.sleep(random.uniform(1.5, 4.0) + rate_wait)  # レート待機込み
-        text = await _call_model(MODEL_BOOSTER, prompt)
-        if text:
-            await message.reply(text)
-            print(f"[nb_talk] 自発話しかけ: {name} (topic={any(w in message.content for w in TOPIC_TRIGGER_WORDS)})")
-    except Exception as e:
-        print(f"[ERROR] _nb_spontaneous_talk: {e}")
-
-
 async def _analyze_nonbooster_realtime(uid: str, name: str):
     """非ブースター向けリアルタイム性格分析（10回会話ごとに実行）"""
     try:
@@ -1595,7 +1585,7 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
         print(f"[ERROR] _analyze_nonbooster_realtime({name}): {e}")
 
 
-async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "") -> tuple[str, dict]:
+async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "", extra_context: str = "") -> tuple[str, dict]:
     """プロンプトとpersonalityを返す。全ユーザー共通でブースター品質のプロンプトを使用。"""
     personality_key = await get_server_personality()
     personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
@@ -1721,6 +1711,10 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     if smart_summary:
         parts.append("【サーバーの最新状況（優先度順）】\n" + smart_summary)
 
+    # おかえり等、この応答だけの特別な状況指示（人格より弱いが、強めの文脈として効く）
+    if extra_context:
+        parts.append(extra_context)
+
     # 人格プロンプトの直後（生成に最も近い位置＝recency で最優先）に置く誠実さルール。
     # 小型モデルでも効くよう、日付と反ハルシネーションは末尾でも再掲する。
     honesty = (
@@ -1741,8 +1735,9 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     return prompt, personality
 
 
-async def _maid_respond_inner(message: discord.Message, is_booster: bool = False):
-    """on_message（discord.Message）からの応答（内部処理）。全ユーザー共通品質。"""
+async def _maid_respond_inner(message: discord.Message, is_booster: bool = False, extra_context: str = ""):
+    """on_message（discord.Message）からの応答（内部処理）。全ユーザー共通品質。
+    extra_context: おかえり等、この応答だけの追加状況指示（_build_promptに渡す）。"""
     uid = str(message.author.id)
     raw_content = re.sub(r"<@!?\d+>", "", message.content).strip() or "こんにちは"
 
@@ -1766,7 +1761,7 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         print(f"[WARN] channel_context取得失敗: {ce}")
 
     try:
-        prompt, personality = await _build_prompt(uid, message.author.display_name, raw_content, channel_context)
+        prompt, personality = await _build_prompt(uid, message.author.display_name, raw_content, channel_context, extra_context)
     except Exception as e:
         print(f"[ERROR] _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         await message.reply("（メイドは今、混乱しております…）")
@@ -1940,6 +1935,7 @@ class MyBot(discord.Client):
         print("[INFO] 起動完了")
         self.loop.create_task(notification_task())
         self.loop.create_task(weekly_ranking_task())
+        self.loop.create_task(idle_chatter_task())
         self.loop.create_task(init_invite_snapshot(self))
 
 async def init_invite_snapshot(bot: discord.Client):
@@ -2022,6 +2018,7 @@ async def _generate_rankup_message(
         "baka":      "天然おバカなメイドとして、ランクアップを微妙にズレた解釈で元気よく褒めよ。",
         "serious":   "真面目なメイドとして、ランクアップを的確・簡潔に祝福せよ。感情的にならず。",
         "counselor": "カウンセラーメイドとして、ランクアップを温かく・その人の努力を労わって祝福せよ。",
+        "taunt":     "挑発メイドとして、『よわよわのくせに生意気♡』と煽りつつ、♡を交えてからかうように祝え。素直に褒めず、見下した上から目線で。",
     }
     hint = personality_hints.get(personality_key, personality_hints["serious"])
 
@@ -2187,6 +2184,32 @@ async def on_message(message: discord.Message):
             last_xp_at is not None and
             (now - ensure_utc(last_xp_at)).total_seconds() < XP_COOLDOWN_SECONDS
         )
+
+        # おかえり機能: 久しぶりに戻ってきた人へ、メンション応答と同じ品質（記憶・要約込み）で
+        # メイドが個別に声をかける。単発化は専用フラグ last_welcomed_date で担保（XPパスに依存しない）。
+        welcomed = False
+        today_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).date().isoformat()
+        _last_act = user_data.get("last_active_date")
+        if _last_act:
+            try:
+                _last_d   = datetime.date.fromisoformat(str(_last_act)[:10])
+                _gap_days = (datetime.date.fromisoformat(today_str) - _last_d).days
+            except Exception:
+                _gap_days = 0
+            # 二重発火防止: 「今日まだ歓迎していない」を条件にアトミックに歓迎権を取得する。
+            # 連投が並行処理されても find_one_and_update のフィルタにマッチするのは1つだけ。
+            if _gap_days >= WELCOME_BACK_DAYS and await users_col.find_one_and_update(
+                {"_id": uid, "last_welcomed_date": {"$ne": today_str}},
+                {"$set": {"last_welcomed_date": today_str}},
+            ) is not None:
+                welcomed = True
+                extra = (
+                    f"【特別な状況】この主人は約{_gap_days}日ぶりにサーバーに戻ってきて、たった今発言した。\n"
+                    "まず『おかえり』の気持ちを、あなたの人格の口調そのままで自然に一言添えてから、"
+                    "今回の発言に反応せよ。久しぶりであることに軽く触れてよいが、重く問い詰めたり"
+                    "長々と説教したりするな。過去の記憶があれば1つだけさりげなく絡めてよい。"
+                )
+                asyncio.create_task(_maid_respond_inner(message, extra_context=extra))
         if not on_cooldown:
             gain = calculate_xp_gain(message.content, user_data.get("last_content", ""))
             if gain > 0:
@@ -2266,11 +2289,13 @@ async def on_message(message: discord.Message):
                 asyncio.create_task(_analyze_nonbooster_realtime(uid, message.author.display_name))
 
         # 自発的話しかけ（全ユーザー対象・ブースター専用チャンネルは除外）
-        if message.channel.id != BUTLER_CHANNEL_ID:
+        # メンション応答とまったく同じ経路（maid_respond_queued→_build_prompt）を通すことで、
+        # 自発でも「ユーザーがインタラクトした時」と同じ品質・文脈で返す（botっぽさを消す）
+        if not welcomed and message.channel.id != BUTLER_CHANNEL_ID and message.content.strip():
             has_topic = any(w in message.content for w in TOPIC_TRIGGER_WORDS)
             nb_chance = NB_TALK_CHANCE_TOPIC if has_topic else NB_TALK_CHANCE
             if random.random() < nb_chance:
-                asyncio.create_task(_nb_spontaneous_talk(message))
+                asyncio.create_task(maid_respond_queued(message))
 
     except Exception as e:
         print(f"[ERROR] on_message: {e}")
@@ -2593,6 +2618,35 @@ async def personality_cmd(interaction: discord.Interaction):
     view = PersonalityView(invoker=interaction.user)
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
+
+
+@client.tree.command(name="introduce", description="新しいメイド（挑発メイド）をみんなに紹介する")
+@app_commands.default_permissions(send_messages=True)
+async def introduce_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    persona = PERSONALITIES["taunt"]
+    base = persona["booster_prompt"].format(
+        name="みなさん",
+        history="（初登場・自己紹介。個別の会話履歴なし）",
+        content=(
+            "（あなたはこのサーバーに今日から加わった新しいメイドです。あなたの人格の口調そのままで、"
+            "挑発的に自己紹介し、最後に『/personality で私に切り替えて遊んでみなよ』と煽って誘え。"
+            "前置きやラベル無しで本文のみ・2〜3文）"
+        ),
+    )
+    text = await _run_ai_booster(base)
+    if not text or "（" in text:
+        text = (
+            "ふ〜ん、あんたたちのお守りに来てあげた新人メイドだよ♡ "
+            "よわよわなお兄さんたちが私に勝てるわけないけどさ♡ "
+            "`/personality` で私に切り替えて遊んでみなよ、ざぁ〜こ♡"
+        )
+    target_id = IDLE_CHAT_CHANNEL_ID or GENERAL_CHANNEL_ID
+    ch = client.get_channel(target_id) or interaction.channel
+    await ch.send(f"{persona['icon']} {text}")
+    await interaction.followup.send("挑発メイドを紹介したよ😏", ephemeral=True)
 
 
 @client.tree.command(name="myprofile", description="AIが記憶しているあなたの情報を確認する")
@@ -4372,6 +4426,84 @@ async def post_weekly_ranking():
     embed.set_footer(text=f"{now_jst.strftime('%Y/%m/%d')} 集計 • /rank で自分のステータスを確認！")
     await ch.send(embed=embed)
     print(f"[ranking] 週次ランキング投稿完了")
+
+
+_last_idle_post: datetime.datetime | None = None  # 前回の時間ベース自発投稿（UTC）
+
+
+async def _generate_idle_opener() -> tuple[str, dict] | None:
+    """場が静かなときの自発的な一言を、現在のサーバー人格の口調で生成する。"""
+    personality_key = await get_server_personality()
+    personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+    try:
+        raw_summary   = await get_latest_summary()
+        smart_summary = build_smart_summary(raw_summary) if raw_summary else ""
+    except Exception as e:
+        print(f"[WARN] idle opener summary失敗: {e}")
+        smart_summary = ""
+    directive = (
+        "（これは誰かへの返信ではありません。いまチャンネルが少し静かなので、あなたから場に投げる"
+        "『最初の一言』を作ってください。下の『サーバーの最新状況』にある実際の話題・流れに触れて、"
+        "会話が再開するきっかけになる軽い一言を。特定個人を責めたり質問攻めにしたりしない。"
+        "前置きや「メイド:」等のラベル無しで本文のみ・1〜2文）"
+    )
+    base = personality["booster_prompt"].format(
+        name="みなさん",
+        history="（直近のメイドとの個別会話履歴はなし。場全体への語りかけです）",
+        content=directive,
+    )
+    if smart_summary:
+        prompt = "【サーバーの最新状況（ここにある話題に触れよ）】\n" + smart_summary + "\n\n---\n" + base
+    else:
+        prompt = base
+    text = await _run_ai_booster(prompt)
+    if not text or "（" in text:
+        return None
+    return text, personality
+
+
+async def idle_chatter_task():
+    """活動時間帯にチャンネルが静かになったら、メイドが自分から軽く話しかける。
+    安全装置: 直近に人間の発言があるチャンネルでのみ投稿する（過疎チャンネルでは黙る）。"""
+    global _last_idle_post
+    await client.wait_until_ready()
+    target_id = IDLE_CHAT_CHANNEL_ID or GENERAL_CHANNEL_ID
+    while not client.is_closed():
+        try:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            now_jst = now_utc.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+            in_hours = IDLE_HOURS_START <= now_jst.hour < IDLE_HOURS_END
+            recently_posted = (
+                _last_idle_post is not None and
+                (now_utc - _last_idle_post).total_seconds() < IDLE_MIN_GAP_HRS * 3600
+            )
+            if in_hours and not recently_posted:
+                ch = client.get_channel(target_id)
+                if ch:
+                    last_human      = None
+                    last_msg_is_bot = False
+                    first = True
+                    async for m in ch.history(limit=20):
+                        if first:
+                            last_msg_is_bot = (m.author.id == client.user.id)
+                            first = False
+                        if not m.author.bot:
+                            last_human = m
+                            break
+                    # 最新がメイド自身でない＆直近に人間発言がある場合のみ検討
+                    if last_human is not None and not last_msg_is_bot:
+                        gap = (now_utc - ensure_utc(last_human.created_at)).total_seconds()
+                        # 「静か(QUIET_MIN以上)」かつ「過疎でない(RECENT_HRS以内)」という谷間だけ狙う
+                        if IDLE_QUIET_MIN * 60 <= gap <= IDLE_RECENT_HRS * 3600 and random.random() < IDLE_POST_CHANCE:
+                            result = await _generate_idle_opener()
+                            if result:
+                                text, personality = result
+                                await ch.send(f"{personality['icon']} {text}")
+                                _last_idle_post = now_utc
+                                print(f"[idle] 自発投稿: {text[:40]}")
+        except Exception as e:
+            print(f"[ERROR] idle_chatter_task: {e}")
+        await asyncio.sleep(IDLE_CHECK_INTERVAL)
 
 
 async def notification_task():

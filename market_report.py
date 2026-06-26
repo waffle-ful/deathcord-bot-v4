@@ -41,7 +41,7 @@ GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL", "")
 SUMMARY_CHANNEL_ID = os.environ.get("SUMMARY_CHANNEL_ID", "")
 BOT_TOKEN          = os.environ.get("DISCORD_BOT_TOKEN", "")
-MODEL              = "models/gemma-3-27b-it"
+MODEL              = "models/gemini-3.1-flash-lite"   # 非検索フォールバック1段目（旧 gemma-3-27b-it は現APIで404）
 MODEL_FB           = "models/gemini-2.5-flash-lite"
 MODEL_SEARCH       = "models/gemini-2.5-flash-lite"   # 検索グラウンディング用（2.5系のみ対応）
 MODEL_SEARCH_ALT   = "models/gemini-flash-lite-latest" # エイリアス（フォールバック）
@@ -185,6 +185,11 @@ def generate_ai_comment(df: pd.DataFrame, personality: str) -> str:
             "穏やかなカウンセラーメイド口調で書け。",
             "例:「日経が上がりましたね。GDP好調のニュース、少し安心できたでしょうか。"
             "でもVIXが警戒水準にあります。焦らず、長い目で見ていきましょう💙」"
+        ),
+        "taunt": (
+            "生意気で挑発的なメイド口調で書け。相手を「お兄さん」と見下し、♡を使って煽れ（♡以外の絵文字は禁止）。",
+            "例:「日経が55,239円〜？お兄さん、これくらいで浮かれちゃうの？よわよわ♡ "
+            "S&P500はちゃっかり下げてるし、VIXも23超えだよ？ちゃ〜んと見てた？ざぁ〜こ♡」"
         ),
     }
     p_instruction, p_example = personality_examples.get(
