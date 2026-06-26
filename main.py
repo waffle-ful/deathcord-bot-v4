@@ -1444,13 +1444,17 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
 async def _call_model(model: str, prompt: str) -> str:
     """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。"""
     _rate_record()  # レートリミッター記録
+    # gemma-4系は thinking 予算を出力トークンから消費するため、300では思考だけで枯れて
+    # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
+    # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
+    max_tokens = 3000 if "gemma" in model else 300
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.8,
-            max_output_tokens=300,
+            max_output_tokens=max_tokens,
         ),
     )
     text = response.text
