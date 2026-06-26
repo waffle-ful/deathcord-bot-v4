@@ -47,6 +47,21 @@ PANIC_TOKEN          = os.environ.get("PANIC_TOKEN") or ""
 # 監査ログ投稿先（任意）。0 なら print のみ
 PANIC_LOG_CHANNEL_ID = int(os.environ.get("PANIC_LOG_CHANNEL_ID") or 0)
 
+# --- モデレーション・ガード（他管理者/他botの ban・kick を検知してレビュー）設定 ---
+# ban を「発動前に」止めるのは Discord 仕様上不可能。検知→通知→ワンクリックUndo（モデルC）。
+# レビュー投稿先。未設定なら PANIC_LOG_CHANNEL_ID → CHANNEL_ID(NOTIFY) にフォールバック
+MOD_GUARD_LOG_CHANNEL_ID = int(os.environ.get("MOD_GUARD_LOG_CHANNEL_ID") or 0)
+# "0"/"false"/"no" でガード無効化（既定は有効）
+MOD_GUARD_ENABLED = (os.environ.get("MOD_GUARD_ENABLED", "1").strip().lower()
+                     not in ("0", "false", "no", ""))
+# Wick の bot user ID。Wick の ban は荒らし対策の正当banとみなし Undo を出さない（ログのみ）
+WICK_BOT_ID = int(os.environ.get("WICK_BOT_ID") or 0)
+# 信頼する実行者ID（CSV）。これらの ban/kick はログのみで Undo/招待ボタンを出さない
+GUARD_TRUSTED_IDS = {
+    int(x) for x in (os.environ.get("GUARD_TRUSTED_IDS") or "").replace(" ", "").split(",")
+    if x.isdigit()
+}
+
 # --- Gemini クライアント (新SDK) ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -2002,6 +2017,7 @@ system_col     = db["system"]
 summaries_col  = db["summaries"]
 messages_col   = db["messages"]         # Phase 1: messages蓄積用
 killswitch_col = db["killswitch_snapshots"]   # キルスイッチ復旧スナップショット
+guard_events_col = db["guard_events"]         # モデレーション・ガードのban/kick検知履歴
 interaction_dedup_col = db["interaction_dedup"]  # スラッシュコマンドの二重応答防止（インスタンス跨ぎ）
 
 
@@ -2049,9 +2065,22 @@ class MyBot(discord.Client):
         )
         # ギルドsync（即時反映）: グローバルsyncは最大1時間かかるためギルド指定に変更
         guild = discord.Object(id=HOME_GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-        print(f"[INFO] スラッシュコマンド登録完了（guild={HOME_GUILD_ID}）")
+        # sync失敗で bot 全体が落ちないよう保護（1コマンドの不正名等で全機能停止を防ぐ）。
+        # 失敗時は「旧コマンドは生きたまま・新規が未反映」に縮退し、ログにエラーを残す。
+        try:
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"[INFO] スラッシュコマンド登録完了（guild={HOME_GUILD_ID}）")
+        except Exception as e:
+            print(f"[ERROR] コマンドsync失敗（既存コマンドで継続）: {e}")
+            traceback.print_exc()
+        # モデレーション・ガード/パネルの永続UIを再登録（再接続後もボタンを有効化）
+        try:
+            self.add_dynamic_items(GuardUnbanButton, GuardInviteButton)
+            self.add_view(ModPanelView())
+            print("[INFO] mod-guard/modpanel 永続UI登録完了")
+        except Exception as e:
+            print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
         print("[INFO] 起動完了")
         self.loop.create_task(notification_task())
         self.loop.create_task(weekly_ranking_task())
@@ -4503,6 +4532,676 @@ async def _panic_web_handler(request):
         print(f"[PANIC] _panic_web_handler 例外: {e}")
         traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500)
+
+
+# =============================================================================
+# モデレーション・ガード：他管理者/他botの ban・kick を検知してレビュー（モデルC）
+#   - ban を発動前に止めることは Discord 仕様上不可能 → 検知→通知→ワンクリックUndo。
+#   - Wick の ban は既定で Undo を出さない（荒らし対策の正当banを誤解除しないため）。
+#   - 空気くん自身の操作は self-filter で除外（通知ループ防止）。
+#   - kick は巻き戻し不可（強制再参加は不可）→ 検知・通知＋招待リンク発行のみ。
+# =============================================================================
+
+
+async def _guard_find_audit_entry(guild, action, target_id, retries: int = 4, delay: float = 1.0):
+    """監査ログから target_id に対する直近の action エントリを探す。
+    on_member_ban は監査エントリ確定前に発火し得るため数回リトライする。
+    新鮮さ(30秒)で stale エントリを弾く。見つからなければ None。
+    View Audit Log 権限が無ければ静かに諦める。"""
+    if guild is None:
+        return None
+    for _ in range(max(1, retries)):
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            async for entry in guild.audit_logs(action=action, limit=8):
+                if getattr(entry.target, "id", None) != target_id:
+                    continue
+                age = (now - ensure_utc(entry.created_at)).total_seconds()
+                if age <= 30:
+                    return entry
+                # このtargetへの最新一致が古い → 新規actionは未記録。リトライへ
+                break
+        except discord.Forbidden:
+            print("[GUARD] View Audit Log 権限がありません（実行者を特定できません）")
+            return None
+        except Exception as e:
+            print(f"[GUARD] audit_logs 取得失敗: {e}")
+        await asyncio.sleep(delay)
+    return None
+
+
+def _guard_resolve_log_channel(guild):
+    """レビュー投稿先 channel を解決。優先: MOD_GUARD_LOG → PANIC_LOG → NOTIFY。"""
+    for cid in (MOD_GUARD_LOG_CHANNEL_ID, PANIC_LOG_CHANNEL_ID, NOTIFY_CHANNEL_ID):
+        if not cid:
+            continue
+        ch = guild.get_channel(cid) if guild is not None else None
+        if ch is None:
+            ch = client.get_channel(cid)
+        if ch is not None:
+            return ch
+    return None
+
+
+async def _guard_store_event(kind, guild, target, executor, reason):
+    """検知履歴を MongoDB に best-effort で保存。"""
+    try:
+        await guard_events_col.insert_one({
+            "kind": kind,
+            "guild_id": guild.id if guild else None,
+            "target_id": getattr(target, "id", None),
+            "target_name": str(target),
+            "executor_id": getattr(executor, "id", None),
+            "executor_name": str(executor) if executor else None,
+            "reason": str(reason)[:500],
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+        })
+    except Exception as e:
+        print(f"[GUARD] event保存失敗: {e}")
+
+
+async def _guard_mark_resolved(interaction: discord.Interaction, note: str):
+    """レビューembedに対応結果を追記しボタンを消す。best-effort。"""
+    try:
+        msg = interaction.message
+        embed = msg.embeds[0] if (msg and msg.embeds) else discord.Embed()
+        embed.add_field(name="対応", value=note[:1024], inline=False)
+        embed.color = 0x2ECC71
+        await msg.edit(embed=embed, view=None)
+    except Exception as e:
+        print(f"[GUARD] mark_resolved失敗: {e}")
+        try:
+            await interaction.followup.send(note, ephemeral=False)
+        except Exception:
+            pass
+
+
+class GuardUnbanButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"guard:unban:(?P<uid>\d+)",
+):
+    """ban レビューの「Undo（解除）」ボタン。custom_id に対象IDを埋め、再起動後も有効。"""
+    def __init__(self, uid: int):
+        self.uid = uid
+        super().__init__(
+            discord.ui.Button(
+                label="Undo（banを解除）",
+                style=discord.ButtonStyle.success,
+                emoji="↩️",
+                custom_id=f"guard:unban:{uid}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["uid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.ban_members:
+            await interaction.response.send_message(
+                "⛔ banを解除するには ban_members 権限が必要です。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        guild = interaction.guild
+        try:
+            await guild.unban(
+                discord.Object(id=self.uid),
+                reason=f"mod-guard Undo by {interaction.user} ({interaction.user.id})",
+            )
+            note = f"↩️ {interaction.user.mention} がbanを解除しました。"
+        except discord.NotFound:
+            note = f"ℹ️ 既にban解除済みでした（{interaction.user.mention} が確認）。"
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "⛔ 空気くんに ban_members 権限が無く解除できません。", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ 解除に失敗: {e}", ephemeral=True)
+            return
+        await _guard_mark_resolved(interaction, note)
+
+
+class GuardInviteButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"guard:invite",
+):
+    """kick レビューの「招待リンク発行」ボタン。kick は巻き戻せないため再招待用。"""
+    def __init__(self):
+        super().__init__(
+            discord.ui.Button(
+                label="招待リンクを発行",
+                style=discord.ButtonStyle.primary,
+                emoji="✉️",
+                custom_id="guard:invite",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.kick_members:
+            await interaction.response.send_message(
+                "⛔ kick_members 権限が必要です。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            target_ch = interaction.guild.system_channel or interaction.channel
+            invite = await target_ch.create_invite(
+                max_age=86400, max_uses=1, unique=True,
+                reason=f"mod-guard re-invite by {interaction.user}",
+            )
+            await interaction.followup.send(
+                "✉️ 24時間有効・1回使い切りの招待リンクです"
+                f"（kickされた人にDM等で渡してください）:\n{invite.url}",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"❌ 招待発行に失敗: {e}", ephemeral=True)
+
+
+@client.event
+async def on_member_ban(guild: discord.Guild, user):
+    """他者の ban を検知 → レビュー投稿（Wick/信頼済み/自分は除外）。"""
+    if not MOD_GUARD_ENABLED:
+        return
+    try:
+        if guild.id != HOME_GUILD_ID:
+            return
+        entry = await _guard_find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
+        executor = entry.user if entry else None
+        reason = (entry.reason if entry else None) or "（理由なし）"
+
+        # self-filter：空気くん自身のbanは通知しない（ループ防止）
+        if executor and client.user and executor.id == client.user.id:
+            return
+
+        ch = _guard_resolve_log_channel(guild)
+        if ch is None:
+            print("[GUARD] ログchannel未設定のため ban を通知できません")
+            return
+
+        is_wick = bool(WICK_BOT_ID and executor and executor.id == WICK_BOT_ID)
+        is_trusted = bool(executor and executor.id in GUARD_TRUSTED_IDS)
+        exec_label = f"{executor} (`{executor.id}`)" if executor else "不明（監査ログ取得不可）"
+
+        embed = discord.Embed(
+            title="🔨 BAN を検知",
+            color=0xE74C3C,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="対象", value=f"{user} (`{user.id}`)", inline=False)
+        embed.add_field(name="実行者", value=exec_label, inline=True)
+        embed.add_field(name="理由", value=str(reason)[:1024], inline=False)
+
+        view = None
+        if is_wick:
+            embed.color = 0x95A5A6
+            embed.add_field(
+                name="判定",
+                value="🛡️ Wick による ban → 荒らし対策の正当banとみなし Undo は出しません"
+                      "（必要なら手動で解除してください）。",
+                inline=False)
+        elif is_trusted:
+            embed.color = 0x95A5A6
+            embed.add_field(name="判定", value="✅ 信頼済み実行者のためログのみ。", inline=False)
+        elif executor is None:
+            # fail-safe：実行者を特定できない時は Undo を出さない。
+            # 荒らし時はWickの大量banで監査ログ取得が最も失敗しやすく、ここで
+            # ボタンを出すと荒らしを一括unban→空気くん自身がanti-nukeに焼かれる。
+            embed.color = 0xF1C40F
+            embed.add_field(
+                name="判定",
+                value="⚠️ 実行者を特定できませんでした（監査ログ未取得/権限不足/大量ban中）。"
+                      "誤解除防止のため Undo ボタンは出しません。不当なら手動で解除してください。",
+                inline=False)
+        else:
+            view = discord.ui.View(timeout=None)
+            view.add_item(GuardUnbanButton(user.id))
+            embed.set_footer(text="不当と思えば下のボタンで即解除できます（要 ban_members 権限）")
+
+        await ch.send(embed=embed, view=view)
+        await _guard_store_event("ban", guild, user, executor, reason)
+    except Exception as e:
+        print(f"[GUARD] on_member_ban 例外: {e}")
+        traceback.print_exc()
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    """退出を検知。監査ログに kick エントリがあれば「kick」としてレビュー投稿。
+    自主退出・ban（別途 on_member_ban で処理）・監査取得不可は無視する。"""
+    if not MOD_GUARD_ENABLED:
+        return
+    try:
+        guild = member.guild
+        if guild.id != HOME_GUILD_ID:
+            return
+        # 自主退出が大多数なので kick リトライは抑えめ（kickの監査記録は概ね即時）
+        entry = await _guard_find_audit_entry(
+            guild, discord.AuditLogAction.kick, member.id, retries=2)
+        if entry is None:
+            return  # 自主退出 or 監査取得不可 → 何もしない
+        executor = entry.user
+        if executor and client.user and executor.id == client.user.id:
+            return  # 自分のkick
+        reason = entry.reason or "（理由なし）"
+        is_wick = bool(WICK_BOT_ID and executor and executor.id == WICK_BOT_ID)
+        is_trusted = bool(executor and executor.id in GUARD_TRUSTED_IDS)
+
+        ch = _guard_resolve_log_channel(guild)
+        if ch is None:
+            return
+        exec_label = f"{executor} (`{executor.id}`)" if executor else "不明"
+
+        embed = discord.Embed(
+            title="👢 KICK を検知",
+            color=0xE67E22,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="対象", value=f"{member} (`{member.id}`)", inline=False)
+        embed.add_field(name="実行者", value=exec_label, inline=True)
+        embed.add_field(name="理由", value=str(reason)[:1024], inline=False)
+        embed.add_field(
+            name="注意",
+            value="⚠️ kick は巻き戻せません（強制再参加は不可）。"
+                  "必要なら招待リンクを発行して本人へ渡してください。",
+            inline=False)
+
+        view = None
+        if is_wick or is_trusted:
+            embed.color = 0x95A5A6
+            embed.add_field(name="判定", value="ログのみ（信頼済み/Wick）。", inline=False)
+        else:
+            view = discord.ui.View(timeout=None)
+            view.add_item(GuardInviteButton())
+
+        await ch.send(embed=embed, view=view)
+        await _guard_store_event("kick", guild, member, executor, reason)
+    except Exception as e:
+        print(f"[GUARD] on_member_remove 例外: {e}")
+        traceback.print_exc()
+
+
+@client.tree.command(name="guard_status", description="【管理者】ban/kickガードの稼働状況と権限を確認")
+@app_commands.default_permissions(administrator=True)
+async def guard_status_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("⛔ 管理者専用です。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me or await guild.fetch_member(client.user.id)
+    p = me.guild_permissions
+    ch = _guard_resolve_log_channel(guild)
+
+    def yn(b): return "✅" if b else "❌"
+
+    embed = discord.Embed(
+        title="🛡️ ban/kick ガード状況",
+        color=0x2ECC71 if MOD_GUARD_ENABLED else 0x95A5A6,
+    )
+    embed.add_field(name="有効", value=yn(MOD_GUARD_ENABLED), inline=True)
+    embed.add_field(
+        name="投稿先ch",
+        value=(ch.mention if ch else "❌ 未設定（MOD_GUARD_LOG_CHANNEL_ID等を設定）"),
+        inline=True)
+    embed.add_field(
+        name="空気くんの権限",
+        value=(f"View Audit Log {yn(p.view_audit_log)} / "
+               f"Ban {yn(p.ban_members)} / Kick {yn(p.kick_members)} / "
+               f"招待作成 {yn(p.create_instant_invite)}"),
+        inline=False)
+    embed.add_field(
+        name="Wick ID",
+        value=(f"`{WICK_BOT_ID}`（banはログのみ）" if WICK_BOT_ID else "未設定"),
+        inline=True)
+    embed.add_field(
+        name="信頼済み実行者",
+        value=(", ".join(f"`{i}`" for i in GUARD_TRUSTED_IDS) if GUARD_TRUSTED_IDS else "なし"),
+        inline=True)
+
+    try:
+        recent = await guard_events_col.find(
+            {"guild_id": guild.id}).sort("created_at", -1).limit(5).to_list(length=5)
+        if recent:
+            lines = []
+            for ev in recent:
+                icon = "🔨" if ev["kind"] == "ban" else "👢"
+                ts = ensure_utc(ev["created_at"]).astimezone(
+                    datetime.timezone(datetime.timedelta(hours=9))).strftime("%m/%d %H:%M")
+                lines.append(f"{icon} {ts} 対象`{ev.get('target_name','?')}` ← "
+                             f"実行`{ev.get('executor_name') or '不明'}`")
+            embed.add_field(name="直近の検知", value="\n".join(lines)[:1024], inline=False)
+    except Exception as e:
+        embed.add_field(name="直近の検知", value=f"取得失敗: {e}", inline=False)
+
+    if not p.view_audit_log:
+        embed.set_footer(text="⚠️ View Audit Log 権限が無いと実行者を特定できません。")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# =============================================================================
+# 統合モデレーション・パネル（v2）：分散したパネルを空気くん1つに集約
+#   - 右クリック→アプリ で BAN / Kick / タイムアウト / 警告（モーダルで理由入力）
+#   - /modpanel で常設ボタン（ch ロック切替・スローモード）を設置
+#   - 操作は空気くん自身が実行（admin保持＝Wickより上位なので階層的に確実）
+# =============================================================================
+
+_MODGUARD_JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def _parse_duration(s: str):
+    """'10m' / '1h' / '2d' / '30s' を秒に。最大28日(Discordのtimeout上限)。不正なら None。"""
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", str(s).lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    secs = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    if secs <= 0:
+        return None
+    return min(secs, 28 * 86400)
+
+
+async def _mod_can_target(interaction: discord.Interaction, member: discord.Member):
+    """対象操作の安全チェック。問題があればエラー文字列、無ければ None。"""
+    guild = interaction.guild
+    if guild is None:
+        return "サーバー内でのみ使用できます。"
+    if member.id == guild.owner_id:
+        return "サーバーオーナーは対象にできません。"
+    if client.user and member.id == client.user.id:
+        return "空気くん自身は対象にできません。"
+    me = guild.me
+    if me and member.id != me.id and member.top_role >= me.top_role:
+        return "対象が空気くんと同等以上のロールのため操作できません。"
+    return None
+
+
+async def _mod_log(guild, embed: discord.Embed):
+    """操作ログをガードと同じchへ best-effort 投稿。"""
+    try:
+        ch = _guard_resolve_log_channel(guild)
+        if ch:
+            await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[MODPANEL] ログ投稿失敗: {e}")
+
+
+class BanModal(discord.ui.Modal, title="BAN 確認"):
+    reason = discord.ui.TextInput(label="理由", required=False, max_length=400,
+                                  style=discord.TextStyle.paragraph)
+    del_days = discord.ui.TextInput(label="メッセージ削除日数(0-7)", required=False,
+                                    max_length=1, default="0")
+
+    def __init__(self, member: discord.Member):
+        super().__init__()
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            dd = max(0, min(7, int(str(self.del_days) or "0")))
+        except Exception:
+            dd = 0
+        reason = str(self.reason) or "（理由なし）"
+        try:
+            await interaction.guild.ban(
+                self.member, reason=f"{reason} | by {interaction.user}",
+                delete_message_seconds=dd * 86400)
+            await interaction.followup.send(f"🔨 {self.member} をBANしました。", ephemeral=True)
+            await _mod_log(interaction.guild, discord.Embed(
+                title="🔨 BAN（パネル操作）", color=0xE74C3C,
+                description=f"対象: {self.member} (`{self.member.id}`)\n"
+                            f"実行: {interaction.user.mention}\n理由: {reason}"))
+        except discord.Forbidden:
+            await interaction.followup.send("⛔ 権限不足でBANできません（階層を確認）。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 失敗: {e}", ephemeral=True)
+
+
+class KickModal(discord.ui.Modal, title="Kick 確認"):
+    reason = discord.ui.TextInput(label="理由", required=False, max_length=400,
+                                  style=discord.TextStyle.paragraph)
+
+    def __init__(self, member: discord.Member):
+        super().__init__()
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        reason = str(self.reason) or "（理由なし）"
+        try:
+            await interaction.guild.kick(self.member, reason=f"{reason} | by {interaction.user}")
+            await interaction.followup.send(f"👢 {self.member} をKickしました。", ephemeral=True)
+            await _mod_log(interaction.guild, discord.Embed(
+                title="👢 Kick（パネル操作）", color=0xE67E22,
+                description=f"対象: {self.member} (`{self.member.id}`)\n"
+                            f"実行: {interaction.user.mention}\n理由: {reason}"))
+        except discord.Forbidden:
+            await interaction.followup.send("⛔ 権限不足でKickできません（階層を確認）。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 失敗: {e}", ephemeral=True)
+
+
+class TimeoutModal(discord.ui.Modal, title="タイムアウト（ミュート）"):
+    duration = discord.ui.TextInput(label="期間 例: 10m / 1h / 1d（最大28d）",
+                                    required=True, max_length=8)
+    reason = discord.ui.TextInput(label="理由", required=False, max_length=400,
+                                  style=discord.TextStyle.paragraph)
+
+    def __init__(self, member: discord.Member):
+        super().__init__()
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        secs = _parse_duration(str(self.duration))
+        if secs is None:
+            await interaction.followup.send(
+                "⛔ 期間の形式が不正です（例: 10m, 1h, 2d）。", ephemeral=True)
+            return
+        reason = str(self.reason) or "（理由なし）"
+        try:
+            await self.member.timeout(datetime.timedelta(seconds=secs),
+                                      reason=f"{reason} | by {interaction.user}")
+            await interaction.followup.send(
+                f"🔇 {self.member} を {self.duration} タイムアウトしました。", ephemeral=True)
+            await _mod_log(interaction.guild, discord.Embed(
+                title="🔇 タイムアウト（パネル操作）", color=0x9B59B6,
+                description=f"対象: {self.member} (`{self.member.id}`)\n期間: {self.duration}\n"
+                            f"実行: {interaction.user.mention}\n理由: {reason}"))
+        except discord.Forbidden:
+            await interaction.followup.send("⛔ 権限不足でタイムアウトできません（階層を確認）。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 失敗: {e}", ephemeral=True)
+
+
+class WarnModal(discord.ui.Modal, title="警告"):
+    reason = discord.ui.TextInput(label="警告理由", required=True, max_length=400,
+                                  style=discord.TextStyle.paragraph)
+
+    def __init__(self, member: discord.Member):
+        super().__init__()
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        reason = str(self.reason)
+        warn_doc = {
+            "reason": reason[:400], "by_id": interaction.user.id,
+            "by_name": str(interaction.user),
+            "at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        try:
+            doc = await users_col.find_one_and_update(
+                {"_id": str(self.member.id)}, {"$push": {"mod_warnings": warn_doc}},
+                upsert=True, return_document=True)
+            count = len(doc.get("mod_warnings", [])) if doc else 1
+        except Exception as e:
+            await interaction.followup.send(f"❌ 警告の保存に失敗: {e}", ephemeral=True)
+            return
+        try:
+            await self.member.send(
+                f"⚠️ **{interaction.guild.name}** で警告を受けました（通算{count}回目）。\n理由: {reason}")
+            dm_note = ""
+        except Exception:
+            dm_note = "（DM送信不可）"
+        await _mod_log(interaction.guild, discord.Embed(
+            title="⚠️ 警告（パネル操作）", color=0xF1C40F,
+            description=f"対象: {self.member} (`{self.member.id}`)\n通算: **{count}回**\n"
+                        f"実行: {interaction.user.mention}\n理由: {reason}"))
+        await interaction.followup.send(
+            f"⚠️ 警告しました（通算{count}回）{dm_note}", ephemeral=True)
+
+
+@client.tree.context_menu(name="BAN")
+@app_commands.default_permissions(ban_members=True)
+async def ctx_ban(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("⛔ ban_members 権限が必要です。", ephemeral=True)
+        return
+    err = await _mod_can_target(interaction, member)
+    if err:
+        await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        return
+    await interaction.response.send_modal(BanModal(member))
+
+
+@client.tree.context_menu(name="Kick")
+@app_commands.default_permissions(kick_members=True)
+async def ctx_kick(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("⛔ kick_members 権限が必要です。", ephemeral=True)
+        return
+    err = await _mod_can_target(interaction, member)
+    if err:
+        await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        return
+    await interaction.response.send_modal(KickModal(member))
+
+
+@client.tree.context_menu(name="タイムアウト")
+@app_commands.default_permissions(moderate_members=True)
+async def ctx_timeout(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.moderate_members:
+        await interaction.response.send_message("⛔ moderate_members 権限が必要です。", ephemeral=True)
+        return
+    err = await _mod_can_target(interaction, member)
+    if err:
+        await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        return
+    await interaction.response.send_modal(TimeoutModal(member))
+
+
+@client.tree.context_menu(name="警告")
+@app_commands.default_permissions(kick_members=True)
+async def ctx_warn(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("⛔ kick_members 権限が必要です。", ephemeral=True)
+        return
+    if client.user and member.id == client.user.id:
+        await interaction.response.send_message("⛔ 空気くん自身は対象にできません。", ephemeral=True)
+        return
+    await interaction.response.send_modal(WarnModal(member))
+
+
+class ModPanelView(discord.ui.View):
+    """/modpanel で設置する常設パネル。操作対象は設置されたチャンネル。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _need(self, interaction: discord.Interaction, perm: str) -> bool:
+        if not getattr(interaction.user.guild_permissions, perm, False):
+            await interaction.response.send_message(f"⛔ `{perm}` 権限が必要です。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🔒 ロック切替", style=discord.ButtonStyle.danger,
+                       custom_id="modpanel:lock")
+    async def lock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._need(interaction, "manage_channels"):
+            return
+        ch = interaction.channel
+        everyone = interaction.guild.default_role
+        ow = ch.overwrites_for(everyone)
+        locked_now = ow.send_messages is False
+        ow.send_messages = None if locked_now else False
+        try:
+            await ch.set_permissions(everyone, overwrite=ow,
+                                     reason=f"modpanel lock by {interaction.user}")
+            await interaction.response.send_message(
+                f"{'🔓 解除' if locked_now else '🔒 ロック'}しました（#{ch.name}）。", ephemeral=False)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ 失敗: {e}", ephemeral=True)
+
+    @discord.ui.select(custom_id="modpanel:slowmode", placeholder="🐌 スローモードを設定…",
+                       options=[
+                           discord.SelectOption(label="オフ", value="0"),
+                           discord.SelectOption(label="5秒", value="5"),
+                           discord.SelectOption(label="15秒", value="15"),
+                           discord.SelectOption(label="60秒", value="60"),
+                           discord.SelectOption(label="5分", value="300"),
+                       ])
+    async def slowmode(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if not await self._need(interaction, "manage_channels"):
+            return
+        sec = int(select.values[0])
+        try:
+            await interaction.channel.edit(
+                slowmode_delay=sec, reason=f"modpanel slowmode by {interaction.user}")
+            await interaction.response.send_message(
+                f"🐌 スローモードを **{sec}秒**{'（オフ）' if sec == 0 else ''}に設定（#{interaction.channel.name}）。",
+                ephemeral=False)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ 失敗: {e}", ephemeral=True)
+
+
+@client.tree.command(name="modpanel", description="【管理者】モデレーション操作パネルを設置")
+@app_commands.default_permissions(manage_guild=True)
+async def modpanel_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("⛔ manage_channels 権限が必要です。", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="🛠️ モデレーション・パネル",
+        description="**このチャンネル**への操作です。\n"
+                    "🔒 ロック切替 ／ 🐌 スローモード\n\n"
+                    "ユーザー個別操作（BAN/Kick/タイムアウト/警告）は、"
+                    "**ユーザーを右クリック → アプリ** から実行できます。",
+        color=0x5865F2)
+    await interaction.channel.send(embed=embed, view=ModPanelView())
+    await interaction.response.send_message("✅ パネルを設置しました。", ephemeral=True)
+
+
+@client.tree.command(name="warnings", description="【管理者】ユーザーの警告履歴を表示")
+@app_commands.describe(user="対象ユーザー")
+@app_commands.default_permissions(kick_members=True)
+async def warnings_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not await check_home_guild(interaction):
+        return
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("⛔ kick_members 権限が必要です。", ephemeral=True)
+        return
+    doc = await users_col.find_one({"_id": str(user.id)})
+    warns = (doc or {}).get("mod_warnings", [])
+    if not warns:
+        await interaction.response.send_message(f"{user} に警告履歴はありません。", ephemeral=True)
+        return
+    lines = []
+    for i, w in enumerate(warns[-15:], 1):
+        ts = (ensure_utc(w["at"]).astimezone(_MODGUARD_JST).strftime("%Y/%m/%d")
+              if w.get("at") else "?")
+        lines.append(f"{i}. [{ts}] {w.get('reason','?')} — by {w.get('by_name','?')}")
+    embed = discord.Embed(
+        title=f"⚠️ {user} の警告履歴（通算{len(warns)}件・直近15件）",
+        description="\n".join(lines)[:4000], color=0xF1C40F)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # =============================================================================
