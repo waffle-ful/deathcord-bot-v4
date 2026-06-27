@@ -200,8 +200,10 @@ def main():
         return
     print(f"[nonbooster] Summaries: {len(summaries_text)}文字")
 
+    # 選別はブースター有無ではなく「実際にサーバーで活動しているか」で行う（下の要約言及フィルタ＝
+    # presence/engagement 基準）。ブースト未加入でも長くいる人を公平にカバーするため is_booster 条件は撤廃。
+    # 会話量の多い人は analyze_personality 側でリッチな Big Five 診断が走り、_build_prompt がそちらを優先する。
     targets = list(users_col.find({
-        "is_booster":         {"$ne": True},
         "name":               {"$exists": True},
         "xp":                 {"$gt": 0},
         "personality_optout": {"$ne": True},   # /privacy でオプトアウトした人は分析しない
