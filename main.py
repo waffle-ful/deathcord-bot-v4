@@ -99,16 +99,9 @@ MODEL_CHAIN: list[tuple[str, int]] = [
     (MODEL_FALLBACK,                  3000),   # ⑤ gemma-4-26b（容量潤沢・低速・実績）
     ("models/gemma-4-31b-it",         3000),   # ⑥ gemma-4-31b（最終フォールバック・batch実績）
 ]
-
-# レスバ専用チェーン: gemma-4 を主に据える。狙い: レスバの負荷をメイド本体の gemini 無料枠
-# （深夜の容量429＝メイドが黙る真因／[[freetier-capacity-429]]）から切り離す。gemma系は別quota・容量潤沢。
-# ※「12回/分」の behavioral limiter はモデル横断で共有なので RPM ペースは分離されない（容量＝日次のみ分離）。
-# 末尾の flash-lite は gemma が location未対応エラーを出した時だけの保険（_run_ai_booster が自動で次へ送る）。
-RESUBA_CHAIN: list[tuple[str, int]] = [
-    ("models/gemma-4-26b-a4b-it",     3000),   # ① primary: gemma-4-26b（別quota・容量潤沢・低速）
-    ("models/gemma-4-31b-it",         3000),   # ② gemma-4-31b（同上）
-    (MODEL_BOOSTER,                   300),    # ③ 保険: flash-lite（gemma location未対応時のみ落ちてくる）
-]
+# 注: レスバ専用の gemma主チェーンを一度試したが、gemma は thinking_config 非対応＋思考青天井で
+# 空応答が頻発し、80トークンの返信に1800〜3000トークン消費＝非効率。レスバも標準 MODEL_CHAIN
+# （flash-lite主）に戻した（2026-06-27）。gemma はあくまで末尾の容量フォールバックとしてのみ使う。
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
 # --- ランク・ロール設定 ---
@@ -1688,17 +1681,17 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
         # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
         # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
         max_tokens = 3000 if "gemma" in model else 300
-    cfg_kwargs = dict(temperature=temperature, max_output_tokens=max_tokens)
-    # gemma-4系は thinking が出力トークンを食い尽くし、cap3000でも thoughts≈2998/answer=0(MAX_TOKENS)で
-    # 空応答になる（思考が枠を使い切るまで膨張＝capを上げても不安定・遅い・無駄）。思考をオフにして全枠を
-    # 本文へ回す。これでダメ（gemmaが thinking_budget=0 を拒否/無視）なら gemma 経路は諦める判断材料になる。
-    if "gemma" in model:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    # 注意: gemma-4系は thinking_config 自体が 400 INVALID_ARGUMENT「Thinking budget is not supported
+    # for this model.」で拒否される（実機確認 2026-06-27）＝思考のオフ/上限設定は不可。思考は必須・青天井で、
+    # 時に cap を思考で食い尽くし answer=0(MAX_TOKENS) 空応答になる。max_tokens を大きめに与えるのが唯一の緩和。
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=model,
         contents=prompt,
-        config=types.GenerateContentConfig(**cfg_kwargs),
+        config=types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        ),
     )
     # 実トークン計測: max_output_tokens を正しく決めるための実データ。
     # out(=thoughts+answer) が cap に張り付いていたら枠不足（thinking系で本文が出ず MAX_TOKENS になる）。
@@ -1795,11 +1788,10 @@ def _typing_delay(text: str) -> float:
     return delay
 
 
-async def _run_ai_booster(prompt: str, chain: list | None = None) -> str:
-    """会話用AI呼び出し。chain（既定 MODEL_CHAIN）を上から順に試し、最初に本文が返ったモデルを採用する。
-    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。
-    chain にレスバ専用の RESUBA_CHAIN を渡すと、その経路（gemma主）で生成する。"""
-    for model, max_tokens in (chain or MODEL_CHAIN):
+async def _run_ai_booster(prompt: str) -> str:
+    """会話用AI呼び出し。MODEL_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
+    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。"""
+    for model, max_tokens in MODEL_CHAIN:
         try:
             text = await _call_model(model, prompt, max_tokens)
             if text:
@@ -4312,7 +4304,7 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
         claim_lines = "\n".join(f"・{c['content']}" for c in claims)
         prompt = (f"【{target.display_name} が過去に言った主張（隙があれば突いてよい・無理に使わなくてよい）】\n"
                   f"{claim_lines}\n\n---\n{prompt}")
-    text = await _run_ai_booster(prompt, chain=RESUBA_CHAIN)   # レスバはgemma主の専用経路
+    text = await _run_ai_booster(prompt)   # 標準MODEL_CHAIN（flash-lite主）
     # 全モデル失敗時の sentinel「（メイドは今、席を外しております…）」だけを弾く。
     # 旧 '"（" in text' は「（笑）」等の正当な全角括弧で誤爆していたので厳密一致に修正。
     if not text or text.startswith("（メイド"):
@@ -4327,7 +4319,7 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
 #   pile-on防止: 対象が返し続ける=合意のため上限撤廃だが、CD/optout/TTL/横断1セッションは維持。
 # =============================================================================
 _resuba_sessions: dict[int, dict] = {}   # channel_id -> session
-RESUBA_SESS_CD        = 6    # 反論の最小間隔＝コアレス窓（秒）。gemma主＋短CDでテンポ重視。
+RESUBA_SESS_CD        = 6    # 反論の最小間隔＝コアレス窓（秒）。flash-lite主＝高速なので短CDでテンポ重視。
                              # ※混雑時はグローバル12RPM limiter(_rate_get_wait_seconds)が6〜20秒の待ちを
                              #   自動付与＝短CDが効くのは静かな1対1時のみ／混雑時は自動ブレーキで安全。
 RESUBA_SESS_TTL       = 600  # 沈黙でのセッション自動終了（秒）
@@ -4410,7 +4402,7 @@ async def _resuba_judge(channel, session: dict):
         "②その理由を2〜3行で公平に述べてください。前置き・ラベルなし・本文のみ・150文字以内。"
     )
     try:
-        verdict = await _run_ai_booster(prompt, chain=RESUBA_CHAIN)   # 判定もgemma主経路
+        verdict = await _run_ai_booster(prompt)   # 標準MODEL_CHAIN（flash-lite主）
         if verdict and not verdict.startswith("（メイド"):
             await asyncio.sleep(_rate_get_wait_seconds())
             await channel.send(f"⚖️ **レスバ判定**\n{verdict.strip()}")
