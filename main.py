@@ -99,6 +99,16 @@ MODEL_CHAIN: list[tuple[str, int]] = [
     (MODEL_FALLBACK,                  3000),   # ⑤ gemma-4-26b（容量潤沢・低速・実績）
     ("models/gemma-4-31b-it",         3000),   # ⑥ gemma-4-31b（最終フォールバック・batch実績）
 ]
+
+# レスバ専用チェーン: gemma-4 を主に据える。狙い: レスバの負荷をメイド本体の gemini 無料枠
+# （深夜の容量429＝メイドが黙る真因／[[freetier-capacity-429]]）から切り離す。gemma系は別quota・容量潤沢。
+# ※「12回/分」の behavioral limiter はモデル横断で共有なので RPM ペースは分離されない（容量＝日次のみ分離）。
+# 末尾の flash-lite は gemma が location未対応エラーを出した時だけの保険（_run_ai_booster が自動で次へ送る）。
+RESUBA_CHAIN: list[tuple[str, int]] = [
+    ("models/gemma-4-26b-a4b-it",     3000),   # ① primary: gemma-4-26b（別quota・容量潤沢・低速）
+    ("models/gemma-4-31b-it",         3000),   # ② gemma-4-31b（同上）
+    (MODEL_BOOSTER,                   300),    # ③ 保険: flash-lite（gemma location未対応時のみ落ちてくる）
+]
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
 # --- ランク・ロール設定 ---
@@ -1781,10 +1791,11 @@ def _typing_delay(text: str) -> float:
     return delay
 
 
-async def _run_ai_booster(prompt: str) -> str:
-    """会話用AI呼び出し。MODEL_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
-    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。"""
-    for model, max_tokens in MODEL_CHAIN:
+async def _run_ai_booster(prompt: str, chain: list | None = None) -> str:
+    """会話用AI呼び出し。chain（既定 MODEL_CHAIN）を上から順に試し、最初に本文が返ったモデルを採用する。
+    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。
+    chain にレスバ専用の RESUBA_CHAIN を渡すと、その経路（gemma主）で生成する。"""
+    for model, max_tokens in (chain or MODEL_CHAIN):
         try:
             text = await _call_model(model, prompt, max_tokens)
             if text:
@@ -2721,24 +2732,24 @@ async def on_message(message: discord.Message):
                 _mimic_sess["last_react_at"] = now   # 発火前に更新＝並行on_messageによる連投を防ぐ
                 asyncio.create_task(_mimic_react(message.channel, _mimic_sess, message.content))
 
-        # レスバ追撃: 対象本人が発言したら論破メイドが噛みつく（反応式・回数制）。
+        # レスバ追撃v2: 対象本人が発言したら双方向レスバ（健忘症解消＝transcript／取りこぼしゼロ＝コアレス）。
         # ★pile-on防止の要。bot/webhookは2397で除外済。①author.id一致で対象判定
-        #   ②remaining減算＋cooldown更新を create_task の前に同期実行（mimic教訓: 並行発言の連投を断つ／
-        #     fail-safeに「失敗しても回数消費」＝多めに殴らない方向）③optoutを毎回再チェック（途中拒否で即停止）。
+        #   ②対象発言は同期でtranscript/pendingへ記録→CD明けに_resuba_flushが束ねて1回反論（mimic教訓: 並行
+        #     on_messageの連投レースをflush_scheduledフラグの発火前更新で断つ）③optoutを毎回再チェック（途中拒否で即停止）。
         _rsess = _resuba_sessions.get(message.channel.id)
-        if (_rsess and uid == _rsess["target_uid"] and message.content.strip()
-                and _rsess.get("remaining", 0) > 0):
-            _rlast = _rsess.get("last_reply_at")
-            if _rlast is None or (now - _rlast).total_seconds() >= RESUBA_SESS_CD:
-                _ropt = (await users_col.find_one({"_id": uid}, {"resuba_optout": 1}) or {}).get("resuba_optout")
-                if _ropt:
-                    _resuba_sessions.pop(message.channel.id, None)   # 途中でoptout→即終了
-                else:
-                    _rsess["remaining"]    -= 1     # ★発火前に減算（fail-safe）
-                    _rsess["last_reply_at"] = now    # ★発火前にcooldown更新（burst防止）
-                    asyncio.create_task(_resuba_react(message, _rsess))
-                    if _rsess["remaining"] <= 0:
-                        _resuba_sessions.pop(message.channel.id, None)   # 最後の一発で終了
+        if _rsess and uid == _rsess["target_uid"] and message.content.strip():
+            # ①対象の発言は即・同期で記録（取りこぼしゼロ＋並行on_messageのレース対策＝ミミック教訓）。
+            _resuba_push(_rsess, "user", message.author.display_name, message.content.strip())
+            _rsess.setdefault("pending", []).append(message.content.strip())
+            # ②optoutは毎回再チェック（途中拒否で即終了・pile-on防止の要）。
+            _ropt = (await users_col.find_one({"_id": uid}, {"resuba_optout": 1}) or {}).get("resuba_optout")
+            if _ropt:
+                _resuba_sessions.pop(message.channel.id, None)
+            elif not _rsess.get("flush_scheduled"):
+                # ③1セッションにつき同時1本のflushを起動。CD明けに pending を束ねて1回反論
+                #   （CDスロットルは維持しつつ、窓内の発言を全部拾う＝速く撃ち返せる）。
+                _rsess["flush_scheduled"] = True   # ★発火前に立てて二重スケジュールを断つ
+                asyncio.create_task(_resuba_flush(message.channel, _rsess))
 
         # 二重発火抑制: ミミック/レスバがこの発言を処理する場面では自発話しかけを止める
         # （同一メッセージにbot応答が2つ出るのを防ぐ。レスバは対象本人発言時のみ該当）。
@@ -4234,10 +4245,12 @@ async def advocate_mode_cmd(interaction: discord.Interaction, auto: bool | None 
 
 
 async def _generate_resuba(target: discord.Member, topic: str = "",
-                           reply_to: str | None = None) -> str | None:
+                           reply_to: str | None = None,
+                           transcript: list | None = None) -> str | None:
     """論破人格でレスバ文を生成（お遊び）。
-    reply_to=None: こちらから議論を仕掛ける一撃（/resuba）。
-    reply_to=本文: 相手の直近発言に噛みつく反応式（/レスバ追撃）。
+    transcript=ログ: 進行中レスバの続き＝これまでの往復を踏まえ直前の主張に正面から反論（追撃v2）。
+    reply_to=本文: 相手の直近発言に噛みつく反応式（旧経路・後方互換）。
+    どちらもNone: こちらから議論を仕掛ける一撃（/resuba）。
     claims＋相手のBig Fiveで煽り方をチューニングする。"""
     persona = PERSONALITIES["angry"]
     doc = await users_col.find_one(
@@ -4248,7 +4261,25 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
     prof   = doc.get("profile") or {}
     bf_dir = _resuba_bf_directive(prof.get("bigfive_self") or prof.get("bigfive") or {})
 
-    if reply_to:
+    if transcript:
+        convo = "\n".join(
+            f"{'相手' if m['role'] == 'user' else 'あなた(論破メイド)'}: {m['content']}"
+            for m in transcript[-RESUBA_TRANSCRIPT_MAX:]
+        )
+        topic_line = (f"このレスバのお題は「{topic.strip()}」。この論点から大きく外れないこと。\n"
+                      if topic and topic.strip() else "")
+        directive = (
+            "以下は『あなた(論破メイド)』と『相手』の進行中レスバの経過です。\n"
+            f"--- これまでのやり取り ---\n{convo}\n--- ここまで ---\n"
+            f"{topic_line}"
+            "このやり取りを踏まえ、相手の【直前の発言】の具体的な主張・論理の穴・前提の甘さ・"
+            "矛盾に正面から反論してください。論点をずらさず、前のやり取りと噛み合わせること"
+            "（同じ煽りの繰り返しは禁止・話を前に進める）。"
+            "あくまで知的なレスバ・お遊びの範囲で、容姿・人格の全否定など本気で傷つける罵倒は禁止。"
+            "前置きやラベルなし・本文のみ・120文字以内。"
+        )
+        history_note = "（これは進行中レスバの続き。上のやり取りに噛み合わせて反論）"
+    elif reply_to:
         directive = (
             f"「{target.display_name}」がたった今こう言いました：「{reply_to[:200]}」\n"
             "この発言に対して、論理の穴・前提の甘さ・矛盾を突いて鋭く反論してください。"
@@ -4283,7 +4314,7 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
         prompt = f"【{target.display_name} が過去に言った主張（隙があれば突いてよい・無理に使わなくてよい）】\n{claim_lines}\n\n---\n{base}"
     else:
         prompt = base
-    text = await _run_ai_booster(prompt)
+    text = await _run_ai_booster(prompt, chain=RESUBA_CHAIN)   # レスバはgemma主の専用経路
     # 全モデル失敗時の sentinel「（メイドは今、席を外しております…）」だけを弾く。
     # 旧 '"（" in text' は「（笑）」等の正当な全角括弧で誤爆していたので厳密一致に修正。
     if not text or text.startswith("（メイド"):
@@ -4292,31 +4323,114 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
 
 
 # =============================================================================
-# レスバ追撃セッション（反応式・mimicのreact基盤と対称）
-#   対象本人が発言するたび論破メイドが噛みつく。pile-on防止のため回数/CD/optout/TTLで厳重に制御。
+# レスバ追撃v2セッション（双方向レスバ・mimicのreact基盤と対称）
+#   対象が発言→これまでのtranscriptを踏まえ論破メイドが噛み合わせて反論。CD窓内の発言はコアレスで束ねて
+#   1回返す（取りこぼしゼロ）。続く限り続き、沈黙TTL/レスバ停止/レスバ拒否で終了→終了時にレスバ判定。
+#   pile-on防止: 対象が返し続ける=合意のため上限撤廃だが、CD/optout/TTL/横断1セッションは維持。
 # =============================================================================
 _resuba_sessions: dict[int, dict] = {}   # channel_id -> session
-RESUBA_SESS_MAX     = 5    # 1セッションの最大追撃回数（上限）
-RESUBA_SESS_DEFAULT = 3    # 既定の追撃回数
-RESUBA_SESS_CD      = 35   # 追撃の最小間隔（秒）＝spam化防止
-RESUBA_SESS_TTL     = 600  # セッション自動終了（秒）
+RESUBA_SESS_CD        = 6    # 反論の最小間隔＝コアレス窓（秒）。gemma主＋短CDでテンポ重視。
+                             # ※混雑時はグローバル12RPM limiter(_rate_get_wait_seconds)が6〜20秒の待ちを
+                             #   自動付与＝短CDが効くのは静かな1対1時のみ／混雑時は自動ブレーキで安全。
+RESUBA_SESS_TTL       = 600  # 沈黙でのセッション自動終了（秒）
+RESUBA_TRANSCRIPT_MAX = 20   # セッションが保持する発言数の上限（直近10往復ぶん＝健忘症解消の文脈窓）
 
 
-async def _resuba_react(message: discord.Message, session: dict):
-    """対象の発言に噛みつく反応式レスバ。pingはしない(message.reply mention_author=False)。"""
+def _resuba_push(session: dict, role: str, name: str, content: str) -> None:
+    """レスバの会話ログにappendして直近 RESUBA_TRANSCRIPT_MAX 件にcap（健忘症解消の中核）。
+    role は "user"(対象) か "maid"(論破メイド)。on_message/生成後から同期で呼ぶ。"""
+    t = session.setdefault("transcript", [])
+    t.append({"role": role, "name": name, "content": content[:300]})
+    if len(t) > RESUBA_TRANSCRIPT_MAX:
+        del t[:-RESUBA_TRANSCRIPT_MAX]
+
+
+async def _resuba_react(channel, session: dict, pending: list[str]):
+    """溜まった対象発言（pending）に、これまでのtranscriptを踏まえて1回反論する。
+    transcript には pending も既に積まれている（on_message で同期append済）ので、
+    生成には transcript 全体を渡す。引数 pending は「今回束ねた発言」の記録用で生成には未使用
+    （load-bearingではない）。ボットの反論は生成後に追記する。pingはしない。"""
     try:
-        guild  = message.guild
+        guild  = getattr(channel, "guild", None)
         target = guild.get_member(int(session["target_uid"])) if guild else None
         if target is None:
             return
         text = await _generate_resuba(target, topic=session.get("topic", ""),
-                                      reply_to=message.content)
+                                      transcript=session.get("transcript", []))
         if not text:
             return
+        _resuba_push(session, "maid", "論破メイド", text)   # 反論もログへ（往復が噛み合う）
         await asyncio.sleep(_rate_get_wait_seconds())
-        await message.reply(f"{RESUBA_ICON} {text}", mention_author=False)
+        await channel.send(f"{RESUBA_ICON} {text}")
     except Exception as e:
         print(f"[ERROR] _resuba_react: {e}")
+
+
+async def _resuba_flush(channel, session: dict):
+    """1セッション1ワーカーで pending を排出するループ（コアレス＝取りこぼしゼロ・並行リアクト無し）。
+    on_message は flush_scheduled が False の時だけ本タスクを起動し、本タスクは drain し切るまで True を
+    保持し続ける＝CD=6s＋低速gemmaで生成が長引いても、同一セッションで2本目の生成は決して走らない。
+    各周回: CD窓ぶん待つ→pending を束ねて1回反論→reactは逐次（直列）。react中に積まれた新pendingは次周回で拾う。"""
+    try:
+        while True:
+            last = session.get("last_reply_at")
+            if last is not None:
+                elapsed = (datetime.datetime.now(datetime.timezone.utc) - last).total_seconds()
+                if elapsed < RESUBA_SESS_CD:
+                    await asyncio.sleep(RESUBA_SESS_CD - elapsed)
+            # 停止/optout/TTLで消えた or 排出完了 → flag を下ろして終了。
+            # ★この判定から flag クリアまで await を挟まない＝check-then-act レース無し（取りこぼし無し）。
+            if _resuba_sessions.get(channel.id) is not session or not session.get("pending"):
+                session["flush_scheduled"] = False
+                return
+            pending = session["pending"]
+            session["pending"]       = []                                           # ★発火前にバッファ確保
+            session["last_reply_at"] = datetime.datetime.now(datetime.timezone.utc)  # ★発火前にCD更新
+            await _resuba_react(channel, session, pending)   # 直列。完了後ループ先頭へ→残りを排出
+    except Exception as e:
+        print(f"[ERROR] _resuba_flush: {e}")
+        session["flush_scheduled"] = False
+
+
+async def _resuba_judge(channel, session: dict):
+    """セッション終了時、中立の審判視点で勝敗と短評を出す（ストレッチ）。
+    論破人格ではなく素の中立トーン。やり取りが薄い（往復未成立）場合は判定しない。"""
+    transcript = session.get("transcript", [])
+    if sum(1 for m in transcript if m["role"] == "user") < 2:
+        return   # 対象がほぼ反論していない＝レスバ未成立。判定しない
+    target_name = session.get("target_name", "相手")
+    convo = "\n".join(
+        f"{target_name if m['role'] == 'user' else '論破メイド'}: {m['content']}"
+        for m in transcript
+    )
+    prompt = (
+        "あなたは中立公平なレスバの審判です。煽らず、どちらにも肩入れしない素の口調で判定します。\n"
+        f"以下は『論破メイド』と『{target_name}』のレスバ（言葉の打ち合い）の全記録です。\n"
+        f"--- 記録 ---\n{convo}\n--- ここまで ---\n"
+        "論理の一貫性・反論の的確さ・説得力で総合的に判定し、"
+        f"①勝者（「論破メイド」「{target_name}」「引き分け」のいずれか）"
+        "②その理由を2〜3行で公平に述べてください。前置き・ラベルなし・本文のみ・150文字以内。"
+    )
+    try:
+        verdict = await _run_ai_booster(prompt, chain=RESUBA_CHAIN)   # 判定もgemma主経路
+        if verdict and not verdict.startswith("（メイド"):
+            await asyncio.sleep(_rate_get_wait_seconds())
+            await channel.send(f"⚖️ **レスバ判定**\n{verdict.strip()}")
+    except Exception as e:
+        print(f"[ERROR] _resuba_judge: {e}")
+
+
+async def _resuba_finish(channel, session: dict, note: str):
+    """セッション終了の共通処理：終了メッセージ＋レスバ判定。
+    呼び出し側で _resuba_sessions から pop 済みであること。channel が None なら判定スキップ。"""
+    if channel is None:
+        return
+    try:
+        if note:
+            await channel.send(f"{RESUBA_ICON} {note}")
+    except Exception:
+        pass
+    await _resuba_judge(channel, session)
 
 
 @client.tree.command(name="resuba", description="論破メイドが指定メンバーにレスバを仕掛ける（お遊び）")
@@ -4355,10 +4469,10 @@ async def resuba_cmd(interaction: discord.Interaction, member: discord.Member, t
 
 
 @client.tree.command(name="レスバ追撃",
-                     description="論破メイドが対象の発言に一定回数噛みつき続ける（ブースター/管理者）")
-@app_commands.describe(member="追撃する相手", count="追撃回数(1-5・既定3)", topic="お題（任意）")
+                     description="論破メイドが対象と噛み合う双方向レスバを始める（ブースター/管理者）")
+@app_commands.describe(member="追撃する相手", topic="お題（任意）")
 async def resuba_chase_cmd(interaction: discord.Interaction, member: discord.Member,
-                           count: int = RESUBA_SESS_DEFAULT, topic: str = ""):
+                           topic: str = ""):
     if not await check_home_guild(interaction):
         return
     # 持続追撃は影響が大きいので開始はブースター/管理者に限定（一撃の /resuba は全員可のまま）
@@ -4387,29 +4501,36 @@ async def resuba_chase_cmd(interaction: discord.Interaction, member: discord.Mem
             ephemeral=True)
         return
 
-    count   = max(1, min(RESUBA_SESS_MAX, count))
     session = {
         "target_uid":  str(member.id),
         "target_name": member.display_name,
-        "remaining":   count,
         "topic":       topic,
         "last_reply_at": None,
         "invoker":     str(interaction.user.id),
+        "transcript":  [],     # [{"role":"user"/"maid","name":str,"content":str}] 健忘症解消の文脈窓
+        "pending":     [],     # CD窓内に溜まった対象発言（コアレスして1回で返す）
+        "flush_scheduled": False,
     }
     _resuba_sessions[interaction.channel_id] = session
-    # 開始の一度だけ ping（以降の追撃は ping しない＝通知連打=嫌がらせ化を防ぐ）
+    # 開始の一度だけ ping（以降の反論は ping しない＝通知連打=嫌がらせ化を防ぐ）
     await interaction.response.send_message(
-        f"{RESUBA_ICON} {member.mention} 覚悟しろ。お前の発言に**最大{count}回**噛みついてやる。\n"
-        f"（`/レスバ停止` か、対象本人の `/レスバ拒否` でいつでも終了）")
+        f"{RESUBA_ICON} {member.mention} 覚悟しろ。お前が言い返す限り、噛み合わせて議論してやる。\n"
+        f"（沈黙{RESUBA_SESS_TTL // 60}分・`/レスバ停止`・対象本人の`/レスバ拒否`で終了。終了時にレスバ判定を出す）")
+
+    _started_at = datetime.datetime.now(datetime.timezone.utc)
 
     async def _auto_end():
-        await asyncio.sleep(RESUBA_SESS_TTL)
+        # 沈黙TTL監視: 最後の往復から TTL 経過したら終了。会話が続けば last_reply_at が更新されるので、
+        # その都度残り時間を測り直して延命する（＝「沈黙10分で終了」を正しく満たす）。
+        while _resuba_sessions.get(interaction.channel_id) is session:
+            last = session.get("last_reply_at") or _started_at
+            idle = (datetime.datetime.now(datetime.timezone.utc) - last).total_seconds()
+            if idle >= RESUBA_SESS_TTL:
+                break
+            await asyncio.sleep(RESUBA_SESS_TTL - idle)
         if _resuba_sessions.get(interaction.channel_id) is session:
             _resuba_sessions.pop(interaction.channel_id, None)
-            try:
-                await interaction.channel.send(f"{RESUBA_ICON} 追撃セッション、時間切れで終了。")
-            except Exception:
-                pass
+            await _resuba_finish(interaction.channel, session, "レスバ、時間切れで終了。")
     asyncio.create_task(_auto_end())
 
 
@@ -4420,9 +4541,10 @@ async def resuba_stop_cmd(interaction: discord.Interaction):
     sess = _resuba_sessions.pop(interaction.channel_id, None)
     if sess:
         await interaction.response.send_message(
-            f"{RESUBA_ICON} **{sess['target_name']}** への追撃を停止しました。")
+            f"{RESUBA_ICON} **{sess['target_name']}** へのレスバを停止しました。")
+        await _resuba_judge(interaction.channel, sess)   # 停止時はレスバ判定を出す
     else:
-        await interaction.response.send_message("進行中の追撃はありません。", ephemeral=True)
+        await interaction.response.send_message("進行中のレスバはありません。", ephemeral=True)
 
 
 @client.tree.command(name="レスバ拒否", description="自分をレスバの対象外にする/戻すを切り替える")
