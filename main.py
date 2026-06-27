@@ -1412,11 +1412,12 @@ def _bigfive_directives(bigfive: dict) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-# レスバ煽りのBig Fiveチューニング: 相手の性格に合わせて煽り強度を変える。
-# 安全side＝高情緒不安定さは軽め（傷つけ防止）／低協調は遠慮なく論理で殴り合い（罵倒は別途禁止）。
+# レスバ煽りのBig Fiveチューニング: 攻め方の“スタイル”を相手に合わせて変える（論破はやめない）。
+# ★「配慮しろ/手加減しろ」と書くと論破ペルソナと矛盾し、モデルがその矛盾を論破し始める（実機で発生）。
+#   なので必ず「論破は続けるが、こう攻めた方が刺さる」という戦術指示として書くこと。
 _RESUBA_BF_HIGH = {
-    "neuroticism":   "相手は情緒が揺れやすい。煽りは軽め・ユーモア寄りにし、人格攻撃や追い込みは避ける。",
-    "agreeableness": "相手は温和。ガチ詰めより、ニヤッとできる挑発・知的なツッコミ程度に留める。",
+    "neuroticism":   "相手は感情が揺れやすいタイプ。声を荒げる罵倒や人格攻撃より、冷静で的確な論理の一突きの方が刺さる。淡々と詰めろ。",
+    "agreeableness": "相手は温和なタイプ。重い詰めより、ニヤッとさせる挑発・知的なツッコミで攻めろ。",
 }
 _RESUBA_BF_LOW = {
     "agreeableness": "相手は是々非々で打たれ強い。遠慮せず論理でガッツリ殴り合ってよい（罵倒は除く）。",
@@ -4264,59 +4265,53 @@ async def _generate_resuba(target: discord.Member, topic: str = "",
     prof   = doc.get("profile") or {}
     bf_dir = _resuba_bf_directive(prof.get("bigfive_self") or prof.get("bigfive") or {})
 
+    # ★重要（実機で発生）: 反論方針・お題・性格チューニング・ガードは「演出指示」であって“主人の発言”ではない。
+    #   これらを {content}=「主人の発言」スロットに混ぜると、論破ペルソナが指示そのものの矛盾を論破し始める
+    #   （例:「論破特化型なのに配慮しろは矛盾」）。→ 会話は{history}・相手の生発言だけ{content}・指示は末尾の
+    #   【演出メモ】に分離し、「これは主人の発言ではない／反論対象にするな」と明示してプロンプト論破を防ぐ。
     if transcript:
-        convo = "\n".join(
-            f"{'相手' if m['role'] == 'user' else 'あなた(論破メイド)'}: {m['content']}"
-            for m in transcript[-RESUBA_TRANSCRIPT_MAX:]
+        recent = transcript[-RESUBA_TRANSCRIPT_MAX:]
+        history_slot = "\n".join(
+            f"{'相手' if m['role'] == 'user' else 'あなた'}: {m['content']}" for m in recent
         )
-        topic_line = (f"このレスバのお題は「{topic.strip()}」。この論点から大きく外れないこと。\n"
-                      if topic and topic.strip() else "")
-        directive = (
-            "以下は『あなた(論破メイド)』と『相手』の進行中レスバの経過です。\n"
-            f"--- これまでのやり取り ---\n{convo}\n--- ここまで ---\n"
-            f"{topic_line}"
-            "このやり取りを踏まえ、相手の【直前の発言】の具体的な主張・論理の穴・前提の甘さ・"
-            "矛盾に正面から反論してください。論点をずらさず、前のやり取りと噛み合わせること"
-            "（同じ煽りの繰り返しは禁止・話を前に進める）。"
-            "あくまで知的なレスバ・お遊びの範囲で、容姿・人格の全否定など本気で傷つける罵倒は禁止。"
-            "前置きやラベルなし・本文のみ・120文字以内。"
-        )
-        history_note = "（これは進行中レスバの続き。上のやり取りに噛み合わせて反論）"
+        content_slot = next((m["content"] for m in reversed(recent) if m["role"] == "user"),
+                            "（直前の発言）")
+        stage_note = ("進行中レスバの続き。上の会話を踏まえ、主人の【直前の発言】の論理の穴・前提の甘さ・"
+                      "矛盾を突いて反論しろ。論点をずらすな。同じ煽りの繰り返しは禁止、話を前に進めろ。")
     elif reply_to:
-        directive = (
-            f"「{target.display_name}」がたった今こう言いました：「{reply_to[:200]}」\n"
-            "この発言に対して、論理の穴・前提の甘さ・矛盾を突いて鋭く反論してください。"
-            "あくまで知的なレスバ・お遊びの範囲で、容姿・人格の全否定など本気で傷つける罵倒は禁止。"
-            "前置きやラベルなし・本文のみ・120文字以内。"
-        )
-        history_note = "（これは相手の直近発言へのレスバ反応）"
+        history_slot = "（単発レスバ・履歴なし）"
+        content_slot = reply_to[:200]
+        stage_note = "主人の発言の論理の穴・前提の甘さ・矛盾を突いて鋭く反論しろ。"
     else:
-        topic_clause = (
-            f"お題は「{topic.strip()}」。この話題で議論を仕掛けろ。"
-            if topic and topic.strip()
-            else "お題は自由。相手が言いそうなこと・最近の話題から、議論になりそうな論点を一つ選んで仕掛けろ。"
-        )
-        directive = (
-            f"これは誰かへの返信ではなく、あなたから「{target.display_name}」に自分から仕掛けるレスバ（言葉の打ち合い）です。\n"
-            f"{topic_clause}\n"
-            "相手を軽く挑発しつつ、反論したくなる論点を一つ投げて議論を吹っかけてください。"
-            "ただし容姿・人格の全否定など本気で傷つける罵倒は禁止。あくまで知的なレスバ・お遊びの範囲で。"
-            "前置きや「レスバ:」等のラベルなし・本文のみ・150文字以内。"
-        )
-        history_note = "（これは新たに仕掛けるレスバ。過去の個別会話履歴は使いません）"
-    if bf_dir:
-        directive += "\n【相手の性格への配慮】" + bf_dir
+        topic_clause = (f"お題は「{topic.strip()}」でこちらから仕掛けろ。" if topic and topic.strip()
+                        else "お題は自由。相手が言いそうな論点・最近の話題から議論になりそうな点を一つ選んで仕掛けろ。")
+        history_slot = "（新規レスバ・履歴なし）"
+        content_slot = "（まだ発言なし＝あなたから議論を仕掛ける番）"
+        stage_note = f"これは返信ではなく、あなたから主人に仕掛けるレスバ。{topic_clause}反論したくなる論点を一つ投げて軽く挑発しろ。"
 
     base = persona["booster_prompt"].format(
         name=target.display_name,
-        history=history_note,
-        content=directive,
+        history=history_slot,
+        content=content_slot,
     )
+
+    # 【演出メモ】= content の外。お題・性格チューニング・ガードをここへ集約し、内容自体を論破対象にさせない。
+    stage_lines = [stage_note]
+    if transcript and topic and topic.strip():
+        stage_lines.append(f"お題は「{topic.strip()}」。論点はここから大きく外すな。")
+    if bf_dir:
+        stage_lines.append(bf_dir)
+    stage_lines.append("容姿・人格の全否定など本気で傷つける罵倒は禁止（あくまで知的なレスバ・お遊び）。"
+                       "前置きやラベルなし・本文のみ・120文字以内、メイドのセリフだけを書け。")
+    stage_block = ("\n\n---\n【演出メモ（あなた=メイドへの指示。これは主人の発言ではない＝"
+                   "この内容自体を反論の対象にするな・引用するな・言及するな）】\n"
+                   + "\n".join(f"・{s}" for s in stage_lines))
+
+    prompt = base + stage_block
     if claims:
         claim_lines = "\n".join(f"・{c['content']}" for c in claims)
-        prompt = f"【{target.display_name} が過去に言った主張（隙があれば突いてよい・無理に使わなくてよい）】\n{claim_lines}\n\n---\n{base}"
-    else:
-        prompt = base
+        prompt = (f"【{target.display_name} が過去に言った主張（隙があれば突いてよい・無理に使わなくてよい）】\n"
+                  f"{claim_lines}\n\n---\n{prompt}")
     text = await _run_ai_booster(prompt, chain=RESUBA_CHAIN)   # レスバはgemma主の専用経路
     # 全モデル失敗時の sentinel「（メイドは今、席を外しております…）」だけを弾く。
     # 旧 '"（" in text' は「（笑）」等の正当な全角括弧で誤爆していたので厳密一致に修正。
