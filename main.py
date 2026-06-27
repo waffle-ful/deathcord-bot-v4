@@ -1687,14 +1687,17 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
         # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
         # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
         max_tokens = 3000 if "gemma" in model else 300
+    cfg_kwargs = dict(temperature=temperature, max_output_tokens=max_tokens)
+    # gemma-4系は thinking が出力トークンを食い尽くし、cap3000でも thoughts≈2998/answer=0(MAX_TOKENS)で
+    # 空応答になる（思考が枠を使い切るまで膨張＝capを上げても不安定・遅い・無駄）。思考をオフにして全枠を
+    # 本文へ回す。これでダメ（gemmaが thinking_budget=0 を拒否/無視）なら gemma 経路は諦める判断材料になる。
+    if "gemma" in model:
+        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=model,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(**cfg_kwargs),
     )
     # 実トークン計測: max_output_tokens を正しく決めるための実データ。
     # out(=thoughts+answer) が cap に張り付いていたら枠不足（thinking系で本文が出ず MAX_TOKENS になる）。
