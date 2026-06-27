@@ -2325,7 +2325,8 @@ class MyBot(discord.Client):
             self.add_dynamic_items(GuardUnbanButton, GuardInviteButton)
             self.add_view(ModPanelView())
             self.add_view(NotifyConsentView())
-            print("[INFO] mod-guard/modpanel/通知同意 永続UI登録完了")
+            self.add_view(QuizStartView())
+            print("[INFO] mod-guard/modpanel/通知同意/入場クイズ 永続UI登録完了")
         except Exception as e:
             print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
         print("[INFO] 起動完了")
@@ -2334,6 +2335,7 @@ class MyBot(discord.Client):
         self.loop.create_task(idle_chatter_task())
         self.loop.create_task(init_invite_snapshot(self))
         self.loop.create_task(_load_advocate_flags())
+        self.loop.create_task(_load_quiz_gate())
 
 async def init_invite_snapshot(bot: discord.Client):
     await bot.wait_until_ready()
@@ -4445,6 +4447,273 @@ async def resuba_optout_cmd(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(
             "✅ レスバ対象外を解除しました。再び /resuba の対象になります。", ephemeral=True)
+
+
+# =============================================================================
+# 入場クイズゲート（寛容ハードゲート）
+#   新規参加→未認証ロール付与→#入場クイズの常設ボタン→ephemeralクイズ→全問正解で解放。
+#   安全: ①既存/出戻り(DB実績あり)・bot・管理者にはロールを付けない ②未認証=閲覧不可の権限上書きは
+#   ロール保持者にしか効かない＝既存メンバー無影響 ③kill-switch(enabled)/手動解放(/認証許可)/原状復帰。
+#   設定はDB(system.quiz_gate)保存＝envや再デプロイ不要・別サーバー移転もコマンドだけで完結。
+# =============================================================================
+_quiz_gate: dict = {"enabled": False, "role_id": 0, "channel_id": 0}
+QUIZ_CHANNEL_NAME = "入場クイズ"
+QUIZ_QUESTIONS = [
+    {"q": "自分の個人情報（本名・住所・学校など）をサーバーに書き込むのは？",
+     "options": ["OK", "ダメ"], "answer": 1,
+     "why": "自分の情報でも晒すのは禁止だよ（🟡）。"},
+    {"q": "他サーバーへメンバーを引き抜く・勧誘するのは？",
+     "options": ["OK", "ダメ"], "answer": 1,
+     "why": "メンバーの引き抜き行為は禁止（🔴）。"},
+    {"q": "ルール違反を見かけたら、まずどうする？",
+     "options": ["一緒にやる", "通報する", "無視する"], "answer": 1,
+     "why": "「通報はこちらから」へ通報してね（努力義務）。"},
+]
+
+
+async def _load_quiz_gate():
+    """起動時にDBから入場クイズ設定を読み込む。"""
+    try:
+        doc = await system_col.find_one({"_id": "quiz_gate"}) or {}
+        _quiz_gate["enabled"]    = bool(doc.get("enabled", False))
+        _quiz_gate["role_id"]    = int(doc.get("role_id", 0) or 0)
+        _quiz_gate["channel_id"] = int(doc.get("channel_id", 0) or 0)
+        print(f"[INFO] 入場クイズ設定: enabled={_quiz_gate['enabled']} "
+              f"role={_quiz_gate['role_id']} ch={_quiz_gate['channel_id']}")
+    except Exception as e:
+        print(f"[WARN] _load_quiz_gate: {e}")
+
+
+async def _save_quiz_gate():
+    await system_col.update_one({"_id": "quiz_gate"}, {"$set": {
+        "enabled": _quiz_gate["enabled"], "role_id": _quiz_gate["role_id"],
+        "channel_id": _quiz_gate["channel_id"],
+    }}, upsert=True)
+
+
+def _quiz_embed(idx: int, wrong_why: str | None = None) -> discord.Embed:
+    q = QUIZ_QUESTIONS[idx]
+    desc = q["q"] if not wrong_why else f"❌ 惜しい！{wrong_why}\nもう一度どうぞ！\n\n{q['q']}"
+    e = discord.Embed(title=f"🎫 入場クイズ（{idx+1}/{len(QUIZ_QUESTIONS)}）",
+                      description=desc, color=0x00C2A8)
+    e.set_footer(text="ルール確認だよ。落ちることはないから安心してね")
+    return e
+
+
+class QuizRunView(discord.ui.View):
+    """ephemeralで1人ずつ進めるクイズ本体（寛容＝不正解でも正解理由を見せて再挑戦）。"""
+    def __init__(self, idx: int = 0):
+        super().__init__(timeout=300)
+        self.idx = idx
+        self._render()
+
+    def _render(self):
+        self.clear_items()
+        for i, opt in enumerate(QUIZ_QUESTIONS[self.idx]["options"]):
+            btn = discord.ui.Button(label=opt, style=discord.ButtonStyle.primary)
+            btn.callback = self._make_cb(i)
+            self.add_item(btn)
+
+    def _make_cb(self, choice: int):
+        async def cb(interaction: discord.Interaction):
+            q = QUIZ_QUESTIONS[self.idx]
+            if choice != q["answer"]:
+                await interaction.response.edit_message(
+                    embed=_quiz_embed(self.idx, wrong_why=q["why"]), view=self)
+                return
+            self.idx += 1
+            if self.idx >= len(QUIZ_QUESTIONS):
+                await _grant_quiz_pass(interaction)
+                return
+            self._render()
+            await interaction.response.edit_message(embed=_quiz_embed(self.idx), view=self)
+        return cb
+
+
+async def _grant_quiz_pass(interaction: discord.Interaction):
+    """全問正解→未認証ロールを外して解放。"""
+    member = interaction.user
+    role = interaction.guild.get_role(_quiz_gate["role_id"]) if interaction.guild else None
+    try:
+        if role and isinstance(member, discord.Member) and role in member.roles:
+            await member.remove_roles(role, reason="入場クイズ正解")
+    except Exception as e:
+        print(f"[ERROR] _grant_quiz_pass: {e}")
+    await interaction.response.edit_message(
+        content="✅ 正解！ようこそ🎉 サーバーが解放されたよ。楽しんでね！", embed=None, view=None)
+
+
+class QuizStartView(discord.ui.View):
+    """#入場クイズ に常設するスタートボタン（永続View・custom_idで再起動後も有効）。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="クイズを始める", style=discord.ButtonStyle.success,
+                       custom_id="quiz_gate_start", emoji="🎫")
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        role = interaction.guild.get_role(_quiz_gate["role_id"]) if interaction.guild else None
+        if not role or not (isinstance(member, discord.Member) and role in member.roles):
+            await interaction.response.send_message("もう認証済みだよ！ようこそ🎉", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=_quiz_embed(0), view=QuizRunView(0), ephemeral=True)
+
+
+@client.event
+async def on_member_join(member: discord.Member):
+    """新規参加者に未認証ロールを付与してクイズへ誘導。既存/出戻り・bot・管理者は対象外。"""
+    try:
+        if not _quiz_gate.get("enabled") or not _quiz_gate.get("role_id"):
+            return
+        if member.bot or member.guild_permissions.administrator:
+            return
+        # 既存/出戻りメンバー（DBに活動実績あり）はゲートしない＝締め出さない
+        doc = await users_col.find_one({"_id": str(member.id)}, {"xp": 1, "butler_history": 1})
+        if doc and (doc.get("xp", 0) > 0 or doc.get("butler_history")):
+            return
+        role = member.guild.get_role(_quiz_gate["role_id"])
+        if not role:
+            return
+        await member.add_roles(role, reason="入場クイズ: 未認証")
+        ch = member.guild.get_channel(_quiz_gate["channel_id"])
+        if ch:
+            try:
+                await ch.send(f"{member.mention} ようこそ！下の「🎫 クイズを始める」から認証してね。")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[ERROR] on_member_join: {e}")
+
+
+def _quiz_is_admin(interaction: discord.Interaction) -> bool:
+    return getattr(interaction.user.guild_permissions, "administrator", False)
+
+
+@client.tree.command(name="認証ゲート設定",
+                     description="【管理者】入場クイズゲートを設定（ch作成＋権限適用＋ボタン設置）")
+@app_commands.describe(role="未認証ロール（新規参加者に自動付与される制限ロール）")
+@app_commands.default_permissions(administrator=True)
+async def quiz_setup_cmd(interaction: discord.Interaction, role: discord.Role):
+    if not await check_home_guild(interaction):
+        return
+    if not _quiz_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    # ① クイズch（既存名を探す→無ければ作成。@everyone可視・未認証も可視・発言不可）
+    ch = discord.utils.get(guild.text_channels, name=QUIZ_CHANNEL_NAME)
+    if ch is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            role: discord.PermissionOverwrite(view_channel=True, send_messages=False,
+                                              read_message_history=True),
+        }
+        ch = await guild.create_text_channel(QUIZ_CHANNEL_NAME, overwrites=overwrites,
+                                             reason="入場クイズch")
+    else:
+        await ch.set_permissions(role, view_channel=True, send_messages=False,
+                                 read_message_history=True)
+    # ② 全カテゴリ＋全チャンネルに「未認証=閲覧不可」を適用（同期/非同期の漏れを防ぐためch個別にも）。
+    #    上書きは未認証ロール保持者にしか効かない＝既存メンバーは無影響。
+    applied = 0
+    for c in guild.channels:
+        if c.id == ch.id:
+            continue
+        try:
+            await c.set_permissions(role, view_channel=False, reason="入場クイズゲート")
+            applied += 1
+        except Exception as e:
+            print(f"[WARN] quiz overwrite {getattr(c, 'name', '?')}: {e}")
+    # ③ 常設スタートボタンを設置
+    embed = discord.Embed(
+        title="🎫 入場認証クイズ",
+        description=("ようこそ！遊ぶ前に、かんたんなルール確認クイズに答えてね。\n"
+                     "下のボタンから始められるよ（**落ちることはない**から安心して。全問正解で解放）。"),
+        color=0x00C2A8)
+    await ch.send(embed=embed, view=QuizStartView())
+    # ④ 設定保存（最初はOFF＝即締め出さない）
+    _quiz_gate["role_id"]    = role.id
+    _quiz_gate["channel_id"] = ch.id
+    _quiz_gate["enabled"]    = False
+    await _save_quiz_gate()
+    await interaction.followup.send(
+        f"✅ 設定完了。\nクイズch: {ch.mention}\n権限適用: {applied}箇所\n未認証ロール: {role.mention}\n\n"
+        f"現在ゲートは**OFF**。まず自分で `{ch.mention}` のボタンを試して、問題なければ "
+        f"`/認証ゲート切替` でONにしてね。", ephemeral=True)
+
+
+@client.tree.command(name="認証ゲート切替", description="【管理者】入場クイズゲートのON/OFF（kill-switch）")
+@app_commands.default_permissions(administrator=True)
+async def quiz_toggle_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _quiz_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    if not _quiz_gate.get("role_id"):
+        await interaction.response.send_message("先に `/認証ゲート設定` を実行してね。", ephemeral=True)
+        return
+    _quiz_gate["enabled"] = not _quiz_gate["enabled"]
+    await _save_quiz_gate()
+    state = "ON（新規参加者にクイズ必須）" if _quiz_gate["enabled"] else "OFF（誰も制限しない）"
+    await interaction.response.send_message(f"🎫 入場クイズゲートを **{state}** にしたよ。", ephemeral=True)
+
+
+@client.tree.command(name="認証許可", description="【管理者】指定メンバーを手動で認証済みにする（保険）")
+@app_commands.describe(member="解放するメンバー")
+@app_commands.default_permissions(administrator=True)
+async def quiz_pass_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not await check_home_guild(interaction):
+        return
+    if not _quiz_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    role = interaction.guild.get_role(_quiz_gate.get("role_id", 0))
+    if role and role in member.roles:
+        await member.remove_roles(role, reason="管理者による手動認証")
+        await interaction.response.send_message(f"✅ {member.mention} を認証済みにしたよ。", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"{member.display_name} は未認証ロールを持ってないよ。", ephemeral=True)
+
+
+@client.tree.command(name="認証ゲート解除",
+                     description="【管理者】入場クイズの権限上書きを全て外して原状復帰")
+@app_commands.default_permissions(administrator=True)
+async def quiz_teardown_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _quiz_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    role = interaction.guild.get_role(_quiz_gate.get("role_id", 0))
+    if not role:
+        await interaction.response.send_message("設定が見つからないよ。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    removed = 0
+    for c in guild.channels:
+        try:
+            await c.set_permissions(role, overwrite=None, reason="入場クイズ解除")
+            removed += 1
+        except Exception:
+            pass
+    # 念のため全員から未認証ロールを剥がす（誰も詰まらせない）
+    stripped = 0
+    for m in list(role.members):
+        try:
+            await m.remove_roles(role, reason="入場クイズ解除")
+            stripped += 1
+        except Exception:
+            pass
+    _quiz_gate["enabled"] = False
+    await _save_quiz_gate()
+    await interaction.followup.send(
+        f"✅ 原状復帰。権限上書き解除: {removed}箇所 / 未認証剥がし: {stripped}人 / ゲートOFF。",
+        ephemeral=True)
 
 
 def _build_retro_embeds(doc: dict) -> list[dict]:
