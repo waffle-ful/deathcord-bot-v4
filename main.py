@@ -82,14 +82,13 @@ MODEL_BACKGROUND     = "models/gemma-4-26b-a4b-it"            # 裏処理用（g
 # ★重要: モデルIDは必ず /listmodels で実在確認してから追加すること。無効名は例外で黙ってスキップされ、
 #   「容量が増えた気がするだけで実際ゼロ」になる（ログには NotFound→次モデルへ と出るので確認可能）。
 MODEL_CHAIN: list[tuple[str, int]] = [
-    (MODEL_BOOSTER,             300),    # ① primary: flash-lite（高速・実績）
-    # --- ↓ /listmodels で実在ID確認後に有効化。各々別quota(≈20回/日)で容量を積み増す ---
-    # ("models/gemini-3.5-flash",       2048),
-    # ("models/gemini-3-flash",         2048),
-    # ("models/gemini-2.5-flash",       2048),
-    # ("models/gemini-2.5-flash-lite",   768),
-    (MODEL_FALLBACK,           3000),    # ⑥ gemma-4-26b（容量潤沢・低速・実績）
-    ("models/gemma-4-31b-it",  3000),    # ⑦ gemma-4-31b（最終フォールバック・batchで実績あり）
+    (MODEL_BOOSTER,                    300),    # ① primary: flash-lite 3.1（高速・実績）
+    # ↓ /listmodels で実在確認済（各々別quota≒20回/日で容量を積み増す）。3.5→3→2.5の順に下げる。
+    ("models/gemini-3.5-flash",       2048),   # ② 3.5 flash（thinking系なので枠大きめ）
+    ("models/gemini-3-flash-preview", 2048),   # ③ 3 flash preview
+    ("models/gemini-2.5-flash-lite",  1024),   # ④ 2.5 flash-lite（lite・念のため余裕）
+    (MODEL_FALLBACK,                  3000),   # ⑤ gemma-4-26b（容量潤沢・低速・実績）
+    ("models/gemma-4-31b-it",         3000),   # ⑥ gemma-4-31b（最終フォールバック・batch実績）
 ]
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
