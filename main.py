@@ -817,10 +817,52 @@ SUMMARY_TRIGGER_WORDS = MEMORY_TRIGGER_WORDS + [
 ]
 
 
-async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = None) -> list[dict]:
-    """過去日報(サーバー全体)の意味検索＋名前の語彙一致ハイブリッド。「去年いた○○覚えてる?」等の想起用。
+def _parse_query_date_prefixes(query: str, now_year: int) -> list[str]:
+    """クエリから年月の手がかりを抽出し、日報の日付(YYYY-MM-DD)に対する一致パターンを返す。
+    各要素: "YYYY-MM"(その年月) / "YYYY-"(その年) / "*-MM"(年不明のその月)。手がかりなしは []。
+    例: '2025年5月'→['2025-05'] / '去年の5月'(今2026)→['2025-05'] / '2025の話'→['2025-'] / '5月'→['*-05']。"""
+    q = query
+    rel_year = None
+    if "去年" in q or "昨年" in q:
+        rel_year = now_year - 1
+    elif "今年" in q:
+        rel_year = now_year
+    # ① 年+月（2025年5月 / 2025-05 / 2025/5）を最優先で確定
+    m = re.search(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*月?", q)
+    if m:
+        return [f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"]
+    # ② 年のみ / 月のみ / 相対年の組み合わせ
+    y  = re.search(r"(20\d{2})\s*年?", q)
+    mo = re.search(r"(?<!\d)(\d{1,2})\s*月", q)
+    year = rel_year if rel_year else (int(y.group(1)) if y else None)
+    if year and mo:
+        return [f"{year:04d}-{int(mo.group(1)):02d}"]
+    if year:
+        return [f"{year:04d}-"]
+    if mo:
+        return [f"*-{int(mo.group(1)):02d}"]
+    return []
 
-    ① ゲート: SUMMARY_TRIGGER_WORDS を含み、かつ8文字以上のときだけ実行。
+
+def _date_prefix_hit(doc: dict, prefixes: list[str]) -> bool:
+    """日報docの内容日付(retro_date優先・無ければcreated_at)が prefixes のいずれかに一致するか。"""
+    ds = doc.get("retro_date") or str(doc.get("created_at", ""))[:10]   # "YYYY-MM-DD"
+    if len(ds) < 7:
+        return False
+    for p in prefixes:
+        if p.startswith("*-"):          # 年不明の月一致（例: '*-05' → 任意年の5月）
+            if ds[5:7] == p[2:]:
+                return True
+        elif ds.startswith(p):          # 'YYYY-MM' or 'YYYY-'
+            return True
+    return False
+
+
+async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = None) -> list[dict]:
+    """過去日報(サーバー全体)の意味検索＋名前の語彙一致＋日付想起のハイブリッド。「去年いた○○覚えてる?」
+    「2025年5月どうだった?」等の想起用。
+
+    ① ゲート: SUMMARY_TRIGGER_WORDS を含む or 年月の指定があり、かつ8文字以上のときだけ実行。
        ※「総括して」系（集計）はトリガー語に当たらず発火しない＝/report 案件と棲み分け（意図的）。
        ※発火1回 = embed1回＋summaries全件(~970)読込＋cosine。低トラフィックなホームギルド前提のコスト感。
     ② 意味検索: embedding 付き summary を全件 in-Python cosine（retro日報も含める＝歴史想起が目的）。
@@ -830,7 +872,10 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
     """
     if len(query) < 8:
         return []
-    if not any(w in query for w in SUMMARY_TRIGGER_WORDS):
+    # 日付の手がかり(年月)があればトリガー語なしでも発火させる（「2025年5月どうだった?」を拾う）
+    now_year      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).year
+    date_prefixes = _parse_query_date_prefixes(query, now_year)
+    if not date_prefixes and not any(w in query for w in SUMMARY_TRIGGER_WORDS):
         return []
     qvec = await _embed_query_for_summaries(query)
     if not qvec:
@@ -872,9 +917,19 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
     sem_floor = max(SUMMARY_SIM_THRESHOLD, best - SUMMARY_SEM_REL_GAP)
     semantic  = [d for sc, d in scored if sc >= sem_floor]
 
-    # ④ needle 優先で統合・重複排除（_id でユニーク化）
+    # ★日付想起: クエリに年月があれば、その期間の日報を最優先で拾う（cosineが低くても日付一致を採用）。
+    #   意味検索は日付では引けない（embeddingは話題で似せる）ため、「2025年5月の話」を確実に当てる主役。
+    #   名前も併記されていれば、期間内でその名前を含むdocを前に寄せる（cosine順は安定ソートで保持）。
+    date_matched = []
+    if date_prefixes:
+        in_period = [d for _, d in scored if _date_prefix_hit(d, date_prefixes)]  # cosine降順を維持
+        if present_names:
+            in_period.sort(key=lambda d: 0 if any(n in d.get("summary", "") for n in present_names) else 1)
+        date_matched = in_period[:top_k]
+
+    # ④ 日付一致 → needle → semantic の優先順で統合・重複排除（_id でユニーク化）
     merged, seen = [], set()
-    for d in needle + semantic:
+    for d in date_matched + needle + semantic:
         k = d.get("_id")
         if k in seen:
             continue
@@ -884,6 +939,7 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
             break
 
     print(f"[summary] best={best:.3f} floor={sem_floor:.2f} "
+          f"date={date_prefixes or 'なし'} datehit={len(date_matched)} "
           f"needle={len(needle)} sem={len(semantic)} → {len(merged)}件 "
           f"names={list(present_names) or 'なし'}")
     out = []
