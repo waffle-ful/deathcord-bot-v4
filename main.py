@@ -71,6 +71,18 @@ GUARD_TRUSTED_IDS = {
     if x.isdigit()
 }
 
+# --- メイド発言の自動再投稿（消されても復活）設定 ---
+# メイドの「会話発言」が誰かに削除されたら自動で再投稿する。Discord仕様上「消せなくする」のは
+# 不可能なので、消されたら蘇らせる方式。OWNER_ID / 免除ロール所持者 / サーバーオーナー /
+# bot自身 の削除だけは「正当な削除」とみなして復活させない（判定は監査ログ）。
+# "0"/"false"/"no" で無効化（既定は有効）
+MAID_REPOST_ENABLED = (os.environ.get("MAID_REPOST_ENABLED", "1").strip().lower()
+                       not in ("0", "false", "no", ""))
+# このロール所持者が消した発言は復活させない（=正当な削除）。未設定(0)なら OWNER/サーバーオーナーのみ免除
+MAID_REPOST_EXEMPT_ROLE_ID = int(os.environ.get("MAID_REPOST_EXEMPT_ROLE_ID") or 0)
+# 再投稿のペース（秒）。無制限に復活させるが、削除連打で送信レート上限に当たらないよう最低限ならす
+MAID_REPOST_PACE_SECONDS = float(os.environ.get("MAID_REPOST_PACE_SECONDS") or 2.0)
+
 # --- Gemini クライアント (新SDK) ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -2134,7 +2146,9 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         total_delay = rate_wait + _typing_delay(ai_text)
         async with message.channel.typing():
             await asyncio.sleep(total_delay)
-        await message.reply(f"{personality['icon']} {ai_text}")
+        _reply_text = f"{personality['icon']} {ai_text}"
+        sent = await message.reply(_reply_text)
+        _track_maid_message(sent, _reply_text)  # 消されても復活させるため記録
 
     if "（" not in ai_text:
         await save_butler_history(uid, "user", raw_content[:200])
@@ -2166,7 +2180,9 @@ async def maid_respond_cmd(interaction: discord.Interaction, content: str):
     if ai_text:
         total_delay = rate_wait + _typing_delay(ai_text)
         await asyncio.sleep(total_delay)
-        await interaction.followup.send(f"{personality['icon']} {ai_text}")
+        _reply_text = f"{personality['icon']} {ai_text}"
+        sent = await interaction.followup.send(_reply_text)  # 非ephemeral=削除可・追跡可
+        _track_maid_message(sent, _reply_text)  # 消されても復活させるため記録
 
     if "（" not in ai_text:
         await save_butler_history(uid, "user", raw_content[:200])
@@ -2769,6 +2785,120 @@ async def on_message(message: discord.Message):
 
     except Exception as e:
         print(f"[ERROR] on_message: {e}")
+        traceback.print_exc()
+
+
+# =============================================================================
+# メイド発言の自動再投稿（消されても復活）
+#   - メイドが「会話発言」を送るたびに _track_maid_message で内容を覚えておく。
+#   - その発言が消されたら on_raw_message_delete が拾い、削除者を監査ログで確認。
+#     OWNER / 免除ロール / サーバーオーナー / bot自身 の削除なら尊重（復活させない）。
+#     それ以外（イタチ的な削除）は同じ内容を再投稿する（無制限・ペースだけ最低限ならす）。
+#   注意: 追跡対象の発言を delete_after= 付きで送ってはいけない。自動消滅も削除イベントを
+#         発火し、監査ログが無いため「外部削除」と誤認して復活させてしまう。
+#   注意: キャッシュはメモリ上のみ。Render再起動で消えるため、再起動前の発言は復活できない
+#         （「たった今消された」窓だけ守れれば十分なので許容）。
+# =============================================================================
+_maid_msg_cache: dict[int, dict] = {}      # message_id -> {channel_id, content, ts, reposts}
+_MAID_CACHE_MAX = 1000
+_maid_intentional_deletes: set[int] = set()  # bot自身が消したメイド発言ID（復活させない用・現状は休眠）
+
+def _track_maid_message(msg, content: str):
+    """メイドの会話発言を記録。後で消されたら復活に使う。msg は送信済みの discord.Message。"""
+    if not MAID_REPOST_ENABLED or msg is None:
+        return
+    try:
+        _maid_msg_cache[msg.id] = {
+            "channel_id": msg.channel.id,
+            "content":    content,
+            "ts":         time.time(),
+            "reposts":    0,
+        }
+        # 古いものから間引き（メモリ上限）
+        while len(_maid_msg_cache) > _MAID_CACHE_MAX:
+            _maid_msg_cache.pop(next(iter(_maid_msg_cache)), None)
+    except Exception as e:
+        print(f"[WARN] _track_maid_message: {e}")
+
+
+async def _maid_delete_is_exempt(payload: discord.RawMessageDeleteEvent) -> bool:
+    """削除者が OWNER / 免除ロール / サーバーオーナー / bot自身 なら True（=復活させない）。
+    判定不能（権限なし・監査ログ未反映）のときは False（=守る側＝復活）に倒す。"""
+    try:
+        guild = client.get_guild(payload.guild_id) if payload.guild_id else None
+        if guild is None:
+            return False
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            # View Audit Log 権限が無いと削除者を特定できない＝オーナーが消しても復活してしまう。
+            # 手掛かりを残すため警告を出す（症状報告時の診断用）。
+            print("[WARN] maid-repost: View Audit Log 権限が無いため削除者を判定できません"
+                  "（OWNER/ロール所持者が消しても復活します）")
+            return False
+        await asyncio.sleep(1.5)  # 監査ログ反映待ち（短すぎると初回削除を取りこぼす）
+        async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.message_delete):
+            # 「bot自身の発言が消された」最新エントリだけを見る
+            if not (entry.target and entry.target.id == client.user.id):
+                continue
+            age = (datetime.datetime.now(datetime.timezone.utc)
+                   - ensure_utc(entry.created_at)).total_seconds()
+            if age > 15:
+                # この削除に対応する新しいエントリが無い＝未反映/取りこぼし。守る側に倒す。
+                return False
+            deleter = entry.user
+            if deleter is None:
+                return False
+            if deleter.id == client.user.id:
+                return True  # bot自身（空気くん）の削除は尊重
+            if OWNER_ID and deleter.id == OWNER_ID:
+                return True
+            if deleter.id == guild.owner_id:
+                return True
+            member = guild.get_member(deleter.id)
+            if (member and MAID_REPOST_EXEMPT_ROLE_ID
+                    and any(r.id == MAID_REPOST_EXEMPT_ROLE_ID for r in member.roles)):
+                return True
+            return False  # それ以外の人の削除 → 復活させる
+        return False  # bot宛ての削除エントリが見つからない → 守る側
+    except Exception as e:
+        print(f"[WARN] _maid_delete_is_exempt: {e}")
+        return False
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """メイドの会話発言が消されたら復活させる（消した人がOWNER/免除ロール/bot自身なら尊重）。"""
+    try:
+        if not MAID_REPOST_ENABLED:
+            return
+        mid  = payload.message_id
+        info = _maid_msg_cache.get(mid)
+        if not info:
+            return  # メイドの会話発言として記録が無い＝対象外（Bump通知やパネル等は無視）
+        # bot自身が意図的に消したものは尊重（現状この経路は使われないが将来用）
+        if mid in _maid_intentional_deletes:
+            _maid_intentional_deletes.discard(mid)
+            _maid_msg_cache.pop(mid, None)
+            return
+        if await _maid_delete_is_exempt(payload):
+            _maid_msg_cache.pop(mid, None)
+            return
+        channel = client.get_channel(info["channel_id"])
+        if channel is None:
+            _maid_msg_cache.pop(mid, None)
+            return
+        # 無制限に復活させるが、削除連打で送信レート上限に当たらない程度にならす
+        await asyncio.sleep(MAID_REPOST_PACE_SECONDS)
+        sent = await channel.send(info["content"])
+        # 復活させた発言も追跡を引き継ぐ（また消されたら再び復活させる＝無制限）
+        _maid_msg_cache.pop(mid, None)
+        _track_maid_message(sent, info["content"])
+        if sent.id in _maid_msg_cache:
+            _maid_msg_cache[sent.id]["reposts"] = info.get("reposts", 0) + 1
+        print(f"[maid-repost] 発言を復活 (#{info.get('reposts', 0) + 1}) "
+              f"ch={info['channel_id']}")
+    except Exception as e:
+        print(f"[ERROR] on_raw_message_delete: {e}")
         traceback.print_exc()
 
 
@@ -7021,7 +7151,9 @@ async def idle_chatter_task():
                             result = await _generate_idle_opener()
                             if result:
                                 text, personality = result
-                                await ch.send(f"{personality['icon']} {text}")
+                                _idle_text = f"{personality['icon']} {text}"
+                                sent = await ch.send(_idle_text)
+                                _track_maid_message(sent, _idle_text)  # 消されても復活
                                 _last_idle_post = now_utc
                                 print(f"[idle] 自発投稿: {text[:40]}")
         except Exception as e:
