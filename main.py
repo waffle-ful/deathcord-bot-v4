@@ -481,6 +481,13 @@ MIMIC_DEEP_PROMPT = """あなたは今から「{name}」という人物の深層
 MIMIC_SITUATION_FIRST  = "今の状況を踏まえて、{name}が今この瞬間に思っていそうな本音を1文で言え。"
 MIMIC_SITUATION_REACT  = "直前の発言「{trigger}」に対して、{name}ならどう本音で反応するか1文で言え。"
 
+# ミミック反応の安全弁（暴走防止）。過去、反応経路はチャンネル全発言にノークールダウンで
+# Gemini呼び出しを連打しうる構造だった。確率ゲート＋クールダウン＋ターン上限で連投と
+# スレッド/レート枯渇を構造的に封じる。
+MIMIC_REACT_CHANCE   = 0.35   # 人間の各発言に反応する確率（全部には反応しない）
+MIMIC_REACT_COOLDOWN = 20     # 同一チャンネルで連続反応しない最小間隔（秒）
+MIMIC_MAX_TURNS      = 8       # 1セッション(5分)あたりの最大発言数（first 1回を含む）
+
 
 def _build_mimic_profile(doc: dict) -> str:
     """ミミック対象のプロフィール文字列を構築"""
@@ -561,13 +568,9 @@ async def _run_mimic_session(channel: discord.TextChannel, session: dict):
             summary=summary,
             situation=MIMIC_SITUATION_FIRST.format(name=name),
         )
-        raw = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=MODEL_BOOSTER,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=120),
-        )
-        text = raw.text.strip()
+        # レート計上＋空応答ハンドリングを共通化（生API直叩きはCLAUDE.md違反＝レート枯渇で全体沈黙の温床）。
+        # 失敗時は "" が返り、本人名義の誤投稿を出さずに黙る。
+        text = await _call_model(MODEL_BOOSTER, prompt, max_tokens=120, temperature=0.85)
         if text:
             await asyncio.sleep(random.uniform(1.5, 3.0))
             await _send_mimic(channel, session, text)
@@ -593,13 +596,8 @@ async def _mimic_react(channel: discord.TextChannel, session: dict, trigger_text
             summary=summary,
             situation=MIMIC_SITUATION_REACT.format(name=name, trigger=trigger_text[:100]),
         )
-        raw = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=MODEL_BOOSTER,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=120),
-        )
-        text = raw.text.strip()
+        # _call_model 経由（レート計上・空応答処理を共通化）。失敗時は "" で黙る。
+        text = await _call_model(MODEL_BOOSTER, prompt, max_tokens=120, temperature=0.85)
         if text:
             await asyncio.sleep(random.uniform(2.0, 4.5))
             await _send_mimic(channel, session, text)
@@ -1527,9 +1525,11 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
     return "\n".join(lines)
 
 
-async def _call_model(model: str, prompt: str, max_tokens: int | None = None) -> str:
+async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
+                      temperature: float = 0.8) -> str:
     """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。
-    max_tokens 未指定時はモデル名から自動判定（gemma系はthinking予算ぶん大きめ）。"""
+    max_tokens 未指定時はモデル名から自動判定（gemma系はthinking予算ぶん大きめ）。
+    temperature を上げたい呼び出し（例: ミミックの本音生成=0.85）は引数で渡す。"""
     _rate_record()  # レートリミッター記録
     if max_tokens is None:
         # gemma-4系は thinking 予算を出力トークンから消費するため、300では思考だけで枯れて
@@ -1541,7 +1541,7 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None) ->
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
-            temperature=0.8,
+            temperature=temperature,
             max_output_tokens=max_tokens,
         ),
     )
@@ -2559,6 +2559,20 @@ async def on_message(message: discord.Message):
             )
             if nb_count % 30 == 0:  # 30発言ごとに変更（レート制限対策）
                 asyncio.create_task(_analyze_nonbooster_realtime(uid, message.author.display_name))
+
+        # ミミック反応: アクティブセッションのあるチャンネルで、人間の発言に反応して本音を代弁する。
+        # ★暴走防止の要。ここに来る時点で bot/webhook は on_message:2397 で除外済み（自己ループ不可）。
+        #   ①対象本人には反応しない ②クールダウンは発火前に同期更新＝並行処理の連投を断つ
+        #   ③1セッションのターン上限で打ち切り ④確率ゲートで全発言には食いつかない。
+        _mimic_sess = _mimic_sessions.get(message.channel.id)
+        if (_mimic_sess and message.content.strip()
+                and uid != _mimic_sess["target_uid"]
+                and _mimic_sess.get("turn_count", 0) < MIMIC_MAX_TURNS):
+            _last_react = _mimic_sess.get("last_react_at")
+            _cooled = _last_react is None or (now - _last_react).total_seconds() >= MIMIC_REACT_COOLDOWN
+            if _cooled and random.random() < MIMIC_REACT_CHANCE:
+                _mimic_sess["last_react_at"] = now   # 発火前に更新＝並行on_messageによる連投を防ぐ
+                asyncio.create_task(_mimic_react(message.channel, _mimic_sess, message.content))
 
         # 自発的話しかけ（全ユーザー対象・ブースター専用チャンネルは除外）
         # メンション応答とまったく同じ経路（maid_respond_queued→_build_prompt）を通すことで、
@@ -3595,6 +3609,7 @@ async def mimic_cmd(interaction: discord.Interaction, member: discord.Member):
         "avatar_url":  member.display_avatar.url,
         "expires_at":  expires_at,
         "turn_count":  0,
+        "last_react_at": None,   # 反応のクールダウン基準（暴走防止）
         "webhook":     None,
         "invoker":     str(interaction.user.id),
     }
