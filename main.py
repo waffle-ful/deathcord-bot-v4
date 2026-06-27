@@ -1374,6 +1374,91 @@ def _bigfive_directives(bigfive: dict) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+# =============================================================================
+# 相性診断 / サーバー分布 用ヘルパー
+#   ※自己申告(bigfive_self)のみ使用＝検証済み尺度・推定optout者にも安全（本人が出した値）。
+#   ※Big Fiveの対人相性の予測力は研究上弱い。あくまで透明な式の“エンタメ目安”として扱う。
+# =============================================================================
+_COMPAT_WEIGHTS = {  # 類似性の重み（協調性を最重視・外向は軽め）
+    "agreeableness": 0.30, "openness": 0.22, "conscientiousness": 0.20,
+    "extraversion": 0.12, "neuroticism": 0.16,
+}
+_SERVER_TYPE = {  # 平均が最も高い因子 → サーバーの“タイプ”ラベル（情緒不安定さは除外）
+    "openness":          "好奇心の探検隊🔭",
+    "conscientiousness": "きっちり堅実派📋",
+    "extraversion":      "わいわい社交派🎉",
+    "agreeableness":     "平和な癒し系☕",
+}
+
+
+def _bf_scores(bigfive: dict) -> dict:
+    """bigfive(_self) から {factor: score(0-100)} だけを取り出す。"""
+    if not isinstance(bigfive, dict):
+        return {}
+    out = {}
+    for f in FACTOR_JA:
+        seg = bigfive.get(f)
+        if isinstance(seg, dict) and isinstance(seg.get("score"), (int, float)):
+            out[f] = float(seg["score"])
+    return out
+
+
+def _bar10(score: float) -> str:
+    """0-100 を10ブロックのバーに変換。"""
+    filled = max(0, min(10, round(score / 10)))
+    return "█" * filled + "░" * (10 - filled)
+
+
+def compute_compatibility(bf_a: dict, bf_b: dict) -> dict | None:
+    """2人の自己申告Big Fiveから相性スコア(40-99)を算出。共通因子が無ければNone。
+    因子ごと類似性(100-|差|)の重み付き平均＋協調性高で加点・情緒不安定さ高で減点。"""
+    sa, sb = _bf_scores(bf_a), _bf_scores(bf_b)
+    common = [f for f in FACTOR_JA if f in sa and f in sb]
+    if not common:
+        return None
+    wsum = sum(_COMPAT_WEIGHTS[f] for f in common)
+    sim  = sum((100 - abs(sa[f] - sb[f])) * _COMPAT_WEIGHTS[f] for f in common) / wsum
+    adj  = 0.0
+    if "agreeableness" in common:   # 協調性が高いペアは円満（+）
+        adj += ((sa["agreeableness"] + sb["agreeableness"]) / 2 - 50) * 0.10
+    if "neuroticism" in common:     # 情緒不安定さが高いペアは波風（-）
+        adj -= ((sa["neuroticism"] + sb["neuroticism"]) / 2 - 50) * 0.10
+    score    = max(40, min(99, round(sim + adj)))
+    closest  = min(common, key=lambda f: abs(sa[f] - sb[f]))   # 最も近い因子
+    farthest = max(common, key=lambda f: abs(sa[f] - sb[f]))   # 最も離れた因子
+    return {"score": score, "common": common, "sa": sa, "sb": sb,
+            "closest": closest, "farthest": farthest}
+
+
+def _compat_label(score: int) -> tuple[str, str]:
+    if score >= 85: return ("運命級✨", "💞")
+    if score >= 72: return ("好相性",   "💖")
+    if score >= 60: return ("いい感じ", "😊")
+    if score >= 50: return ("ぼちぼち", "🙂")
+    return ("これから育つ相性", "🌱")
+
+
+async def _aisho_comment(name_a: str, name_b: str, result: dict) -> str:
+    """相性の一言講評（メイド口調・捏造禁止）。LLM失敗時もテンプレで必ず返す。"""
+    closest, farthest = result["closest"], result["farthest"]
+    facts = (f"{name_a}と{name_b}は「{FACTOR_JA[closest]}」が近く、"
+             f"「{FACTOR_JA[farthest]}」は離れている。相性スコアは{result['score']}点。")
+    prompt = (
+        "あなたは可愛いメイドです。2人の性格相性をユーザーに楽しく伝えます。\n"
+        f"【事実（これだけを根拠にし、新たな事実を創作しない）】\n{facts}\n"
+        "この事実だけを根拠に、2〜3文で前向き＆ちょっとお茶目に講評してください。"
+        "似ている点・違う点をどう活かせるかを一言添えて。出力は本文のみ。"
+    )
+    try:
+        text = await _call_model(MODEL_BOOSTER, prompt, max_tokens=200, temperature=0.85)
+        if text:
+            return text
+    except Exception as e:
+        print(f"[WARN] _aisho_comment: {e}")
+    return (f"「{FACTOR_JA[closest]}」が似ているのは大きな強み。"
+            f"「{FACTOR_JA[farthest]}」の違いはお互いを補い合えるポイントだよ！")
+
+
 # 自己-行動 乖離レイヤー（PERSONALITY_SPEC.md レイヤーB拡張・SOKA重み付け）
 #   自己申告(bigfive_self) と 客観行動(behavior_signals.pct) のギャップを、行動が自己と
 #   同等以上に妥当な因子に限って「振り返るきっかけ」として提示する。LLM推定(bigfive)は使わない
@@ -3370,6 +3455,125 @@ async def personalitytest_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=view.page_embed(), view=view, ephemeral=True)
 
 
+# =============================================================================
+# /相性 — 2人のBig Five相性診断（自己申告ベース・エンタメ）
+#   フライホイール: 相性を見るには /personalitytest が要る → 受験が増える → 全機能が精度UP
+# =============================================================================
+_aisho_cooldown: dict[int, datetime.datetime] = {}  # チャンネル単位の連打防止
+
+
+@client.tree.command(name="相性", description="2人のBig Five相性を診断（エンタメ）")
+@app_commands.describe(member="相性を見る相手", member2="(任意) もう一方。省略すると自分との相性")
+async def aisho_cmd(interaction: discord.Interaction, member: discord.Member,
+                    member2: discord.Member | None = None):
+    if not await check_home_guild(interaction):
+        return
+    a = interaction.user if member2 is None else member
+    b = member if member2 is None else member2
+    if a.id == b.id:
+        await interaction.response.send_message(
+            "同じ人どうしの相性は測れないよ…！別の相手を選んでね。", ephemeral=True)
+        return
+    # クールダウン（チャンネル20s・連打防止）
+    now_ts = datetime.datetime.now(datetime.timezone.utc)
+    last   = _aisho_cooldown.get(interaction.channel_id)
+    if last and (now_ts - last).total_seconds() < 20:
+        await interaction.response.send_message(
+            "ちょっと待ってね（相性診断はクールダウン中だよ）", ephemeral=True)
+        return
+    _aisho_cooldown[interaction.channel_id] = now_ts
+
+    await interaction.response.defer()
+    doc_a = await users_col.find_one({"_id": str(a.id)}, {"profile.bigfive_self": 1}) or {}
+    doc_b = await users_col.find_one({"_id": str(b.id)}, {"profile.bigfive_self": 1}) or {}
+    bf_a  = (doc_a.get("profile") or {}).get("bigfive_self") or {}
+    bf_b  = (doc_b.get("profile") or {}).get("bigfive_self") or {}
+    missing = [m.display_name for m, bf in [(a, bf_a), (b, bf_b)] if not _bf_scores(bf)]
+    if missing:
+        await interaction.followup.send(
+            f"⚠️ **{'・'.join(missing)}** さんはまだ性格診断を受けていないみたい。\n"
+            f"`/personalitytest`（10問）を受けてもらうと相性が見られるよ！")
+        return
+
+    result = compute_compatibility(bf_a, bf_b)
+    if not result:
+        await interaction.followup.send("相性を計算できる共通データが足りなかった…ごめんね。")
+        return
+    score        = result["score"]
+    label, emoji = _compat_label(score)
+    comment      = await _aisho_comment(a.display_name, b.display_name, result)
+
+    embed = discord.Embed(
+        title=f"{emoji} {a.display_name} × {b.display_name} の相性",
+        description=f"**相性スコア: {score} / 100**　（{label}）\n{comment}",
+        color=0xff6fa3,
+    )
+    for f in FACTOR_JA:
+        if f in result["sa"] and f in result["sb"]:
+            embed.add_field(
+                name=FACTOR_JA[f],
+                value=(f"{a.display_name[:6]} `{_bar10(result['sa'][f])}`\n"
+                       f"{b.display_name[:6]} `{_bar10(result['sb'][f])}`"),
+                inline=True,
+            )
+    embed.set_footer(text="自己申告(TIPI-J)ベースのエンタメ診断 • 相性は科学的には目安程度です")
+    await interaction.followup.send(embed=embed)
+
+
+# =============================================================================
+# /サーバー性格 — サーバー全体のBig Five分布（自己申告ベース・集計のみ＝個人特定なし）
+# =============================================================================
+@client.tree.command(name="サーバー性格", description="サーバー全体のBig Five分布を表示")
+async def server_personality_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    await interaction.response.defer()
+    sums   = {f: 0.0 for f in FACTOR_JA}
+    counts = {f: 0   for f in FACTOR_JA}
+    bands  = {f: {"高": 0, "中": 0, "低": 0} for f in FACTOR_JA}
+    n = 0
+    cursor = users_col.find({"profile.bigfive_self": {"$exists": True}},
+                            {"profile.bigfive_self": 1})
+    async for d in cursor:
+        bf  = (d.get("profile") or {}).get("bigfive_self") or {}
+        got = False
+        for f in FACTOR_JA:
+            seg = bf.get(f)
+            if isinstance(seg, dict) and isinstance(seg.get("score"), (int, float)):
+                sums[f] += seg["score"]; counts[f] += 1; got = True
+                if seg.get("band") in bands[f]:
+                    bands[f][seg["band"]] += 1
+        if got:
+            n += 1
+    if n == 0:
+        await interaction.followup.send(
+            "まだ誰も性格診断を受けていないみたい。`/personalitytest` で受けると分布が見られるよ！")
+        return
+
+    means = {f: round(sums[f] / counts[f]) for f in FACTOR_JA if counts[f]}
+    # サーバータイプ: 平均が最も高い因子（情緒不安定さは“低い方が良い”ので除外）
+    type_cand  = {f: means[f] for f in means if f != "neuroticism"}
+    top        = max(type_cand, key=type_cand.get) if type_cand else None
+    type_label = _SERVER_TYPE.get(top, "バランス型")
+
+    embed = discord.Embed(
+        title="🧭 このサーバーの性格分布",
+        description=f"診断済み **{n}人** の平均\n**タイプ: {type_label}**",
+        color=0x6f9bff,
+    )
+    for f in FACTOR_JA:
+        if f not in means:
+            continue
+        bd = bands[f]
+        embed.add_field(
+            name=f"{FACTOR_JA[f]}（{FACTOR_HINT[f]}）",
+            value=f"`{_bar10(means[f])}` 平均{means[f]}\n高{bd['高']} ・ 中{bd['中']} ・ 低{bd['低']}",
+            inline=False,
+        )
+    embed.set_footer(text="自己申告(TIPI-J)ベース • /personalitytest で参加できるよ")
+    await interaction.followup.send(embed=embed)
+
+
 @client.tree.command(name="privacy", description="AIによる性格推定のオン/オフを切り替える")
 async def privacy_cmd(interaction: discord.Interaction):
     uid = str(interaction.user.id)
@@ -3569,12 +3773,13 @@ async def report_cmd(interaction: discord.Interaction, date: str = "今日"):
         await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 
-@client.tree.command(name="mimic", description="指定メンバーの深層心理をAIが代弁（ブースター専用）")
+@client.tree.command(name="mimic", description="指定メンバーの深層心理をAIが代弁（ブースター/管理者）")
 @app_commands.describe(member="ミミック対象のメンバー")
 async def mimic_cmd(interaction: discord.Interaction, member: discord.Member):
-    # ブースター確認
+    # ブースター or 管理者（管理者は動作確認・テスト用に開放）
     is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
-    if not is_booster:
+    is_admin   = getattr(interaction.user.guild_permissions, "administrator", False)
+    if not (is_booster or is_admin):
         await interaction.response.send_message("このコマンドはブースター専用です。", ephemeral=True)
         return
 
@@ -3646,10 +3851,11 @@ async def mimic_cmd(interaction: discord.Interaction, member: discord.Member):
     asyncio.create_task(_auto_end())
 
 
-@client.tree.command(name="stopmimic", description="進行中のミミックセッションを停止（ブースター専用）")
+@client.tree.command(name="stopmimic", description="進行中のミミックセッションを停止（ブースター/管理者）")
 async def stopmimic_cmd(interaction: discord.Interaction):
     is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
-    if not is_booster:
+    is_admin   = getattr(interaction.user.guild_permissions, "administrator", False)
+    if not (is_booster or is_admin):
         await interaction.response.send_message("このコマンドはブースター専用です。", ephemeral=True)
         return
 
