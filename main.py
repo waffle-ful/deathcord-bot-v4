@@ -74,6 +74,23 @@ MODEL_GENERAL_FB     = "models/gemini-3.1-flash-lite"          # バックグラ
 # 実質潤沢で容量に余裕があり、品質も同等以上（遅さは撃ちっぱなしの裏処理では無関係）。
 # 注意: gemma-4 は thinking 予算を出力トークンから食うため、必ず大きめの max_output_tokens を渡すこと。
 MODEL_BACKGROUND     = "models/gemma-4-26b-a4b-it"            # 裏処理用（gemma-4・速度不問・容量に強い）
+
+# 会話用フォールバック連鎖（_run_ai_booster が上から順に試し、最初に本文が返ったモデルを採用）。
+# 狙い: flash-lite が無料枠の容量429（深夜=欧米ピークで共有プール枯渇）で落ちても、別quotaの
+# 複数モデルへ順にフェイルオーバーして「メイドが黙る」のを防ぐ。各タプル=(model_id, max_output_tokens)。
+# thinking系は枠を大きめに（小さいとMAX_TOKENSで空応答になる）。最後は容量潤沢だが低速のgemmaで確実に受ける。
+# ★重要: モデルIDは必ず /listmodels で実在確認してから追加すること。無効名は例外で黙ってスキップされ、
+#   「容量が増えた気がするだけで実際ゼロ」になる（ログには NotFound→次モデルへ と出るので確認可能）。
+MODEL_CHAIN: list[tuple[str, int]] = [
+    (MODEL_BOOSTER,             300),    # ① primary: flash-lite（高速・実績）
+    # --- ↓ /listmodels で実在ID確認後に有効化。各々別quota(≈20回/日)で容量を積み増す ---
+    # ("models/gemini-3.5-flash",       2048),
+    # ("models/gemini-3-flash",         2048),
+    # ("models/gemini-2.5-flash",       2048),
+    # ("models/gemini-2.5-flash-lite",   768),
+    (MODEL_FALLBACK,           3000),    # ⑥ gemma-4-26b（容量潤沢・低速・実績）
+    ("models/gemma-4-31b-it",  3000),    # ⑦ gemma-4-31b（最終フォールバック・batchで実績あり）
+]
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
 # --- ランク・ロール設定 ---
@@ -1446,13 +1463,15 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
     return "\n".join(lines)
 
 
-async def _call_model(model: str, prompt: str) -> str:
-    """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。"""
+async def _call_model(model: str, prompt: str, max_tokens: int | None = None) -> str:
+    """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。
+    max_tokens 未指定時はモデル名から自動判定（gemma系はthinking予算ぶん大きめ）。"""
     _rate_record()  # レートリミッター記録
-    # gemma-4系は thinking 予算を出力トークンから消費するため、300では思考だけで枯れて
-    # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
-    # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
-    max_tokens = 3000 if "gemma" in model else 300
+    if max_tokens is None:
+        # gemma-4系は thinking 予算を出力トークンから消費するため、300では思考だけで枯れて
+        # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
+        # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
+        max_tokens = 3000 if "gemma" in model else 300
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=model,
@@ -1549,34 +1568,34 @@ def _typing_delay(text: str) -> float:
 
 
 async def _run_ai_booster(prompt: str) -> str:
-    """全ユーザー共通のAI呼び出し。fallback付き3回リトライ。"""
-    for model, label in [(MODEL_BOOSTER, "booster"), (MODEL_FALLBACK, "fallback")]:
-        for attempt in range(3):
-            try:
-                text = await _call_model(model, prompt)
-                if text:
-                    return text
-                # 空テキスト＝例外ではないので、ここを明示的にログしないと無言で握り潰される
-                print(f"[WARN] {label} attempt{attempt+1}: 空レスポンス（_call_modelのfinish_reasonを確認）")
-            except Exception as e:
-                if _is_location_error(e):
-                    print(f"[ERROR] {label}: location not supported — モデルを確認してください: {e}")
-                    return "（メイドは今、席を外しております…）"
-                elif _is_503(e):
-                    wait = (attempt + 1) * 10
-                    print(f"[WARN] 503 ({label}) attempt{attempt+1}, wait {wait}s")
-                    await asyncio.sleep(wait)
-                else:
-                    # 詳細ログ: 型・メッセージ・属性・トレースバックを全出力
-                    details = ""
-                    if hasattr(e, "__dict__") and e.__dict__:
-                        details = f" | attrs={e.__dict__}"
-                    if hasattr(e, "args") and len(e.args) > 1:
-                        details += f" | args={e.args}"
-                    print(f"[ERROR] {label} attempt{attempt+1}: {type(e).__name__}: {e}{details}")
-                    print(f"[ERROR] {label} prompt_len={len(prompt)}")
-                    traceback.print_exc()
-                    break
+    """会話用AI呼び出し。MODEL_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
+    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。"""
+    for model, max_tokens in MODEL_CHAIN:
+        try:
+            text = await _call_model(model, prompt, max_tokens)
+            if text:
+                return text
+            # 空（MAX_TOKENS/SAFETY等）＝このモデルでは生成できなかった→次モデルへ
+            print(f"[WARN] chain {model}: 空レスポンス→次モデルへ")
+            continue
+        except Exception as e:
+            if _is_location_error(e):
+                print(f"[WARN] chain {model}: location未対応→次モデルへ")
+                continue
+            if _is_503(e):
+                # 瞬間的な高負荷の可能性。同モデルを1回だけ短く粘ってから次へ。
+                await asyncio.sleep(3)
+                try:
+                    text = await _call_model(model, prompt, max_tokens)
+                    if text:
+                        return text
+                except Exception as e2:
+                    print(f"[WARN] chain {model}: 503再試行も失敗→次モデルへ: {type(e2).__name__}")
+                continue
+            # 429（容量）や NotFound（無効モデル名）含むその他 → 別quotaの次モデルへ即移行
+            print(f"[WARN] chain {model}: {type(e).__name__}: {str(e)[:160]}→次モデルへ")
+            continue
+    print(f"[ERROR] _run_ai_booster: 全モデル失敗 prompt_len={len(prompt)}")
     return "（メイドは今、席を外しております…）"
 
 
