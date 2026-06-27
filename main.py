@@ -1536,6 +1536,15 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None) ->
             max_output_tokens=max_tokens,
         ),
     )
+    # 実トークン計測: max_output_tokens を正しく決めるための実データ。
+    # out(=thoughts+answer) が cap に張り付いていたら枠不足（thinking系で本文が出ず MAX_TOKENS になる）。
+    um = getattr(response, "usage_metadata", None)
+    if um:
+        th  = um.thoughts_token_count or 0       # 思考トークン（非thinking系は0/None）
+        ans = um.candidates_token_count or 0      # 本文トークン
+        print(f"[tokens] {model.split('/')[-1]} cap={max_tokens} "
+              f"prompt={um.prompt_token_count or 0} thoughts={th} answer={ans} "
+              f"out={th + ans} total={um.total_token_count or 0}")
     text = response.text
     if not (text and text.strip()):
         # 空レスポンスの原因（MAX_TOKENS / SAFETY 等）を可視化
