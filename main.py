@@ -520,13 +520,41 @@ def _build_mimic_profile(doc: dict) -> str:
     return "\n".join(lines) if lines else "（データなし）"
 
 
-def _build_mimic_history(doc: dict) -> str:
-    """ミミック対象の過去発言を構築"""
-    history = doc.get("butler_history", [])
-    if not history:
-        return "（会話履歴なし）"
-    recent = [h for h in history if h["role"] == "user"][-10:]
-    return "\n".join(f"- {h['content']}" for h in recent)
+async def _fetch_recent_messages(uid: str, limit: int = 12) -> list[str]:
+    """messages_col から対象の実際の直近発言（生の言動）を取得。
+    ※author_id にインデックスが無いと全スキャンになる。limit で件数を絞り頻度も低く保つ。"""
+    try:
+        cursor = messages_col.find(
+            {"author_id": uid, "content": {"$nin": ["", None]}},
+            {"content": 1, "timestamp": 1},
+        ).sort("timestamp", -1).limit(limit)
+        out = []
+        async for d in cursor:
+            c = (d.get("content") or "").strip()
+            if c:
+                out.append(c)
+        return out
+    except Exception as e:
+        print(f"[WARN] _fetch_recent_messages: {e}")
+        return []
+
+
+async def _build_mimic_utterances(uid: str, doc: dict) -> str:
+    """ミミックのリアリティ源を束ねる: ①メイドとの会話 ②サーバーでの実際の発言（生の言動）
+    ③過去に言った主張・意見(claims)。profile/Big Five に加えて“生の言動”を直接見せて精度を上げる。"""
+    parts = []
+    bh = [h for h in (doc.get("butler_history") or []) if h.get("role") == "user"][-6:]
+    if bh:
+        parts.append("【メイドとの会話】\n" + "\n".join(f"- {h['content']}" for h in bh))
+    real = await _fetch_recent_messages(uid, limit=12)
+    if real:
+        parts.append("【サーバーでの実際の発言（口調・内容の生サンプル）】\n"
+                     + "\n".join(f"- {m}" for m in real))
+    claims = doc.get("claims") or []
+    if claims:
+        parts.append("【過去に言った主張・意見】\n"
+                     + "\n".join(f"- {c['content']}" for c in claims[-8:]))
+    return "\n\n".join(parts) if parts else "（会話履歴なし）"
 
 
 async def _send_mimic(channel: discord.TextChannel, session: dict, text: str):
@@ -557,7 +585,7 @@ async def _run_mimic_session(channel: discord.TextChannel, session: dict):
         name     = session["target_name"]
         doc      = await users_col.find_one({"_id": uid}) or {}
         profile  = _build_mimic_profile(doc)
-        history  = _build_mimic_history(doc)
+        history  = await _build_mimic_utterances(uid, doc)
         summary  = await get_latest_summary() or ""
         summary  = summary[:400]
 
@@ -585,7 +613,7 @@ async def _mimic_react(channel: discord.TextChannel, session: dict, trigger_text
         name    = session["target_name"]
         doc     = await users_col.find_one({"_id": uid}) or {}
         profile = _build_mimic_profile(doc)
-        history = _build_mimic_history(doc)
+        history = await _build_mimic_utterances(uid, doc)
         summary = await get_latest_summary() or ""
         summary = summary[:300]
 
@@ -1372,6 +1400,34 @@ def _bigfive_directives(bigfive: dict) -> str | None:
         elif seg.get("band") == "低" and f in _BF_DIRECTIVE_LOW:
             lines.append("- " + _BF_DIRECTIVE_LOW[f])
     return "\n".join(lines) if lines else None
+
+
+# レスバ煽りのBig Fiveチューニング: 相手の性格に合わせて煽り強度を変える。
+# 安全side＝高情緒不安定さは軽め（傷つけ防止）／低協調は遠慮なく論理で殴り合い（罵倒は別途禁止）。
+_RESUBA_BF_HIGH = {
+    "neuroticism":   "相手は情緒が揺れやすい。煽りは軽め・ユーモア寄りにし、人格攻撃や追い込みは避ける。",
+    "agreeableness": "相手は温和。ガチ詰めより、ニヤッとできる挑発・知的なツッコミ程度に留める。",
+}
+_RESUBA_BF_LOW = {
+    "agreeableness": "相手は是々非々で打たれ強い。遠慮せず論理でガッツリ殴り合ってよい（罵倒は除く）。",
+    "neuroticism":   "相手は落ち着いている。鋭い指摘や強めの論点をぶつけても受け止められる。",
+}
+
+
+def _resuba_bf_directive(bigfive: dict) -> str | None:
+    """相手のBig Fiveバンドからレスバの煽り強度ガイドを作る。無ければNone（中庸で行く）。"""
+    if not isinstance(bigfive, dict):
+        return None
+    lines = []
+    for f in ("neuroticism", "agreeableness"):
+        seg = bigfive.get(f)
+        if not isinstance(seg, dict):
+            continue
+        if seg.get("band") == "高" and f in _RESUBA_BF_HIGH:
+            lines.append(_RESUBA_BF_HIGH[f])
+        elif seg.get("band") == "低" and f in _RESUBA_BF_LOW:
+            lines.append(_RESUBA_BF_LOW[f])
+    return " ".join(lines) if lines else None
 
 
 # =============================================================================
@@ -2242,6 +2298,10 @@ class MyBot(discord.Client):
         await messages_col.create_index(
             [("guild_id", 1), ("timestamp", -1)], name="guild_ts", background=True
         )
+        # mimicの実発言取得 _fetch_recent_messages 用（author別の直近発言を効率取得）
+        await messages_col.create_index(
+            [("author_id", 1), ("timestamp", -1)], name="author_ts", background=True
+        )
         await messages_col.create_index(
             "created_at", name="ttl_30d", expireAfterSeconds=30*24*3600, background=True
         )
@@ -2659,10 +2719,35 @@ async def on_message(message: discord.Message):
                 _mimic_sess["last_react_at"] = now   # 発火前に更新＝並行on_messageによる連投を防ぐ
                 asyncio.create_task(_mimic_react(message.channel, _mimic_sess, message.content))
 
+        # レスバ追撃: 対象本人が発言したら論破メイドが噛みつく（反応式・回数制）。
+        # ★pile-on防止の要。bot/webhookは2397で除外済。①author.id一致で対象判定
+        #   ②remaining減算＋cooldown更新を create_task の前に同期実行（mimic教訓: 並行発言の連投を断つ／
+        #     fail-safeに「失敗しても回数消費」＝多めに殴らない方向）③optoutを毎回再チェック（途中拒否で即停止）。
+        _rsess = _resuba_sessions.get(message.channel.id)
+        if (_rsess and uid == _rsess["target_uid"] and message.content.strip()
+                and _rsess.get("remaining", 0) > 0):
+            _rlast = _rsess.get("last_reply_at")
+            if _rlast is None or (now - _rlast).total_seconds() >= RESUBA_SESS_CD:
+                _ropt = (await users_col.find_one({"_id": uid}, {"resuba_optout": 1}) or {}).get("resuba_optout")
+                if _ropt:
+                    _resuba_sessions.pop(message.channel.id, None)   # 途中でoptout→即終了
+                else:
+                    _rsess["remaining"]    -= 1     # ★発火前に減算（fail-safe）
+                    _rsess["last_reply_at"] = now    # ★発火前にcooldown更新（burst防止）
+                    asyncio.create_task(_resuba_react(message, _rsess))
+                    if _rsess["remaining"] <= 0:
+                        _resuba_sessions.pop(message.channel.id, None)   # 最後の一発で終了
+
+        # 二重発火抑制: ミミック/レスバがこの発言を処理する場面では自発話しかけを止める
+        # （同一メッセージにbot応答が2つ出るのを防ぐ。レスバは対象本人発言時のみ該当）。
+        _session_busy = (message.channel.id in _mimic_sessions) or (
+            _rsess is not None and uid == _rsess["target_uid"])
+
         # 自発的話しかけ（全ユーザー対象・ブースター専用チャンネルは除外）
         # メンション応答とまったく同じ経路（maid_respond_queued→_build_prompt）を通すことで、
         # 自発でも「ユーザーがインタラクトした時」と同じ品質・文脈で返す（botっぽさを消す）
-        if not welcomed and message.channel.id != BUTLER_CHANNEL_ID and message.content.strip():
+        if (not welcomed and not _session_busy
+                and message.channel.id != BUTLER_CHANNEL_ID and message.content.strip()):
             has_topic = any(w in message.content for w in TOPIC_TRIGGER_WORDS)
             nb_chance = NB_TALK_CHANCE_TOPIC if has_topic else NB_TALK_CHANCE
             if random.random() < nb_chance:
@@ -4146,26 +4231,49 @@ async def advocate_mode_cmd(interaction: discord.Interaction, auto: bool | None 
     await interaction.response.send_message(body, ephemeral=True)
 
 
-async def _generate_resuba(target: discord.Member, topic: str = "") -> str | None:
-    """論破人格で対象に議論を吹っかける一撃の挑発を生成（お遊び）。"""
+async def _generate_resuba(target: discord.Member, topic: str = "",
+                           reply_to: str | None = None) -> str | None:
+    """論破人格でレスバ文を生成（お遊び）。
+    reply_to=None: こちらから議論を仕掛ける一撃（/resuba）。
+    reply_to=本文: 相手の直近発言に噛みつく反応式（/レスバ追撃）。
+    claims＋相手のBig Fiveで煽り方をチューニングする。"""
     persona = PERSONALITIES["angry"]
-    doc = await users_col.find_one({"_id": str(target.id)}, {"claims": {"$slice": -8}}) or {}
+    doc = await users_col.find_one(
+        {"_id": str(target.id)},
+        {"claims": {"$slice": -8}, "profile.bigfive_self": 1, "profile.bigfive": 1},
+    ) or {}
     claims = doc.get("claims", [])
-    topic_clause = (
-        f"お題は「{topic.strip()}」。この話題で議論を仕掛けろ。"
-        if topic and topic.strip()
-        else "お題は自由。相手が言いそうなこと・最近の話題から、議論になりそうな論点を一つ選んで仕掛けろ。"
-    )
-    directive = (
-        f"これは誰かへの返信ではなく、あなたから「{target.display_name}」に自分から仕掛けるレスバ（言葉の打ち合い）です。\n"
-        f"{topic_clause}\n"
-        "相手を軽く挑発しつつ、反論したくなる論点を一つ投げて議論を吹っかけてください。"
-        "ただし容姿・人格の全否定など本気で傷つける罵倒は禁止。あくまで知的なレスバ・お遊びの範囲で。"
-        "前置きや「レスバ:」等のラベルなし・本文のみ・150文字以内。"
-    )
+    prof   = doc.get("profile") or {}
+    bf_dir = _resuba_bf_directive(prof.get("bigfive_self") or prof.get("bigfive") or {})
+
+    if reply_to:
+        directive = (
+            f"「{target.display_name}」がたった今こう言いました：「{reply_to[:200]}」\n"
+            "この発言に対して、論理の穴・前提の甘さ・矛盾を突いて鋭く反論してください。"
+            "あくまで知的なレスバ・お遊びの範囲で、容姿・人格の全否定など本気で傷つける罵倒は禁止。"
+            "前置きやラベルなし・本文のみ・120文字以内。"
+        )
+        history_note = "（これは相手の直近発言へのレスバ反応）"
+    else:
+        topic_clause = (
+            f"お題は「{topic.strip()}」。この話題で議論を仕掛けろ。"
+            if topic and topic.strip()
+            else "お題は自由。相手が言いそうなこと・最近の話題から、議論になりそうな論点を一つ選んで仕掛けろ。"
+        )
+        directive = (
+            f"これは誰かへの返信ではなく、あなたから「{target.display_name}」に自分から仕掛けるレスバ（言葉の打ち合い）です。\n"
+            f"{topic_clause}\n"
+            "相手を軽く挑発しつつ、反論したくなる論点を一つ投げて議論を吹っかけてください。"
+            "ただし容姿・人格の全否定など本気で傷つける罵倒は禁止。あくまで知的なレスバ・お遊びの範囲で。"
+            "前置きや「レスバ:」等のラベルなし・本文のみ・150文字以内。"
+        )
+        history_note = "（これは新たに仕掛けるレスバ。過去の個別会話履歴は使いません）"
+    if bf_dir:
+        directive += "\n【相手の性格への配慮】" + bf_dir
+
     base = persona["booster_prompt"].format(
         name=target.display_name,
-        history="（これは新たに仕掛けるレスバ。過去の個別会話履歴は使いません）",
+        history=history_note,
         content=directive,
     )
     if claims:
@@ -4174,9 +4282,39 @@ async def _generate_resuba(target: discord.Member, topic: str = "") -> str | Non
     else:
         prompt = base
     text = await _run_ai_booster(prompt)
-    if not text or "（" in text:
+    # 全モデル失敗時の sentinel「（メイドは今、席を外しております…）」だけを弾く。
+    # 旧 '"（" in text' は「（笑）」等の正当な全角括弧で誤爆していたので厳密一致に修正。
+    if not text or text.startswith("（メイド"):
         return None
     return text.strip()
+
+
+# =============================================================================
+# レスバ追撃セッション（反応式・mimicのreact基盤と対称）
+#   対象本人が発言するたび論破メイドが噛みつく。pile-on防止のため回数/CD/optout/TTLで厳重に制御。
+# =============================================================================
+_resuba_sessions: dict[int, dict] = {}   # channel_id -> session
+RESUBA_SESS_MAX     = 5    # 1セッションの最大追撃回数（上限）
+RESUBA_SESS_DEFAULT = 3    # 既定の追撃回数
+RESUBA_SESS_CD      = 35   # 追撃の最小間隔（秒）＝spam化防止
+RESUBA_SESS_TTL     = 600  # セッション自動終了（秒）
+
+
+async def _resuba_react(message: discord.Message, session: dict):
+    """対象の発言に噛みつく反応式レスバ。pingはしない(message.reply mention_author=False)。"""
+    try:
+        guild  = message.guild
+        target = guild.get_member(int(session["target_uid"])) if guild else None
+        if target is None:
+            return
+        text = await _generate_resuba(target, topic=session.get("topic", ""),
+                                      reply_to=message.content)
+        if not text:
+            return
+        await asyncio.sleep(_rate_get_wait_seconds())
+        await message.reply(f"{RESUBA_ICON} {text}", mention_author=False)
+    except Exception as e:
+        print(f"[ERROR] _resuba_react: {e}")
 
 
 @client.tree.command(name="resuba", description="論破メイドが指定メンバーにレスバを仕掛ける（お遊び）")
@@ -4214,6 +4352,77 @@ async def resuba_cmd(interaction: discord.Interaction, member: discord.Member, t
     await interaction.followup.send(f"{persona['icon']} {member.mention} {text}")
 
 
+@client.tree.command(name="レスバ追撃",
+                     description="論破メイドが対象の発言に一定回数噛みつき続ける（ブースター/管理者）")
+@app_commands.describe(member="追撃する相手", count="追撃回数(1-5・既定3)", topic="お題（任意）")
+async def resuba_chase_cmd(interaction: discord.Interaction, member: discord.Member,
+                           count: int = RESUBA_SESS_DEFAULT, topic: str = ""):
+    if not await check_home_guild(interaction):
+        return
+    # 持続追撃は影響が大きいので開始はブースター/管理者に限定（一撃の /resuba は全員可のまま）
+    is_booster = any(r.id == BOOSTER_ROLE_ID for r in interaction.user.roles)
+    is_admin   = getattr(interaction.user.guild_permissions, "administrator", False)
+    if not (is_booster or is_admin):
+        await interaction.response.send_message(
+            "追撃レスバ（持続）はブースター/管理者専用だよ。一撃なら /resuba をどうぞ。", ephemeral=True)
+        return
+    if member.bot or member.id == interaction.client.user.id:
+        await interaction.response.send_message("botは追撃対象にできません。", ephemeral=True)
+        return
+    tdoc = await users_col.find_one({"_id": str(member.id)}, {"resuba_optout": 1}) or {}
+    if tdoc.get("resuba_optout"):
+        await interaction.response.send_message(
+            f"{member.display_name} さんはレスバ対象外に設定しています。", ephemeral=True)
+        return
+    if interaction.channel_id in _resuba_sessions:
+        await interaction.response.send_message(
+            "このチャンネルでは既に追撃が進行中です。`/レスバ停止` で止めてね。", ephemeral=True)
+        return
+    # pile-on防止: 同一対象を複数チャンネルで同時追撃させない（チャンネル横断で1人1セッション）
+    if any(s.get("target_uid") == str(member.id) for s in _resuba_sessions.values()):
+        await interaction.response.send_message(
+            f"{member.display_name} さんは既に別のチャンネルで追撃中だよ。終わってから/止めてからにしてね。",
+            ephemeral=True)
+        return
+
+    count   = max(1, min(RESUBA_SESS_MAX, count))
+    session = {
+        "target_uid":  str(member.id),
+        "target_name": member.display_name,
+        "remaining":   count,
+        "topic":       topic,
+        "last_reply_at": None,
+        "invoker":     str(interaction.user.id),
+    }
+    _resuba_sessions[interaction.channel_id] = session
+    # 開始の一度だけ ping（以降の追撃は ping しない＝通知連打=嫌がらせ化を防ぐ）
+    await interaction.response.send_message(
+        f"{RESUBA_ICON} {member.mention} 覚悟しろ。お前の発言に**最大{count}回**噛みついてやる。\n"
+        f"（`/レスバ停止` か、対象本人の `/レスバ拒否` でいつでも終了）")
+
+    async def _auto_end():
+        await asyncio.sleep(RESUBA_SESS_TTL)
+        if _resuba_sessions.get(interaction.channel_id) is session:
+            _resuba_sessions.pop(interaction.channel_id, None)
+            try:
+                await interaction.channel.send(f"{RESUBA_ICON} 追撃セッション、時間切れで終了。")
+            except Exception:
+                pass
+    asyncio.create_task(_auto_end())
+
+
+@client.tree.command(name="レスバ停止", description="進行中の追撃レスバセッションを停止")
+async def resuba_stop_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    sess = _resuba_sessions.pop(interaction.channel_id, None)
+    if sess:
+        await interaction.response.send_message(
+            f"{RESUBA_ICON} **{sess['target_name']}** への追撃を停止しました。")
+    else:
+        await interaction.response.send_message("進行中の追撃はありません。", ephemeral=True)
+
+
 @client.tree.command(name="レスバ拒否", description="自分をレスバの対象外にする/戻すを切り替える")
 async def resuba_optout_cmd(interaction: discord.Interaction):
     if not await check_home_guild(interaction):
@@ -4223,9 +4432,19 @@ async def resuba_optout_cmd(interaction: discord.Interaction):
     new_val = not bool(doc.get("resuba_optout"))
     await users_col.update_one({"_id": uid}, {"$set": {"resuba_optout": new_val}}, upsert=True)
     if new_val:
-        await interaction.response.send_message("✅ あなたをレスバ対象外に設定しました。/resuba で指名されなくなります。", ephemeral=True)
+        # 進行中の自分への追撃セッションを即停止（pile-on防止の要・途中拒否で即終了）
+        killed = 0
+        for ch_id, s in list(_resuba_sessions.items()):
+            if s.get("target_uid") == uid:
+                _resuba_sessions.pop(ch_id, None)
+                killed += 1
+        extra = f"（進行中の追撃{killed}件も停止したよ）" if killed else ""
+        await interaction.response.send_message(
+            f"✅ あなたをレスバ対象外に設定しました。/resuba・/レスバ追撃 の対象になりません。{extra}",
+            ephemeral=True)
     else:
-        await interaction.response.send_message("✅ レスバ対象外を解除しました。再び /resuba の対象になります。", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ レスバ対象外を解除しました。再び /resuba の対象になります。", ephemeral=True)
 
 
 def _build_retro_embeds(doc: dict) -> list[dict]:
