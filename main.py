@@ -39,6 +39,15 @@ MONGO_URL         = os.environ.get("MONGO_URL") or os.environ.get("MONGODB_URI")
 NOTIFY_CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or 0)
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 
+# --- Bump通知（宣伝準備完了ping）設定 ---
+# 専用ch にロールpingを出す。env で上書き可。
+NOTIFY_PING_CHANNEL_ID = int(os.environ.get("NOTIFY_PING_CHANNEL_ID") or 1520322785421824041)
+NOTIFY_ROLE_ID         = int(os.environ.get("NOTIFY_ROLE_ID") or 1460224397137809469)
+NOTIFY_GLOBAL_COOLDOWN = int(os.environ.get("NOTIFY_GLOBAL_COOLDOWN") or 3600)  # 全体で1時間に1回まで
+NOTIFY_QUIET_START_JST = 0   # 静音帯 開始(JST) — この時刻〜
+NOTIFY_QUIET_END_JST   = 7   # 静音帯 終了(JST) — この時刻まで鳴らさない
+NOTIFY_CONSENT_TIMEOUT = int(os.environ.get("NOTIFY_CONSENT_TIMEOUT") or 24 * 3600)  # 新規付与の同意猶予(秒)
+
 # --- キルスイッチ（緊急遮断）設定 — すべて deny-by-default ---
 # OWNER_ID==0 の間は全 panic コマンド/エンドポイントを拒否（fail-safe）
 OWNER_ID             = int(os.environ.get("OWNER_ID") or 0)
@@ -2170,7 +2179,8 @@ class MyBot(discord.Client):
         try:
             self.add_dynamic_items(GuardUnbanButton, GuardInviteButton)
             self.add_view(ModPanelView())
-            print("[INFO] mod-guard/modpanel 永続UI登録完了")
+            self.add_view(NotifyConsentView())
+            print("[INFO] mod-guard/modpanel/通知同意 永続UI登録完了")
         except Exception as e:
             print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
         print("[INFO] 起動完了")
@@ -2385,6 +2395,7 @@ async def on_message(message: discord.Message):
             return
 
         if message.author.bot:
+            _bump_diag_log(message, via="create")
             if str(message.author.id) in BOT_CONFIG:
                 await check_bump(message)
             elif message.webhook_id:
@@ -2590,8 +2601,9 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                       "最上段に更新されました"]
         if not any(w in full_text for w in bump_words):
             return
-        if await _is_bump_already_processed(str(payload.message_id)):
-            return
+        # dedupはここで行わない。deferするbotは「空のcreate→本文edit」の順で来るため、
+        # ここでIDを登録すると check_bump 側のキーワード一致前に握り潰してしまう。
+        # 重複排除は check_bump / check_bump_webhook がキーワード一致後に行う。
         author_id = author.get("id", "")
         guild     = client.get_guild(payload.guild_id)
         channel   = guild.get_channel(payload.channel_id) if guild else None
@@ -2602,6 +2614,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         except Exception as fe:
             print(f"[ERROR] on_raw_message_edit fetch: {fe}")
             return
+        _bump_diag_log(msg, via="edit")
         if author_id in BOT_CONFIG:
             await check_bump(msg)
         else:
@@ -2650,6 +2663,27 @@ async def on_interaction(interaction: discord.Interaction):
 # Bump処理
 # =============================================================================
 
+# --- 一時診断: bumpチャンネルのbot発言の素性をログ（実ID/キーワード/配信経路の確認用）---
+#     ディス速/Fortify の実 author.id・実キーワード・create/edit を現物で確定したら撤去可。
+_BUMP_DIAG_WORDS = ["アップしたよ", "移動しました", "表示順", "Bump done", "掲載順",
+                    "bumped", "最上段", "更新されました"]
+
+def _bump_diag_log(message, via: str = ""):
+    try:
+        embeds = getattr(message, "embeds", None) or []
+        embed_text = " ".join(extract_embed_text(e) for e in embeds)
+        full_text  = (getattr(message, "content", "") or "") + " " + embed_text
+        if not any(w in full_text for w in _BUMP_DIAG_WORDS):
+            return
+        aid = getattr(message.author, "id", None)
+        print(f"[bump-diag] via={via} author_id={aid} "
+              f"name={getattr(message.author, 'name', '')!r} "
+              f"webhook_id={getattr(message, 'webhook_id', None)} "
+              f"in_config={str(aid) in BOT_CONFIG} text={full_text[:120]!r}")
+    except Exception as e:
+        print(f"[bump-diag] err: {e}")
+
+
 # 重複処理防止（同一メッセージIDを短時間に二重処理しない）
 _processed_bump_ids: set = set()
 
@@ -2668,11 +2702,6 @@ async def _is_bump_already_processed(message_id: str) -> bool:
 
 
 async def check_bump(message: discord.Message):
-    # 重複処理防止
-    if await _is_bump_already_processed(str(message.id)):
-        print(f"[bump] 重複スキップ: {message.id}")
-        return
-
     bot_id = str(message.author.id)
     config = BOT_CONFIG[bot_id]
 
@@ -2699,6 +2728,13 @@ async def check_bump(message: discord.Message):
     if not user:
         return
 
+    # 重複処理防止: 加点する直前（キーワード一致＋ユーザー特定済み）で初めて登録する。
+    # キーワード判定前に置くとdeferの空createで握り潰し、ユーザー特定前に置くと
+    # 「特定できなかった配信」がIDを消費して後続の特定可能な配信を握り潰すため、ここに置く。
+    if await _is_bump_already_processed(str(message.id)):
+        print(f"[bump] 重複スキップ: {message.id}")
+        return
+
     updated = await users_col.find_one_and_update(
         {"_id": str(user.id)},
         {"$inc": {"bump_count": 1, "xp": 100}, "$set": {"name": user.display_name}},
@@ -2720,11 +2756,6 @@ async def check_bump(message: discord.Message):
 
 async def check_bump_webhook(message: discord.Message):
     """Webhook経由で送信されるBump Bot（Fortify/ディス速/Dislist等）の検出"""
-    # 重複処理防止
-    if await _is_bump_already_processed(str(message.id)):
-        print(f"[bump] webhook重複スキップ: {message.id}")
-        return
-
     embed_text = " ".join(extract_embed_text(e) for e in message.embeds)
     full_text  = message.content + " " + embed_text
 
@@ -2763,6 +2794,11 @@ async def check_bump_webhook(message: discord.Message):
             user = message.guild.get_member(uid)
     if not user:
         print(f"[WARN] check_bump_webhook: ユーザー特定できず ({config['name']})")
+        return
+
+    # 重複処理防止: ユーザー特定済み・加点直前で初めて登録（特定失敗配信での握り潰し回避）
+    if await _is_bump_already_processed(str(message.id)):
+        print(f"[bump] webhook重複スキップ: {message.id}")
         return
 
     updated = await users_col.find_one_and_update(
@@ -3369,6 +3405,58 @@ async def setxp_cmd(interaction: discord.Interaction, member: discord.Member, xp
         f"✅ **{member.display_name}** のXPを **{xp:,}** に設定したよ！\n現在の職階: **{rank_name}**",
         ephemeral=True,
     )
+
+
+@client.tree.command(name="notify_migrate",
+                     description="【管理者】既存の通知ロール保持者へ一度だけ予告を出しbackfillする")
+@app_commands.default_permissions(administrator=True)
+async def notify_migrate_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("⛔ 管理者専用です。", ephemeral=True)
+        return
+    guild = interaction.guild
+    role  = guild.get_role(NOTIFY_ROLE_ID) if guild else None
+    ch    = client.get_channel(NOTIFY_PING_CHANNEL_ID)
+    if not role or not ch:
+        await interaction.response.send_message(
+            f"❌ ロール({NOTIFY_ROLE_ID})かチャンネル({NOTIFY_PING_CHANNEL_ID})が見つかりません。",
+            ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    # role.members はメンバーキャッシュ依存。未チャンク状態だと取りこぼし、
+    # backfillされない保持者が migrated 後に無同意でpingされるため、先に全員取得する。
+    if not guild.chunked:
+        try:
+            await guild.chunk()
+        except Exception as ce:
+            print(f"[WARN] notify_migrate chunk: {ce}")
+    # 案ii: 既存保持者は「同意済み」扱いでbackfill（外す人だけ後でfalseになる）
+    holders = list(role.members)
+    for m in holders:
+        await users_col.update_one(
+            {"_id": str(m.id)}, {"$set": {"notify_consented": True}}, upsert=True)
+
+    msg = await ch.send(
+        f"{role.mention} **【通知ロールのお知らせ】**\n"
+        f"このロールは宣伝が打てるようになると、サーバー全体で **1時間に1回まで** メンションします"
+        f"（深夜0-7時は鳴りません）。\n\n"
+        f"このまま受け取る人は**何もしなくてOK**。要らない人だけ下のボタンで外せます👇",
+        view=NotifyConsentView(),
+        allowed_mentions=discord.AllowedMentions(roles=[role], users=False, everyone=False),
+    )
+    try:
+        await msg.pin()
+    except Exception as pe:
+        print(f"[WARN] notify_migrate pin: {pe}")
+    # 予告を出した時点で初めて宣伝pingを解禁する（不意打ち防止のゲート）
+    await system_col.update_one(
+        {"_id": "notify_state"}, {"$set": {"migrated": True}}, upsert=True)
+    await interaction.followup.send(
+        f"✅ {len(holders)}人を同意済みにbackfillし、予告を投稿・ピン留めしました。\n"
+        f"これ以降、宣伝準備が整うと通知pingが解禁されます。", ephemeral=True)
 
 
 @client.tree.command(name="report", description="過去の日報を検索して表示（ブースター専用）")
@@ -5666,6 +5754,92 @@ async def warnings_cmd(interaction: discord.Interaction, user: discord.Member):
 # UI Views
 # =============================================================================
 
+async def _cleanup_consent_prompt(interaction: discord.Interaction):
+    """個別の同意プロンプトは解決後に削除。ただし:
+    - ピン留めされた常設パネル(/notify_migrate)は消さない。
+    - 共有パネルや「他人宛ての個別プロンプト」を消さない（押した本人が宛先=メンション
+      対象のときだけ削除）。他人のプロンプトを消すと、その人のpendingが未解決のまま
+      24h後に自動剥奪される事故になるため。"""
+    try:
+        msg = interaction.message
+        if not msg or msg.pinned:
+            return
+        if interaction.user in msg.mentions:
+            await msg.delete()
+    except Exception:
+        pass
+
+
+class NotifyConsentView(discord.ui.View):
+    """通知ロールの同意/解除パネル（永続）。ボタンは常に押した本人(interaction.user)に作用する。
+    新規付与時の個別プロンプトと、既存保持者向けの一斉予告（/notify_migrate）で共用。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ 受け取る", style=discord.ButtonStyle.success,
+                       custom_id="notifyconsent:accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await users_col.update_one(
+                {"_id": str(interaction.user.id)},
+                {"$set": {"notify_consented": True},
+                 "$unset": {"notify_consent_pending_since": "", "notify_consent_msg": ""}},
+                upsert=True,
+            )
+            # ロールが無ければ付与（パネル経由のオプトインも兼ねる）
+            guild = interaction.guild
+            role  = guild.get_role(NOTIFY_ROLE_ID) if guild else None
+            member = guild.get_member(interaction.user.id) if guild else None
+            if role and member and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="通知ロール: 本人が受け取りに同意")
+                except Exception as ae:
+                    print(f"[WARN] consent accept add_roles: {ae}")
+            await interaction.response.send_message(
+                "✅ 通知を受け取る設定にしました。宣伝準備ができたらお知らせします。", ephemeral=True)
+            await _cleanup_consent_prompt(interaction)
+        except Exception as e:
+            print(f"[ERROR] NotifyConsentView.accept: {e}")
+            try:
+                await interaction.response.send_message("❌ 失敗しました。時間をおいて再度お試しください。", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="❌ 通知を外す", style=discord.ButtonStyle.secondary,
+                       custom_id="notifyconsent:decline")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            guild  = interaction.guild
+            role   = guild.get_role(NOTIFY_ROLE_ID) if guild else None
+            member = guild.get_member(interaction.user.id) if guild else None
+            # ロール除去に失敗したら状態を変えず（consented維持・pending維持）失敗を伝える。
+            # 「外しました」と言ったのにロールが残り鳴り続ける、を防ぐ。
+            if role and member and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="通知ロール: 本人が解除")
+                except Exception as re:
+                    print(f"[WARN] consent decline remove_roles: {re}")
+                    await interaction.response.send_message(
+                        "❌ 解除に失敗しました（権限/ロール階層の可能性）。管理者にご連絡ください。",
+                        ephemeral=True)
+                    return
+            await users_col.update_one(
+                {"_id": str(interaction.user.id)},
+                {"$set": {"notify_consented": False},
+                 "$unset": {"notify_consent_pending_since": "", "notify_consent_msg": ""}},
+                upsert=True,
+            )
+            await interaction.response.send_message(
+                "🔕 通知を外しました。受け取りたくなったらいつでもこのパネルから戻せます。", ephemeral=True)
+            await _cleanup_consent_prompt(interaction)
+        except Exception as e:
+            print(f"[ERROR] NotifyConsentView.decline: {e}")
+            try:
+                await interaction.response.send_message("❌ 失敗しました。時間をおいて再度お試しください。", ephemeral=True)
+            except Exception:
+                pass
+
+
 class PersonalityView(discord.ui.View):
     def __init__(self, invoker: discord.Member | discord.User | None = None):
         super().__init__(timeout=60)
@@ -5816,6 +5990,50 @@ class LuckyTitleView(discord.ui.View):
 
 # 招待ボーナス設定 { 招待人数: XP }
 INVITE_BONUSES = {1: 200, 3: 500, 5: 1000, 10: 2000}
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """通知ロールが新規付与された人に同意プロンプトを出す（案A: 24h未確認で自動剥奪）。"""
+    try:
+        before_ids = {r.id for r in before.roles}
+        after_ids  = {r.id for r in after.roles}
+        if not (NOTIFY_ROLE_ID in after_ids and NOTIFY_ROLE_ID not in before_ids):
+            return  # 通知ロールの「新規付与」以外は無視
+
+        udoc = await users_col.find_one(
+            {"_id": str(after.id)},
+            {"notify_consented": 1, "notify_consent_pending_since": 1},
+        )
+        if udoc:
+            if udoc.get("notify_consented") is True:
+                return  # 既に同意済み（再付与）
+            if udoc.get("notify_consent_pending_since"):
+                return  # 既にプロンプト送信済み（二重送信防止）
+
+        ch = client.get_channel(NOTIFY_PING_CHANNEL_ID)
+        if not ch:
+            print("[WARN] on_member_update: 通知chが見つからない")
+            return
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        msg = await ch.send(
+            f"{after.mention} 通知ロールが付きました。\n"
+            f"🔔 宣伝が打てるようになると、このロールを **全体で1時間に1回まで** メンションします"
+            f"（深夜0-7時は鳴りません）。受け取りますか？\n"
+            f"※ **24時間** [✅受け取る] を押さないと、自動でロールを外します（あとで付け直せます）。",
+            view=NotifyConsentView(),
+            allowed_mentions=discord.AllowedMentions(users=[after], roles=False, everyone=False),
+        )
+        await users_col.update_one(
+            {"_id": str(after.id)},
+            {"$set": {"notify_consent_pending_since": now,
+                      "notify_consent_msg": f"{ch.id}:{msg.id}"}},
+            upsert=True,
+        )
+        print(f"[notify] 新規付与→同意プロンプト送信: {after.id}")
+    except Exception as e:
+        print(f"[ERROR] on_member_update(consent): {e}")
+
 
 @client.event
 async def on_member_join(member: discord.Member):
@@ -5990,13 +6208,67 @@ async def idle_chatter_task():
         await asyncio.sleep(IDLE_CHECK_INTERVAL)
 
 
+def _in_quiet_hours_jst() -> bool:
+    """静音帯(JST NOTIFY_QUIET_START〜END)内なら True。"""
+    h = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).hour
+    return NOTIFY_QUIET_START_JST <= h < NOTIFY_QUIET_END_JST
+
+
+async def _sweep_consent_timeouts(now: datetime.datetime):
+    """新規付与の同意待ちが NOTIFY_CONSENT_TIMEOUT を超過したらロール自動剥奪。
+
+    重要: 状態(notify_consented:False / pendingクリア)を確定するのは、ロールが
+    実際に外れたことを確認できた場合のみ。ギルド/ロール未解決や remove_roles 失敗時は
+    pending を残し、次周期で再試行する（DBとロールのdesync＝永久に剥奪されない事故の回避）。
+    """
+    try:
+        cutoff = now - datetime.timedelta(seconds=NOTIFY_CONSENT_TIMEOUT)
+        guild  = client.get_guild(HOME_GUILD_ID)
+        role   = guild.get_role(NOTIFY_ROLE_ID) if guild else None
+        if not guild or not role:
+            print("[WARN] consent sweep: guild/role未解決のためスキップ（次周期で再試行）")
+            return
+        async for u in users_col.find({"notify_consent_pending_since": {"$lt": cutoff}}):
+            uid    = u["_id"]
+            member = guild.get_member(int(uid))
+            if member is not None and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="通知ロール: 同意24h無応答のため自動解除")
+                except Exception as re:
+                    print(f"[WARN] consent sweep remove_roles({uid}): {re} — pending維持で再試行")
+                    continue  # 剥奪失敗 → 状態を確定せず次周期で再試行
+            # ここに到達 = メンバー不在(退出済み) or ロール除去成功 or 元々ロール無し。
+            # プロンプトを掃除
+            ref = u.get("notify_consent_msg")
+            if ref and ":" in ref:
+                try:
+                    cid, mid = (int(x) for x in ref.split(":", 1))
+                    pch = client.get_channel(cid)
+                    if pch:
+                        pmsg = await pch.fetch_message(mid)
+                        await pmsg.delete()
+                except Exception:
+                    pass
+            await users_col.update_one(
+                {"_id": uid},
+                {"$set": {"notify_consented": False},
+                 "$unset": {"notify_consent_pending_since": "", "notify_consent_msg": ""}},
+            )
+            print(f"[notify] 同意24h無応答 → ロール解除: {uid}")
+    except Exception as e:
+        print(f"[ERROR] consent sweep: {e}")
+
+
 async def notification_task():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            ch = client.get_channel(NOTIFY_CHANNEL_ID)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            # 新規付与の同意タイムアウト処理（毎周期）
+            await _sweep_consent_timeouts(now)
+
+            ch = client.get_channel(NOTIFY_PING_CHANNEL_ID)
             if ch:
-                now   = datetime.datetime.now(datetime.timezone.utc)
                 ready = []
                 async for doc in system_col.find({"notified": False}):
                     bid = doc["_id"]
@@ -6004,13 +6276,35 @@ async def notification_task():
                         continue
                     if (now - ensure_utc(doc["last_bump_at"])).total_seconds() >= BOT_CONFIG[bid]["cd"]:
                         ready.append(bid)
-                if ready:
-                    await ch.send(
-                        "🔔 **宣伝準備完了！**\n" +
-                        "\n".join(f"✅ **{BOT_CONFIG[b]['name']}**" for b in ready)
-                    )
-                    for b in ready:
-                        await system_col.update_one({"_id": b}, {"$set": {"notified": True}})
+
+                # 静音帯ならpingしない（notifiedはFalseのまま持ち越し→明けてから1本）
+                state = await system_col.find_one({"_id": "notify_state"})
+                # /notify_migrate 未実行の間は一切pingしない（既存40人への不意打ち防止）
+                migrated = bool(state and state.get("migrated"))
+                if ready and not migrated:
+                    print(f"[notify] 宣伝準備OK({len(ready)}件)だが未解禁: /notify_migrate を実行すると通知が始まります")
+                if ready and migrated and not _in_quiet_hours_jst():
+                    # グローバル上限: 全体で1時間に1回まで
+                    last_ping = state.get("last_ping_at") if state else None
+                    allowed   = (last_ping is None or
+                                 (now - ensure_utc(last_ping)).total_seconds() >= NOTIFY_GLOBAL_COOLDOWN)
+                    if allowed:
+                        role    = ch.guild.get_role(NOTIFY_ROLE_ID) if ch.guild else None
+                        mention = (role.mention + "\n") if role else ""
+                        await ch.send(
+                            f"{mention}🔔 **宣伝準備完了！**\n" +
+                            "\n".join(f"✅ **{BOT_CONFIG[b]['name']}**" for b in ready),
+                            allowed_mentions=discord.AllowedMentions(
+                                everyone=False, users=False,
+                                roles=[role] if role else False,
+                            ),
+                        )
+                        await system_col.update_one(
+                            {"_id": "notify_state"}, {"$set": {"last_ping_at": now}}, upsert=True,
+                        )
+                        for b in ready:
+                            await system_col.update_one({"_id": b}, {"$set": {"notified": True}})
+                    # 上限内なら送らず、notifiedはFalseのまま次周期に持ち越す
         except discord.errors.HTTPException as e:
             if "429" in str(e):
                 print(f"[WARN] Notify 429: レート制限中、60秒待機")
