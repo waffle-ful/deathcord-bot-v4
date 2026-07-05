@@ -113,6 +113,12 @@ INVINCIBLE_BREAKER_WINDOW = float(os.environ.get("INVINCIBLE_BREAKER_WINDOW") or
 INVINCIBLE_BREAKER_MAX    = int(os.environ.get("INVINCIBLE_BREAKER_MAX") or 6)
 # 発言復活のペース（秒）。削除連打で送信レート上限に当たらないよう最低限ならす
 INVINCIBLE_REPOST_PACE = float(os.environ.get("INVINCIBLE_REPOST_PACE") or 1.0)
+# 削除者を特定できない時（View Audit Log権限無し／監査ログ未反映／本人の自己削除）も復活させるか。
+# ★on: 「発言が絶対に消せない」に近づくが、本人の自己削除まで蘇る（無敵ユーザーは自分でも消せなくなる）。
+# ★off（既定）: 削除者が「本人以外」と監査ログで確認できた時だけ復活（自己削除は尊重）。View Audit Log 必須。
+INVINCIBLE_REPOST_WHEN_UNKNOWN = (
+    os.environ.get("INVINCIBLE_REPOST_WHEN_UNKNOWN", "0").strip().lower()
+    in ("1", "true", "yes"))
 
 # --- Gemini クライアント (新SDK) ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -3025,29 +3031,34 @@ def _track_invincible_message(message: discord.Message):
         }
         while len(_invincible_msg_cache) > _INVINCIBLE_CACHE_MAX:
             _invincible_msg_cache.pop(next(iter(_invincible_msg_cache)), None)
+        print(f"[invincible] 追跡: 無敵ユーザーの発言を記録 author={message.author.id} "
+              f"msg={message.id} ch={message.channel.id}")
     except Exception as e:
         print(f"[invincible] _track_invincible_message: {e}")
 
 
 async def _invincible_delete_deleter(payload, author_id: int):
     """発言を消したのが誰かを監査ログで特定。返り値=削除者ID or None。
-    None は「本人の自己削除（監査ログに載らない）／権限不足／未反映」を意味し、
-    呼び出し側は None のとき復活させない（自己削除まで蘇らせない安全側）。"""
+    None は「本人の自己削除（監査ログに載らない）／権限不足／未反映」を意味する。
+    ★監査ログの反映ラグに強い _guard_find_audit_entry（4回リトライ・30秒新鮮判定）を再利用する。
+    どの理由で None になったかを必ずログに残す（無言で失敗させない＝診断可能に）。"""
     try:
         guild = client.get_guild(payload.guild_id) if payload.guild_id else None
-        if guild is None or guild.me is None or not guild.me.guild_permissions.view_audit_log:
-            return None  # 判定不能 → 復活しない側へ倒す
-        await asyncio.sleep(1.5)  # 監査ログ反映待ち
-        now = datetime.datetime.now(datetime.timezone.utc)
-        async for entry in guild.audit_logs(
-                limit=8, action=discord.AuditLogAction.message_delete):
-            if getattr(entry.target, "id", None) != author_id:
-                continue
-            age = (now - ensure_utc(entry.created_at)).total_seconds()
-            if age > 15:
-                return None  # 対応する新鮮なエントリが無い＝自己削除/未反映 → 復活しない
-            return getattr(entry.user, "id", None)
-        return None  # 該当エントリ無し＝自己削除 → 復活しない
+        if guild is None:
+            print("[invincible] delete判定: guild取得不可 → 復活しない")
+            return None
+        if guild.me is None or not guild.me.guild_permissions.view_audit_log:
+            print("[invincible] delete判定: ★View Audit Log 権限が無いため削除者を特定できません"
+                  "（発言復活が常にスキップに縮退します。権限を付与してください）")
+            return None
+        # mod-guard と同じ堅牢な監査ログ探索（リトライ＋30秒新鮮判定）を使う
+        entry = await _guard_find_audit_entry(
+            guild, discord.AuditLogAction.message_delete, author_id, retries=4, delay=1.0)
+        if entry is None:
+            print(f"[invincible] delete判定: 該当監査エントリ無し author={author_id} "
+                  "→ 自己削除／未反映／集約の可能性（保守モードでは復活しない）")
+            return None
+        return getattr(entry.user, "id", None)
     except Exception as e:
         print(f"[invincible] _invincible_delete_deleter: {e}")
         return None
@@ -3118,12 +3129,20 @@ async def _invincible_handle_delete(payload, mid: int, info: dict):
     try:
         author_id = info["author_id"]
         deleter_id = await _invincible_delete_deleter(payload, author_id)
-        if deleter_id is None:
-            return  # 自己削除／判定不能 → 復活しない（本人が消したものは尊重）
-        if client.user and deleter_id == client.user.id:
-            return  # bot自身の削除 → 尊重（ループ防止）
-        if deleter_id == author_id:
-            return  # 本人の削除 → 尊重
+        if deleter_id is not None:
+            if client.user and deleter_id == client.user.id:
+                print(f"[invincible] 削除者=bot自身 → 復活しない author={author_id}")
+                return  # bot自身の削除 → 尊重（ループ防止）
+            if deleter_id == author_id:
+                print(f"[invincible] 削除者=本人(自己削除) → 復活しない author={author_id}")
+                return  # 本人の削除 → 尊重
+            # 他者による削除が確定 → 復活（★誰であっても＝完全無敵）
+        elif not INVINCIBLE_REPOST_WHEN_UNKNOWN:
+            # 削除者を特定できず、保守モード → 復活しない（理由は判定関数側でログ済み）
+            return
+        else:
+            # アグレッシブモード：削除者不明でも復活（本人の自己削除も蘇る点に注意）
+            print(f"[invincible] 削除者不明だが REPOST_WHEN_UNKNOWN=on → 復活 author={author_id}")
         if not _invincible_breaker_ok(author_id):
             guild = client.get_guild(payload.guild_id) if payload.guild_id else None
             await _invincible_alert_owner(
