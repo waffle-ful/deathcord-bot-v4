@@ -114,11 +114,13 @@ INVINCIBLE_BREAKER_MAX    = int(os.environ.get("INVINCIBLE_BREAKER_MAX") or 6)
 # 発言復活のペース（秒）。削除連打で送信レート上限に当たらないよう最低限ならす
 INVINCIBLE_REPOST_PACE = float(os.environ.get("INVINCIBLE_REPOST_PACE") or 1.0)
 # 削除者を特定できない時（View Audit Log権限無し／監査ログ未反映／本人の自己削除）も復活させるか。
-# ★on: 「発言が絶対に消せない」に近づくが、本人の自己削除まで蘇る（無敵ユーザーは自分でも消せなくなる）。
-# ★off（既定）: 削除者が「本人以外」と監査ログで確認できた時だけ復活（自己削除は尊重）。View Audit Log 必須。
+# ★on（既定・ユーザー選択）: 「発言が絶対に消せない」に近づく。監査ログのラグに関係なく復活する。
+#   代償として本人の自己削除まで蘇る（無敵ユーザーは自分でも発言を消せなくなる）。連打時は breaker で停止。
+# ★off にしたい場合は env INVINCIBLE_REPOST_WHEN_UNKNOWN=0 を設定（削除者が本人以外と監査ログで
+#   確認できた時だけ復活＝自己削除は尊重。ただし View Audit Log 権限とログ反映が前提で取りこぼしやすい）。
 INVINCIBLE_REPOST_WHEN_UNKNOWN = (
-    os.environ.get("INVINCIBLE_REPOST_WHEN_UNKNOWN", "0").strip().lower()
-    in ("1", "true", "yes"))
+    os.environ.get("INVINCIBLE_REPOST_WHEN_UNKNOWN", "1").strip().lower()
+    not in ("0", "false", "no", ""))
 
 # --- Gemini クライアント (新SDK) ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
