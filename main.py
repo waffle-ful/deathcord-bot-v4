@@ -3201,29 +3201,63 @@ async def _invincible_guard_member_update(before: discord.Member, after: discord
     """無敵ユーザーへの禁止ロール付与 / timeout を検知して即巻き戻す（状態ベース＝ループ無し）。"""
     try:
         guild = after.guild
-        # 1) 禁止ロールが新規付与された → 即剥奪
+        # 1) 禁止ロールが新規付与された → 元ロールを記録して即剥奪＋剥がされた元ロールを復元
+        #    ミュートロールは「他ロールを剥がして自分だけ付ける」実装が多いので、before（＝付与直前）の
+        #    ロールを控え、禁止ロールを外すのと同時にミュートで剥がされたロールを付け直す。
         before_ids = {r.id for r in before.roles}
         after_ids  = {r.id for r in after.roles}
         added_blocked = (after_ids - before_ids) & INVINCIBLE_BLOCKED_ROLE_IDS
-        for rid in added_blocked:
+        if added_blocked:
             if not _invincible_breaker_ok(after.id):
                 await _invincible_alert_owner(
                     guild, f"{after}（`{after.id}`）へ短時間にロール付与が繰り返されています。"
                            f"暴走防止のため自動剥奪を一時停止しました。")
-                break
-            role = guild.get_role(rid)
-            if role is None:
-                continue
-            try:
-                await after.remove_roles(role, reason="無敵ユーザー保護：禁止ロールを自動剥奪")
-                print(f"[invincible] 禁止ロール剥奪 user={after.id} role={rid}")
-            except discord.Forbidden:
-                await _invincible_alert_owner(
-                    guild, f"{after}（`{after.id}`）から禁止ロール `{rid}` を剥奪できませんでした"
-                           f"（空気くんのロールが対象ロールより下か、権限不足）。"
-                           f"無敵保護が機能していません。ロール順位をご確認ください。")
-            except Exception as e:
-                print(f"[invincible] ロール剥奪失敗: {e}")
+            else:
+                # 付与直前に持っていた「付け直せる」元ロール（@everyone/管理ロール/禁止ロールを除く）を記録
+                original = [r for r in before.roles
+                            if r.id not in INVINCIBLE_BLOCKED_ROLE_IDS
+                            and not r.is_default() and not r.managed]
+                try:
+                    await invincible_col.update_one(
+                        {"_id": str(after.id)},
+                        {"$set": {"saved_roles": [r.id for r in original],
+                                  "saved_at": datetime.datetime.now(datetime.timezone.utc)}})
+                except Exception as e:
+                    print(f"[invincible] 元ロール記録失敗: {e}")
+                # 禁止ロールを剥奪
+                blocked_roles = [guild.get_role(rid) for rid in added_blocked]
+                blocked_roles = [r for r in blocked_roles if r is not None]
+                try:
+                    if blocked_roles:
+                        await after.remove_roles(
+                            *blocked_roles, reason="無敵ユーザー保護：禁止ロールを自動剥奪")
+                        print(f"[invincible] 禁止ロール剥奪 user={after.id} "
+                              f"roles={[r.id for r in blocked_roles]}")
+                except discord.Forbidden:
+                    await _invincible_alert_owner(
+                        guild, f"{after}（`{after.id}`）から禁止ロールを剥奪できませんでした"
+                               f"（空気くんのロールが対象ロールより下か、権限不足）。"
+                               f"無敵保護が機能していません。ロール順位をご確認ください。")
+                except Exception as e:
+                    print(f"[invincible] ロール剥奪失敗: {e}")
+                # ミュートで剥がされた元ロール（before にあり after に無い）を復元。
+                # bot が付与可能（自分の最上位ロールより下）なものだけ。
+                me_top = guild.me.top_role if guild.me else None
+                stripped = [r for r in original
+                            if r.id not in after_ids
+                            and (me_top is None or r < me_top)]
+                if stripped:
+                    try:
+                        await after.add_roles(
+                            *stripped, reason="無敵ユーザー保護：ミュートで剥がされた元ロールを復元")
+                        print(f"[invincible] 元ロール復元 user={after.id} "
+                              f"roles={[r.id for r in stripped]}")
+                    except discord.Forbidden:
+                        await _invincible_alert_owner(
+                            guild, f"{after}（`{after.id}`）へ元ロールの一部を復元できませんでした"
+                                   f"（ロール順位/権限）。手動でご確認ください。")
+                    except Exception as e:
+                        print(f"[invincible] 元ロール復元失敗: {e}")
 
         # 2) timeout（communication disabled）が新規/延長された → 即解除
         b_to = before.timed_out_until
@@ -3293,6 +3327,25 @@ async def _invincible_startup_sweep():
             if blocked:
                 await member.remove_roles(*blocked, reason="無敵保護：起動時掃討（ダウンタイム中付与分）")
                 print(f"[invincible] 起動掃討: 禁止ロール剥奪 user={uid}")
+                # まだ禁止ロールを持っている＝現在ミュート中なので、記録済みの元ロールを付け直す。
+                # （非ミュート時はここに来ないので、古い記録による誤復元は起きない）
+                try:
+                    doc = await invincible_col.find_one({"_id": str(uid)}, {"saved_roles": 1})
+                    saved = (doc or {}).get("saved_roles") or []
+                    me_top = guild.me.top_role if guild.me else None
+                    cur_ids = {r.id for r in member.roles}
+                    restore = []
+                    for rid in saved:
+                        r = guild.get_role(rid)
+                        if (r and r.id not in cur_ids and not r.managed
+                                and not r.is_default() and (me_top is None or r < me_top)):
+                            restore.append(r)
+                    if restore:
+                        await member.add_roles(*restore, reason="無敵保護：起動掃討で元ロールを復元")
+                        print(f"[invincible] 起動掃討: 元ロール復元 user={uid} "
+                              f"roles={[r.id for r in restore]}")
+                except Exception as e:
+                    print(f"[invincible] 起動掃討の元ロール復元失敗 user={uid}: {e}")
             if member.is_timed_out():
                 await member.timeout(None, reason="無敵保護：起動時掃討（ダウンタイム中timeout分）")
                 print(f"[invincible] 起動掃討: timeout解除 user={uid}")
