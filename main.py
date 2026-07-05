@@ -83,6 +83,37 @@ MAID_REPOST_EXEMPT_ROLE_ID = int(os.environ.get("MAID_REPOST_EXEMPT_ROLE_ID") or
 # 再投稿のペース（秒）。無制限に復活させるが、削除連打で送信レート上限に当たらないよう最低限ならす
 MAID_REPOST_PACE_SECONDS = float(os.environ.get("MAID_REPOST_PACE_SECONDS") or 2.0)
 
+# --- 無敵機能（指定ユーザーを保護：削除/ban/TO/特定ロール付与を自動で巻き戻す）設定 ---
+# 指定ユーザーを「無敵」にする。Discord仕様上「操作させない」ことは不可能なので、行われたら即巻き戻す:
+#   ・発言を消されても自動再投稿（★本人の自己削除は除く＝監査ログで削除者≠本人の時だけ復活）
+#   ・ban されても即 unban（本人へ招待リンクをDM／DM不可ならログchへ）
+#   ・timeout されても即解除
+#   ・指定ロール（ミュート等の懲罰ロール想定）を付けられても即剥奪
+# ★完全無敵：OWNER/サーバーオーナー/Wick 等も含め「誰の操作でも」巻き戻す（例外なし）。
+#   安全弁は2つだけ:
+#     ① bot自身の巻き戻し操作は再発火しても無視（無限ループ防止／状態ベース判定で自然に成立）
+#     ② サーキットブレーカー: 同一対象が短時間に攻撃され続けたら巻き戻しを止めてOWNERへ通知（暴走抑制）
+# "0"/"false"/"no" で無効化（既定は有効）
+INVINCIBLE_ENABLED = (os.environ.get("INVINCIBLE_ENABLED", "1").strip().lower()
+                      not in ("0", "false", "no", ""))
+# 静的シード（CSV）。実運用は Mongo + オーナー用スラッシュコマンド(/無敵登録・/無敵解除)で管理する
+INVINCIBLE_USER_IDS_SEED = {
+    int(x) for x in (os.environ.get("INVINCIBLE_USER_IDS") or "").replace(" ", "").split(",")
+    if x.isdigit()
+}
+# 付与を禁止するロール（CSV）。既定は依頼の 1495680855560028240（ミュート等の懲罰ロール想定）。
+# 無敵ユーザーにこれらが付いたら即剥奪する。
+INVINCIBLE_BLOCKED_ROLE_IDS = {
+    int(x) for x in (os.environ.get("INVINCIBLE_BLOCKED_ROLE_IDS")
+                     or "1495680855560028240").replace(" ", "").split(",")
+    if x.isdigit()
+}
+# サーキットブレーカー：同一対象がこの秒数内にこの回数を超えて攻撃されたら巻き戻しを止めてOWNERへ通知
+INVINCIBLE_BREAKER_WINDOW = float(os.environ.get("INVINCIBLE_BREAKER_WINDOW") or 60.0)
+INVINCIBLE_BREAKER_MAX    = int(os.environ.get("INVINCIBLE_BREAKER_MAX") or 6)
+# 発言復活のペース（秒）。削除連打で送信レート上限に当たらないよう最低限ならす
+INVINCIBLE_REPOST_PACE = float(os.environ.get("INVINCIBLE_REPOST_PACE") or 1.0)
+
 # --- Gemini クライアント (新SDK) ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -2284,6 +2315,7 @@ messages_col   = db["messages"]         # Phase 1: messages蓄積用
 killswitch_col = db["killswitch_snapshots"]   # キルスイッチ復旧スナップショット
 guard_events_col = db["guard_events"]         # モデレーション・ガードのban/kick検知履歴
 interaction_dedup_col = db["interaction_dedup"]  # スラッシュコマンドの二重応答防止（インスタンス跨ぎ）
+invincible_col = db["invincible_users"]       # 無敵ユーザーの動的リスト（_id: str(user_id)）
 
 
 class DedupCommandTree(app_commands.CommandTree):
@@ -2352,6 +2384,13 @@ class MyBot(discord.Client):
             print("[INFO] mod-guard/modpanel/通知同意/入場クイズ 永続UI登録完了")
         except Exception as e:
             print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
+        # 無敵リストを Mongo から読み込み（seed と合算）
+        # ★権限チェックとダウンタイム中に適用された懲罰の掃討は on_ready 側で行う
+        #   （setup_hook 時点ではギルドキャッシュが空で guild.me を取れないため）。
+        try:
+            await _load_invincible_ids()
+        except Exception as e:
+            print(f"[WARN] 無敵リスト読込失敗: {e}")
         print("[INFO] 起動完了")
         self.loop.create_task(notification_task())
         self.loop.create_task(weekly_ranking_task())
@@ -2595,6 +2634,10 @@ async def on_message(message: discord.Message):
         except Exception as _log_e:
             # ログ失敗（重複以外）では返信を止めない＝そのまま処理続行
             print(f"[WARN] messages log failed: {_log_e}")
+
+        # 無敵ユーザーの発言を追跡（消されたら復活させるため内容を覚えておく）
+        if _is_invincible(message.author.id):
+            _track_invincible_message(message)
 
         uid        = str(message.author.id)
         now        = datetime.datetime.now(datetime.timezone.utc)
@@ -2867,11 +2910,18 @@ async def _maid_delete_is_exempt(payload: discord.RawMessageDeleteEvent) -> bool
 
 @client.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
-    """メイドの会話発言が消されたら復活させる（消した人がOWNER/免除ロール/bot自身なら尊重）。"""
+    """メイドの会話発言が消されたら復活させる（消した人がOWNER/免除ロール/bot自身なら尊重）。
+    無敵ユーザーの発言も同じ経路で復活させる（★こちらは本人の自己削除以外＝誰の削除でも復活）。"""
     try:
+        mid  = payload.message_id
+        # --- 無敵ユーザーの発言復活（メイドとは独立。MAID_REPOST無効でも動く） ---
+        if INVINCIBLE_ENABLED:
+            inv = _invincible_msg_cache.get(mid)
+            if inv is not None:
+                await _invincible_handle_delete(payload, mid, inv)
+                return
         if not MAID_REPOST_ENABLED:
             return
-        mid  = payload.message_id
         info = _maid_msg_cache.get(mid)
         if not info:
             return  # メイドの会話発言として記録が無い＝対象外（Bump通知やパネル等は無視）
@@ -2900,6 +2950,434 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     except Exception as e:
         print(f"[ERROR] on_raw_message_delete: {e}")
         traceback.print_exc()
+
+
+# =============================================================================
+# 無敵機能（指定ユーザーを保護）
+#   指定ユーザーへの「削除 / ban / timeout / 禁止ロール付与」を検知して即巻き戻す。
+#   Discord 仕様上「操作そのものを封じる」ことは不可能なので、行われた瞬間に取り消す方式。
+#   ★完全無敵：OWNER/サーバーオーナー/Wick 含め誰の操作でも巻き戻す（例外なし）。
+#   安全弁は2つ：①bot自身の巻き戻しは状態ベース判定で自然に無視（無限ループ防止）
+#              ②サーキットブレーカー（短時間に攻撃され続けたら止めてOWNERへ通知）
+#   注意：発言復活は「本人の自己削除」を除外する（監査ログで削除者≠本人の時だけ復活）。
+#         これを守らないと本人が自分で消した発言まで蘇り、壊れて見える。
+#   依存：View Audit Log 権限（無いと削除者を判定できず＝発言復活が常にスキップに縮退）。
+# =============================================================================
+_invincible_ids: set[int] = set(INVINCIBLE_USER_IDS_SEED)   # 実効リスト（seed ∪ Mongo）
+_invincible_msg_cache: dict[int, dict] = {}                 # message_id -> {channel_id, author_id, author_name, author_avatar, content}
+_INVINCIBLE_CACHE_MAX = 3000
+_invincible_reversals: dict[int, list] = {}                 # target_id -> [ts,...]（ブレーカー用）
+_invincible_mimic_webhooks: dict[int, discord.Webhook] = {}  # channel_id -> webhook（なりすまし復活用キャッシュ）
+
+
+def _is_invincible(user_id: int) -> bool:
+    return INVINCIBLE_ENABLED and user_id in _invincible_ids
+
+
+def _invincible_breaker_ok(target_id: int) -> bool:
+    """巻き戻しを実行してよいか。ウィンドウ内の実行回数が上限超なら False（=暴走とみなし停止）。
+    True を返すときは今回分を履歴に加算する（呼び出し=1実行としてカウント）。"""
+    now = time.time()
+    hist = [t for t in _invincible_reversals.get(target_id, [])
+            if now - t < INVINCIBLE_BREAKER_WINDOW]
+    hist.append(now)
+    _invincible_reversals[target_id] = hist
+    return len(hist) <= INVINCIBLE_BREAKER_MAX
+
+
+async def _invincible_alert_owner(guild, text: str):
+    """OWNER へ通知（ログch＝mod-guardと共用に投稿。可能なら OWNER をmention）。best-effort。"""
+    try:
+        ch = _guard_resolve_log_channel(guild) if guild else None
+        if ch is None:
+            print(f"[invincible] OWNER通知先が無い: {text}")
+            return
+        prefix = f"<@{OWNER_ID}> " if OWNER_ID else ""
+        await ch.send(
+            f"{prefix}🛡️【無敵】{text}",
+            allowed_mentions=discord.AllowedMentions(
+                users=[discord.Object(id=OWNER_ID)] if OWNER_ID else False,
+                roles=False, everyone=False),
+        )
+    except Exception as e:
+        print(f"[invincible] OWNER通知失敗: {e}")
+
+
+def _track_invincible_message(message: discord.Message):
+    """無敵ユーザーの発言を記録。後で誰かに消されたら復活に使う。"""
+    if not INVINCIBLE_ENABLED or message is None:
+        return
+    try:
+        content = message.content or ""
+        # 画像・ファイルはURLを本文末尾に付けて復活時も残す
+        if message.attachments:
+            urls = "\n".join(a.url for a in message.attachments)
+            content = (content + "\n" + urls).strip()
+        if not content:
+            return  # 復活できる中身が無い（スタンプ単体等）ものは追跡しない
+        _invincible_msg_cache[message.id] = {
+            "channel_id":    message.channel.id,
+            "author_id":     message.author.id,
+            "author_name":   message.author.display_name,
+            "author_avatar": (message.author.display_avatar.url
+                              if message.author.display_avatar else None),
+            "content":       content[:2000],
+        }
+        while len(_invincible_msg_cache) > _INVINCIBLE_CACHE_MAX:
+            _invincible_msg_cache.pop(next(iter(_invincible_msg_cache)), None)
+    except Exception as e:
+        print(f"[invincible] _track_invincible_message: {e}")
+
+
+async def _invincible_delete_deleter(payload, author_id: int):
+    """発言を消したのが誰かを監査ログで特定。返り値=削除者ID or None。
+    None は「本人の自己削除（監査ログに載らない）／権限不足／未反映」を意味し、
+    呼び出し側は None のとき復活させない（自己削除まで蘇らせない安全側）。"""
+    try:
+        guild = client.get_guild(payload.guild_id) if payload.guild_id else None
+        if guild is None or guild.me is None or not guild.me.guild_permissions.view_audit_log:
+            return None  # 判定不能 → 復活しない側へ倒す
+        await asyncio.sleep(1.5)  # 監査ログ反映待ち
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async for entry in guild.audit_logs(
+                limit=8, action=discord.AuditLogAction.message_delete):
+            if getattr(entry.target, "id", None) != author_id:
+                continue
+            age = (now - ensure_utc(entry.created_at)).total_seconds()
+            if age > 15:
+                return None  # 対応する新鮮なエントリが無い＝自己削除/未反映 → 復活しない
+            return getattr(entry.user, "id", None)
+        return None  # 該当エントリ無し＝自己削除 → 復活しない
+    except Exception as e:
+        print(f"[invincible] _invincible_delete_deleter: {e}")
+        return None
+
+
+async def _invincible_get_mimic_webhook(channel):
+    """なりすまし復活用の webhook を取得（無ければ作成・チャンネル単位でキャッシュ）。
+    取れない/権限無しなら None（呼び出し側は bot 発言でフォールバック）。"""
+    cached = _invincible_mimic_webhooks.get(channel.id)
+    if cached is not None:
+        return cached
+    try:
+        if not channel.permissions_for(channel.guild.me).manage_webhooks:
+            return None
+        for wh in await channel.webhooks():
+            if wh.user and client.user and wh.user.id == client.user.id:
+                _invincible_mimic_webhooks[channel.id] = wh
+                return wh
+        wh = await channel.create_webhook(name="空気くん-無敵復活")
+        _invincible_mimic_webhooks[channel.id] = wh
+        return wh
+    except Exception as e:
+        print(f"[invincible] webhook取得失敗: {e}")
+        return None
+
+
+async def _invincible_repost(info: dict):
+    """無敵ユーザーの発言を復活。可能なら webhook で本人になりすます（名前/アイコン再現）。
+    復活させた発言も追跡し直す（また消されたら再び復活＝無制限。ブレーカーで暴走のみ抑制）。"""
+    channel = client.get_channel(info["channel_id"])
+    if channel is None:
+        return
+    await asyncio.sleep(INVINCIBLE_REPOST_PACE)
+    content = info["content"]
+    sent = None
+    # 通常テキストチャンネルは webhook でなりすまし復活
+    if isinstance(channel, discord.TextChannel):
+        wh = await _invincible_get_mimic_webhook(channel)
+        if wh is not None:
+            try:
+                sent = await wh.send(
+                    content, username=info["author_name"],
+                    avatar_url=info.get("author_avatar"),
+                    wait=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.NotFound:
+                _invincible_mimic_webhooks.pop(channel.id, None)  # webhook消された→次回作り直す
+            except Exception as e:
+                print(f"[invincible] webhook復活失敗（bot発言へ）: {e}")
+    if sent is None:  # フォールバック：bot発言（なりすまし不可時）
+        try:
+            sent = await channel.send(
+                f"↩️ **{info['author_name']}** の発言を復活させました:\n{content}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as e:
+            print(f"[invincible] 復活送信失敗: {e}")
+            return
+    # 復活した発言も追跡（消されたらまた復活）。webhook/bot発言は on_message で追跡されないので明示登録。
+    if sent is not None:
+        _invincible_msg_cache[sent.id] = dict(info)
+
+
+async def _invincible_handle_delete(payload, mid: int, info: dict):
+    """無敵ユーザーの発言が消された。削除者が本人以外なら復活させる。"""
+    _invincible_msg_cache.pop(mid, None)
+    try:
+        author_id = info["author_id"]
+        deleter_id = await _invincible_delete_deleter(payload, author_id)
+        if deleter_id is None:
+            return  # 自己削除／判定不能 → 復活しない（本人が消したものは尊重）
+        if client.user and deleter_id == client.user.id:
+            return  # bot自身の削除 → 尊重（ループ防止）
+        if deleter_id == author_id:
+            return  # 本人の削除 → 尊重
+        if not _invincible_breaker_ok(author_id):
+            guild = client.get_guild(payload.guild_id) if payload.guild_id else None
+            await _invincible_alert_owner(
+                guild, f"{info['author_name']} の発言が短時間に大量削除されています"
+                       f"（{INVINCIBLE_BREAKER_WINDOW:.0f}秒に{INVINCIBLE_BREAKER_MAX}回超）。"
+                       f"暴走防止のため自動復活を一時停止しました。手動でご対応ください。")
+            return
+        await _invincible_repost(info)
+        print(f"[invincible] 発言を復活 author={author_id} deleter={deleter_id} ch={info['channel_id']}")
+    except Exception as e:
+        print(f"[invincible] handle_delete: {e}")
+        traceback.print_exc()
+
+
+async def _invincible_handle_ban(guild: discord.Guild, user):
+    """無敵ユーザーが ban された → 即 unban し、本人へ招待リンクをDM（不可ならログchへ）。
+    ★unban は ban 記録を消すだけで自動再参加はしない（Discord 仕様）ため招待リンクを渡す。"""
+    try:
+        if not _invincible_breaker_ok(user.id):
+            await _invincible_alert_owner(
+                guild, f"{user}（`{user.id}`）が短時間に ban され続けています。"
+                       f"暴走防止のため自動 unban を一時停止しました。手動でご対応ください。")
+            return
+        # 1) unban
+        try:
+            await guild.unban(user, reason="無敵ユーザー保護：自動 unban")
+        except discord.NotFound:
+            pass  # 既に unban 済み
+        except discord.Forbidden:
+            await _invincible_alert_owner(
+                guild, f"{user}（`{user.id}`）を unban できませんでした"
+                       f"（空気くんに ban_members 権限が無い）。無敵保護が機能していません。")
+            return
+        # 2) 招待リンク発行（本人が戻れるように）
+        invite_url = None
+        try:
+            target_ch = guild.system_channel
+            if target_ch is None:
+                target_ch = next((c for c in guild.text_channels
+                                  if c.permissions_for(guild.me).create_instant_invite), None)
+            if target_ch is not None:
+                inv = await target_ch.create_invite(
+                    max_age=86400, max_uses=1, unique=True,
+                    reason="無敵ユーザー保護：ban解除後の再参加用")
+                invite_url = inv.url
+        except Exception as e:
+            print(f"[invincible] 招待発行失敗: {e}")
+        # 3) 本人へDM（ban直後は相互サーバーを失いDM不可なことが多い→失敗時はログchへ）
+        dm_ok = False
+        if invite_url:
+            try:
+                await user.send(
+                    f"🛡️ **{guild.name}** で ban されましたが、無敵保護により自動で解除しました。\n"
+                    f"下のリンク（24時間・1回有効）から戻ってこられます:\n{invite_url}")
+                dm_ok = True
+            except Exception:
+                dm_ok = False
+        # 4) ログ
+        note = f"{user}（`{user.id}`）が ban されたので自動 unban しました。"
+        if invite_url and dm_ok:
+            note += " 本人へ招待リンクをDMしました。"
+        elif invite_url:
+            note += f" 本人へのDMに失敗したため招待リンクを掲示します（渡してください）:\n{invite_url}"
+        else:
+            note += " ⚠️ 招待リンクを発行できませんでした（本人は手動で再招待が必要）。"
+        await _invincible_alert_owner(guild, note)
+        await _guard_store_event("invincible_unban", guild, user, None, "無敵保護：自動unban")
+        print(f"[invincible] 自動unban user={user.id} dm={dm_ok}")
+    except Exception as e:
+        print(f"[invincible] handle_ban: {e}")
+        traceback.print_exc()
+
+
+async def _invincible_guard_member_update(before: discord.Member, after: discord.Member):
+    """無敵ユーザーへの禁止ロール付与 / timeout を検知して即巻き戻す（状態ベース＝ループ無し）。"""
+    try:
+        guild = after.guild
+        # 1) 禁止ロールが新規付与された → 即剥奪
+        before_ids = {r.id for r in before.roles}
+        after_ids  = {r.id for r in after.roles}
+        added_blocked = (after_ids - before_ids) & INVINCIBLE_BLOCKED_ROLE_IDS
+        for rid in added_blocked:
+            if not _invincible_breaker_ok(after.id):
+                await _invincible_alert_owner(
+                    guild, f"{after}（`{after.id}`）へ短時間にロール付与が繰り返されています。"
+                           f"暴走防止のため自動剥奪を一時停止しました。")
+                break
+            role = guild.get_role(rid)
+            if role is None:
+                continue
+            try:
+                await after.remove_roles(role, reason="無敵ユーザー保護：禁止ロールを自動剥奪")
+                print(f"[invincible] 禁止ロール剥奪 user={after.id} role={rid}")
+            except discord.Forbidden:
+                await _invincible_alert_owner(
+                    guild, f"{after}（`{after.id}`）から禁止ロール `{rid}` を剥奪できませんでした"
+                           f"（空気くんのロールが対象ロールより下か、権限不足）。"
+                           f"無敵保護が機能していません。ロール順位をご確認ください。")
+            except Exception as e:
+                print(f"[invincible] ロール剥奪失敗: {e}")
+
+        # 2) timeout（communication disabled）が新規/延長された → 即解除
+        b_to = before.timed_out_until
+        a_to = after.timed_out_until
+        if after.is_timed_out() and b_to != a_to:
+            if not _invincible_breaker_ok(after.id):
+                await _invincible_alert_owner(
+                    guild, f"{after}（`{after.id}`）へ短時間に timeout が繰り返されています。"
+                           f"暴走防止のため自動解除を一時停止しました。")
+                return
+            try:
+                await after.timeout(None, reason="無敵ユーザー保護：timeoutを自動解除")
+                print(f"[invincible] timeout自動解除 user={after.id}")
+            except discord.Forbidden:
+                await _invincible_alert_owner(
+                    guild, f"{after}（`{after.id}`）の timeout を解除できませんでした"
+                           f"（空気くんに moderate_members 権限が無い）。無敵保護が機能していません。")
+            except Exception as e:
+                print(f"[invincible] timeout解除失敗: {e}")
+    except Exception as e:
+        print(f"[invincible] guard_member_update: {e}")
+        traceback.print_exc()
+
+
+async def _load_invincible_ids():
+    """起動時に Mongo の動的リストを in-memory の実効リストへ読み込む（seed と合算）。"""
+    try:
+        _invincible_ids.clear()
+        _invincible_ids.update(INVINCIBLE_USER_IDS_SEED)
+        async for doc in invincible_col.find({}, {"_id": 1}):
+            try:
+                _invincible_ids.add(int(doc["_id"]))
+            except (ValueError, KeyError):
+                continue
+        print(f"[invincible] 無敵リスト読込: {len(_invincible_ids)}人 "
+              f"(seed={len(INVINCIBLE_USER_IDS_SEED)})")
+    except Exception as e:
+        print(f"[invincible] リスト読込失敗（seedのみで継続）: {e}")
+
+
+async def _invincible_startup_sweep():
+    """再接続/デプロイ直後に一度だけ、ダウンタイム中に無敵ユーザーへ適用された
+    禁止ロール・timeout を掃討する（イベントを取りこぼした窓を塞ぐ）。監査ログ判定は不要。"""
+    if not INVINCIBLE_ENABLED:
+        return
+    guild = client.get_guild(HOME_GUILD_ID)
+    if guild is None:
+        return
+    # 権限チェック（ここで初めて guild.me が取れる）
+    perms = guild.me.guild_permissions if guild.me else None
+    if perms is not None:
+        missing = [n for n, ok in (
+            ("ban_members", perms.ban_members),
+            ("moderate_members", perms.moderate_members),
+            ("manage_roles", perms.manage_roles),
+            ("view_audit_log", perms.view_audit_log),
+        ) if not ok]
+        if missing:
+            print(f"[WARN] 無敵機能: 権限不足 {missing}（該当保護が縮退します）。"
+                  f"特に view_audit_log 欠如で発言復活が常にスキップになります。")
+    for uid in list(_invincible_ids):
+        member = guild.get_member(uid)
+        if member is None:
+            continue
+        try:
+            blocked = [r for r in member.roles if r.id in INVINCIBLE_BLOCKED_ROLE_IDS]
+            if blocked:
+                await member.remove_roles(*blocked, reason="無敵保護：起動時掃討（ダウンタイム中付与分）")
+                print(f"[invincible] 起動掃討: 禁止ロール剥奪 user={uid}")
+            if member.is_timed_out():
+                await member.timeout(None, reason="無敵保護：起動時掃討（ダウンタイム中timeout分）")
+                print(f"[invincible] 起動掃討: timeout解除 user={uid}")
+        except discord.Forbidden:
+            await _invincible_alert_owner(
+                guild, f"起動掃討: {member}（`{uid}`）の懲罰を解除できませんでした（権限/ロール順位）。")
+        except Exception as e:
+            print(f"[invincible] 起動掃討失敗 user={uid}: {e}")
+
+
+_invincible_ready_swept = False
+
+
+@client.event
+async def on_ready():
+    """接続完了。無敵ユーザーへダウンタイム中に適用された懲罰を一度だけ掃討する。"""
+    global _invincible_ready_swept
+    print(f"[INFO] on_ready: {client.user} 接続完了")
+    if not _invincible_ready_swept:
+        _invincible_ready_swept = True
+        try:
+            await _invincible_startup_sweep()
+        except Exception as e:
+            print(f"[WARN] 無敵起動掃討失敗: {e}")
+
+
+# --- オーナー専用スラッシュコマンド：無敵リスト管理 ---
+@client.tree.command(name="無敵登録", description="【オーナー】指定ユーザーを無敵リストに追加")
+@app_commands.describe(user="無敵にするユーザー")
+async def invincible_add_cmd(interaction: discord.Interaction, user: discord.User):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    await invincible_col.update_one(
+        {"_id": str(user.id)},
+        {"$set": {"name": str(user), "added_at": datetime.datetime.now(datetime.timezone.utc),
+                  "added_by": interaction.user.id}},
+        upsert=True)
+    _invincible_ids.add(user.id)
+    await interaction.response.send_message(
+        f"🛡️ {user}（`{user.id}`）を無敵リストに追加しました。\n"
+        f"以後この人への 削除/ban/timeout/禁止ロール付与 は自動で巻き戻します。",
+        ephemeral=True)
+
+
+@client.tree.command(name="無敵解除", description="【オーナー】指定ユーザーを無敵リストから削除")
+@app_commands.describe(user="無敵を解除するユーザー")
+async def invincible_remove_cmd(interaction: discord.Interaction, user: discord.User):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    await invincible_col.delete_one({"_id": str(user.id)})
+    _invincible_ids.discard(user.id)
+    in_seed = user.id in INVINCIBLE_USER_IDS_SEED
+    extra = ("\n⚠️ このユーザーは環境変数 INVINCIBLE_USER_IDS のシードに含まれています。"
+             "再起動で復活します（恒久解除は env を編集してください）。" if in_seed else "")
+    await interaction.response.send_message(
+        f"🛡️ {user}（`{user.id}`）を無敵リストから外しました。{extra}", ephemeral=True)
+
+
+@client.tree.command(name="無敵一覧", description="【オーナー】無敵リストを表示")
+async def invincible_list_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _panic_owner_gate_ok(interaction):
+        await interaction.response.send_message("⛔ このコマンドはオーナー専用です。", ephemeral=True)
+        return
+    if not _invincible_ids:
+        await interaction.response.send_message("無敵リストは空です。", ephemeral=True)
+        return
+    lines = []
+    for uid in sorted(_invincible_ids):
+        seed_mark = "（seed）" if uid in INVINCIBLE_USER_IDS_SEED else ""
+        u = client.get_user(uid)
+        lines.append(f"・{u if u else uid}（`{uid}`）{seed_mark}")
+    role_note = "、".join(f"`{r}`" for r in sorted(INVINCIBLE_BLOCKED_ROLE_IDS)) or "（なし）"
+    await interaction.response.send_message(
+        "🛡️ **無敵リスト**\n" + "\n".join(lines) +
+        f"\n\n禁止ロール（付与即剥奪）: {role_note}"
+        f"\n機能: {'有効' if INVINCIBLE_ENABLED else '無効'}",
+        ephemeral=True)
 
 
 @client.event
@@ -6200,7 +6678,12 @@ class GuardInviteButton(
 
 @client.event
 async def on_member_ban(guild: discord.Guild, user):
-    """他者の ban を検知 → レビュー投稿（Wick/信頼済み/自分は除外）。"""
+    """他者の ban を検知 → レビュー投稿（Wick/信頼済み/自分は除外）。
+    無敵ユーザーが対象の場合は mod-guard より先に即 unban（誰の ban でも巻き戻す）。"""
+    # 無敵保護：対象が無敵ユーザーなら即 unban（mod-guardの通知はスキップ）
+    if INVINCIBLE_ENABLED and guild.id == HOME_GUILD_ID and _is_invincible(user.id):
+        asyncio.create_task(_invincible_handle_ban(guild, user))
+        return
     if not MOD_GUARD_ENABLED:
         return
     try:
@@ -6944,7 +7427,11 @@ INVITE_BONUSES = {1: 200, 3: 500, 5: 1000, 10: 2000}
 
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    """通知ロールが新規付与された人に同意プロンプトを出す（案A: 24h未確認で自動剥奪）。"""
+    """通知ロールが新規付与された人に同意プロンプトを出す（案A: 24h未確認で自動剥奪）。
+    併せて無敵ユーザーへの禁止ロール付与 / timeout を検知して即巻き戻す。"""
+    # 無敵保護：禁止ロール付与・timeout を即巻き戻す（監査ログ待ちを含むので別タスク化）
+    if INVINCIBLE_ENABLED and _is_invincible(after.id):
+        asyncio.create_task(_invincible_guard_member_update(before, after))
     try:
         before_ids = {r.id for r in before.roles}
         after_ids  = {r.id for r in after.roles}
