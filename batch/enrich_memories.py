@@ -44,6 +44,39 @@ SUMMARY_DAYS   = 7
 MAX_MEMORIES   = 40
 MAX_CLAIMS     = 20
 
+# 全員対象化の制御（analyze_personality と同方針）。
+# 旧実装は is_booster=True 限定で、性格分析が xp>0 全員へ移行した後も取り残されていた。
+MIN_CONV_COUNT    = 30   # メイド会話者を最優先で回す閾値
+ROTATION_DAYS     = 5    # 直近この日数内に enrich 済みならローテーションでスキップ
+MAX_USERS_PER_RUN = 25   # 1回のバッチで処理する最大人数（GitHub Actions タイムアウト対策）
+
+
+def needs_rotation(doc: dict, now: datetime, days: int) -> bool:
+    """直近days日以内に enrich 済みならスキップ（未処理・古いものを優先）。"""
+    at = doc.get("last_enriched")
+    if not at:
+        return True
+    try:
+        return (now - datetime.fromisoformat(at)).days >= days
+    except (ValueError, TypeError):
+        return True
+
+
+def select_targets(users_col, now: datetime) -> list:
+    """メイド会話者(conv_count≥MIN_CONV_COUNT)を最優先し、残りをローテーション補充。"""
+    all_users = list(users_col.find({
+        "xp":                 {"$gt": 0},
+        "name":               {"$exists": True},
+        "personality_optout": {"$ne": True},
+    }))
+    maid_fresh = [d for d in all_users if d.get("conv_count", 0) >= MIN_CONV_COUNT]
+    maid_ids   = {d["_id"] for d in maid_fresh}
+    rotation   = [d for d in all_users
+                  if d["_id"] not in maid_ids and needs_rotation(d, now, ROTATION_DAYS)]
+    # 未処理(last_enriched無し)→古い順に並べ、公平に巡回させる
+    rotation.sort(key=lambda d: d.get("last_enriched") or "")
+    return maid_fresh + rotation
+
 
 EXTRACT_PROMPT = """\
 以下はDiscordサーバーの要約ログです。
@@ -169,16 +202,25 @@ def main():
         return
     print(f"[enrich] 要約: {len(summaries_text)}文字")
 
-    # ブースターユーザーのみ対象
-    targets = list(users_col.find({"is_booster": True, "name": {"$exists": True}}))
-    print(f"[enrich] 対象ユーザー: {len(targets)}人")
+    # xp>0 の全ユーザー（optout除外）をローテーションで対象化
+    now       = datetime.now(timezone.utc)
+    targets   = select_targets(users_col, now)
+    print(f"[enrich] 候補ユーザー: {len(targets)}人 (cap {MAX_USERS_PER_RUN}/run)")
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    success = 0
+    client    = genai.Client(api_key=GEMINI_API_KEY)
+    success   = 0
+    processed = 0
 
     for doc in targets:
+        if processed >= MAX_USERS_PER_RUN:
+            print(f"[enrich] Reached cap ({MAX_USERS_PER_RUN}). 残りは次回に回します。")
+            break
+
         uid  = str(doc["_id"])
         name = doc.get("name", uid)
+        processed += 1
+        # 処理した事実を記録（AI失敗でもローテーションを前進させ、同じ人で詰まらせない）
+        users_col.update_one({"_id": uid}, {"$set": {"last_enriched": now.isoformat()}})
         print(f"[enrich] 処理中: {name}")
 
         prompt = EXTRACT_PROMPT.format(
@@ -261,7 +303,7 @@ def main():
 
         time.sleep(3)
 
-    print(f"[enrich] 完了: {success}/{len(targets)}人処理")
+    print(f"[enrich] 完了: {success}/{processed}人処理（候補{len(targets)}人）")
 
 
 if __name__ == "__main__":

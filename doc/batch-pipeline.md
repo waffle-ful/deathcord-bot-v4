@@ -6,9 +6,10 @@ GitHub Actions 上で実行される全ての定期処理のまとめ。`batch/*
 
 | YAML | cron (UTC) | JST | 呼び出し | 所要時間目安 |
 |------|-----------|-----|---------|------------|
-| `summarize.yml` | `0 */2 * * *` | 2h毎 | fetch → summarize → update_mongodb | ~15 min |
-| `daily_tasks.yml` | `0 15 * * *` | 0:00 | analyze_personality → analyze_nonbooster → post_summary → enrich_memories | ~30 min |
-| `personality_analyze.yml` | `0 15 * * *` | 0:00 | analyze_personality **（daily_tasks と重複 ⚠️）** | ~15 min |
+| `summarize.yml` | `0 */4 * * *` | 4h毎 | fetch → summarize → update_mongodb | ~15 min |
+| `daily_tasks.yml` | `0 15 * * *` | 0:00 | analyze_personality ／ analyze_nonbooster ／ enrich_memories（独立3ジョブ） | ~30 min |
+| `personality_analyze.yml` | manual (dispatch) | - | analyze_personality（schedule削除済＝daily_tasksと重複解消） | ~15 min |
+| `post_summary.yml` | `0 15 * * *` | 0:00 | post_summary.py（日報投稿・Gemini不使用で独立） | ~2 min |
 | `nikkei-report.yml` | `0 7 * * 1-5` | 平日16:00 | market_report.py | ~10 min |
 | `ai_news.yml` | `0 1,4,7,10,13 * * *` | 10, 13, 16, 19, 22 時 | ai_news_bot.py | ~5 min |
 | `cleanup.yml` | `0 15 * * *` | 0:00 | cleanup_bot.py（別トークン） | ~5 min |
@@ -16,7 +17,7 @@ GitHub Actions 上で実行される全ての定期処理のまとめ。`batch/*
 | `retro_backfill.yml` | manual (dispatch) | - | batch/retro_backfill.py（複数日まとめて） | days×数分 |
 | `focus_summary.yml` | manual (dispatch) | - | batch/focus_summary.py | ~20 min |
 
-**毎日 JST 0:00 に 3 つの workflow が一斉起動**（`daily_tasks`, `personality_analyze`, `cleanup`）。GitHub Actions の同時実行キューに注意。
+**毎日 JST 0:00 に起動**（`daily_tasks`＝独立3ジョブ, `post_summary`, `cleanup`）。旧 `personality_analyze` の schedule 重複は解消済み（dispatch専用化）。enrich_memories は 2026-07-07 に is_booster 限定を撤廃し **xp>0 全ユーザーをローテーション**（cap 25/run）対象化。
 
 ## パイプライン 1: 2時間毎の要約（summarize.yml）
 
@@ -164,8 +165,10 @@ focus_summary.py
 > 7日で再構築して捨てていた。**注意（フィードバックループ）**: 既知情報を戻す＋「引き写し禁止」指示により
 > 言い換え再抽出が起き、完全一致 dedup をすり抜けて claims/memories に near-dup が溜まる懸念がある。対策として
 > `_dedup_key`（大小文字・空白・末尾句読点を畳む正規化）で軽い言い換え重複を弾く。profile は `$set` 上書きなので
-> 戻しても劣化しない。真の意味 dedup は Tier3（embedding）領域。
-> （keyword の意味検索 RAG = 各 summary への embedding キャッシュ付与は Tier3 として未実装）
+> 戻しても劣化しない。真の意味 dedup（near-dup 統合）は未実装（将来 consolidation バッチで対応予定）。
+> （keyword の意味検索 RAG = 各 summary への embedding 付与＋in-Python cosine は **実装済み**。summarize.py が
+> embedding を同梱し、main.py `search_summaries` が cosine 検索する。2026-07-07 にトリガー語ゲートを撤廃し
+> standout 閾値で自然な想起質問も発火するよう改善＋プロセス内 embedding キャッシュ化。）
 
 ## 副業スクリプト（root 直下）
 

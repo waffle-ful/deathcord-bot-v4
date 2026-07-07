@@ -9,8 +9,11 @@
 |-------------|-----------|----------|----------|---------------|
 | `users` | ユーザー状態（XP・プロフィール・記憶） | main.py + batch/analyze_* | main.py + batch/analyze_*, focus_summary | サーバーメンバー数 |
 | `system` | サーバー設定・状態（性格・ニックネーム・Bump） | main.py + batch/update_mongodb | main.py + market_report | 数件〜数十件 |
-| `summaries` | サーバー要約アーカイブ | batch/update_mongodb + retro_summarize | main.py + post_summary + analyze_* | 毎2h追加・永久保持 |
+| `summaries` | サーバー要約アーカイブ（embedding付・意味検索対象） | batch/update_mongodb + retro_summarize | main.py(search_summaries) + post_summary + analyze_* | 毎4h追加・永久保持 |
+| `messages` | リアルタイム全発言ログ（mimic・性格分析の生ソース） | main.py on_message | mimic + analyze_personality | **TTL 30日で自動削除** |
 | `market_predictions` | 週次市場予想データ | market_report.py | market_report.py | 1件/週 |
+
+> 注: 実コードには `messages`（TTL30日）のほか `killswitch_snapshots` / `guard_events` / `interaction_dedup`（TTL1h）/ `invincible_users` も存在する。要約は 2h→**4h** 間隔（`summarize.yml` cron `0 */4 * * *`）。
 
 ## コレクション: `users`
 
@@ -57,12 +60,12 @@
     "updated_at": "2026-04-23T15:00:00+00:00"
   },
 
-  "butler_history": [                     // メイド会話履歴（最新 BUTLER_HISTORY_MAX*2 = 10件）
+  "butler_history": [                     // メイド会話履歴（最新 BUTLER_HISTORY_MAX*2 = 30件・2026-07-07に5→15往復へ拡張）
     {"role": "user", "content": "こんにちは"},
-    {"role": "assistant", "content": "..."}
+    {"role": "assistant", "content": "...", "persona": "yandere"}
   ],
 
-  "memories": [                           // 長期記憶、最新10件、MRU
+  "memories": [                           // 長期記憶、最新40件、MRU（$slice:40）
     {
       "content": "最近FPSにハマっている",
       "date": "2026-04",                  // YYYY-MM

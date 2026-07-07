@@ -39,6 +39,15 @@ MONGO_URL         = os.environ.get("MONGO_URL") or os.environ.get("MONGODB_URI")
 NOTIFY_CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or 0)
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 
+# --- YouTube配信開始通知 設定 ---
+# RSS(無料)で直近動画IDを拾い、videos.list(1 unit)でライブ判定して通知する。
+# YOUTUBE_API_KEY / YOUTUBE_NOTIFY_CHANNEL_ID が両方揃わないとタスクは自動で無効化される。
+YOUTUBE_API_KEY          = os.environ.get("YOUTUBE_API_KEY")
+YOUTUBE_CHANNEL_ID       = os.environ.get("YOUTUBE_CHANNEL_ID") or "UC1HxHVAadoOwBN6k5oozGcw"
+YOUTUBE_NOTIFY_CHANNEL_ID = int(os.environ.get("YOUTUBE_NOTIFY_CHANNEL_ID") or 0)
+YOUTUBE_PING_ROLE_ID     = int(os.environ.get("YOUTUBE_PING_ROLE_ID") or 0)  # 0なら@here
+YOUTUBE_POLL_INTERVAL    = int(os.environ.get("YOUTUBE_POLL_INTERVAL") or 120)  # 秒
+
 # --- Bump通知（宣伝準備完了ping）設定 ---
 # 専用ch にロールpingを出す。env で上書き可。
 NOTIFY_PING_CHANNEL_ID = int(os.environ.get("NOTIFY_PING_CHANNEL_ID") or 1520322785421824041)
@@ -245,7 +254,9 @@ def memory_topk(xp: int) -> int:
 BOOSTER_ROLE_ID       = 1420309723273756704
 BOOSTER_XP_MULTIPLIER = 1.5
 BUTLER_CHANNEL_ID     = 1477343773251080433
-BUTLER_HISTORY_MAX    = 5
+BUTLER_HISTORY_MAX    = 15   # 保存する往復数（旧5→15。健忘症緩和）
+BUTLER_HISTORY_FULL   = 5    # プロンプトに全文で見せる直近往復数（それ以前は要約長に切り詰めてトークン節約）
+BUTLER_HISTORY_TRUNC  = 80   # 直近以外の1発言あたり最大文字数
 
 # --- Bump Bot設定 ---
 BOT_CONFIG = {
@@ -894,6 +905,12 @@ SUMMARY_SIM_THRESHOLD = float(os.environ.get("SUMMARY_SIM_THRESHOLD", "0.45"))
 SUMMARY_SEM_REL_GAP   = float(os.environ.get("SUMMARY_SEM_REL_GAP", "0.05"))
 # 1回の検索で読む summaries の上限（現状 ~970 件。将来大幅に増えたらキャッシュ/索引へ移行）。
 SUMMARY_SCAN_LIMIT    = 3000
+# トリガー語が無くても、際立って強い意味一致ならRAG発火（自然な想起質問を拾う）。
+# 空間が密集し baseline~0.45 なので、それより明確に高いこの値を「際立った一致」の目安に。ログの best= で調整。
+SUMMARY_STANDOUT_THRESHOLD = float(os.environ.get("SUMMARY_STANDOUT_THRESHOLD", "0.62"))
+# summaries の embedding を毎回970件Mongoから読むのは重い（M0で~12MB/回）。プロセス内にキャッシュし
+# TTLで更新（日報は4h毎更新なので30分キャッシュで十分新鮮）。gate撤廃で毎応答検索しても安いようにする。
+_SUMMARY_CACHE_TTL_SEC = 1800
 
 # 過去日報検索の発火トリガー。memories(個人記憶)用とは別系統にし、サーバーの歴史・過去メンバー
 # 想起に寄せて拡張（dense embedding は固有名詞に弱いので、人の出入り系の語で確実に発火させる）。
@@ -947,6 +964,30 @@ def _date_prefix_hit(doc: dict, prefixes: list[str]) -> bool:
     return False
 
 
+_summary_embed_cache: list[dict] = []
+_summary_embed_cache_at = None
+
+
+async def _load_summary_docs() -> list[dict]:
+    """embedding付き summaries をプロセス内キャッシュから返す（TTL切れ時のみMongo再読込）。"""
+    global _summary_embed_cache, _summary_embed_cache_at
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if (_summary_embed_cache and _summary_embed_cache_at
+            and (now - _summary_embed_cache_at).total_seconds() < _SUMMARY_CACHE_TTL_SEC):
+        return _summary_embed_cache
+    try:
+        cursor = summaries_col.find(
+            {"embedding": {"$exists": True, "$ne": []}},
+            {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1},
+        )
+        _summary_embed_cache    = await cursor.to_list(length=SUMMARY_SCAN_LIMIT)
+        _summary_embed_cache_at = now
+        print(f"[summary] embeddingキャッシュ更新: {len(_summary_embed_cache)}件")
+    except Exception as e:
+        print(f"[summary] キャッシュ読込失敗: {e}")
+    return _summary_embed_cache
+
+
 async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = None) -> list[dict]:
     """過去日報(サーバー全体)の意味検索＋名前の語彙一致＋日付想起のハイブリッド。「去年いた○○覚えてる?」
     「2025年5月どうだった?」等の想起用。
@@ -964,19 +1005,13 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
     # 日付の手がかり(年月)があればトリガー語なしでも発火させる（「2025年5月どうだった?」を拾う）
     now_year      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).year
     date_prefixes = _parse_query_date_prefixes(query, now_year)
-    if not date_prefixes and not any(w in query for w in SUMMARY_TRIGGER_WORDS):
-        return []
+    # 旧: ここでトリガー語/日付ゲートで早期return していた＝トリガー語を含まない自然な想起質問を
+    # 一切拾えなかった。今は先に埋め込んで採点し、日付/トリガ語に加え「際立った意味一致」でも発火させる。
     qvec = await _embed_query_for_summaries(query)
     if not qvec:
         return []
-    try:
-        cursor = summaries_col.find(
-            {"embedding": {"$exists": True, "$ne": []}},
-            {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1},
-        )
-        docs = await cursor.to_list(length=SUMMARY_SCAN_LIMIT)
-    except Exception as e:
-        print(f"[summary] find失敗: {e}")
+    docs = await _load_summary_docs()
+    if not docs:
         return []
 
     # クエリに登場する既知の名前を収集（別名↔正式名の両形で summary 側を引けるよう両方入れる）。
@@ -997,6 +1032,16 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
         return []
     scored.sort(key=lambda t: t[0], reverse=True)
     best = scored[0][0]
+
+    # 発火判定: 日付手がかり / トリガー語 / 名前needle / 際立った意味一致 のいずれか。
+    # トリガー語ゲートを撤廃し、自然な想起質問（「あの時のイベントどうだった？」等）を
+    # standout閾値で拾えるようにした。casual replyで無関係な日報を注入しないよう standout は高め。
+    fired = (bool(date_prefixes)
+             or any(w in query for w in SUMMARY_TRIGGER_WORDS)
+             or bool(present_names)
+             or best >= SUMMARY_STANDOUT_THRESHOLD)
+    if not fired:
+        return []
 
     # ③ needle: 名前を含む doc を cosine 順で（閾値未満でも採用）。
     needle = ([d for _, d in scored if any(n in d.get("summary", "") for n in present_names)][:top_k]
@@ -1707,17 +1752,26 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
     （主人側の発言は全て保持・内容はmemories/profileに残るので文脈は失われない）"""
     if not history:
         return "（初めてのご挨拶）"
+    # 直近 BUTLER_HISTORY_FULL 往復（=*2 エントリ）は全文、それ以前は BUTLER_HISTORY_TRUNC 字に
+    # 切り詰めて見せる。往復数を増やしても古い発言でプロンプトが肥大しないようにするため。
+    full_from = max(0, len(history) - BUTLER_HISTORY_FULL * 2)
+
+    def _clip(text: str, idx: int) -> str:
+        if idx >= full_from or len(text) <= BUTLER_HISTORY_TRUNC:
+            return text
+        return text[:BUTLER_HISTORY_TRUNC] + "…"
+
     lines = []
-    for h in history:
+    for i, h in enumerate(history):
         if h["role"] == "user":
             mark = "★" if _is_emotionally_significant(h["content"]) else ""
-            lines.append(f"{mark}主人: {h['content']}")
+            lines.append(f"{mark}主人: {_clip(h['content'], i)}")
         else:
             # 現人格タグと一致する発言のみ口調を見せる。タグ無し(レガシー)・別人格は中立化。
             if current_persona and h.get("persona") != current_persona:
                 lines.append("メイド: （別の人格で応答）")
             else:
-                lines.append(f"メイド: {h['content']}")
+                lines.append(f"メイド: {_clip(h['content'], i)}")
     return "\n".join(lines)
 
 
@@ -1821,8 +1875,13 @@ async def maid_respond_queued(message: discord.Message, is_booster: bool = False
 
     qsize = _maid_queue.qsize()
     if qsize >= _QUEUE_MAX:
-        # キュー溢れ時も露骨なメッセージは出さず静かに無視
+        # 旧: 無言drop＝話しかけた人には無視されたように見えた。
+        # 生成LLMは呼ばず、リアクション1個(API1回)だけ付けて「混雑中で後回し」を伝える。
         print(f"[WARN] maid_queue full, dropping: {message.author.display_name}")
+        try:
+            await message.add_reaction("⏳")
+        except Exception:
+            pass
         return
 
     await _maid_queue.put(message)
@@ -2189,7 +2248,10 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         sent = await message.reply(_reply_text)
         _track_maid_message(sent, _reply_text)  # 消されても復活させるため記録
 
-    if "（" not in ai_text:
+    # 全モデル失敗時の sentinel「（メイドは今、…）」だけを弾く。
+    # 旧実装は「（」を含む正常応答（演出・心情の丸括弧）まで記憶保存をスキップしていた＝
+    # メイドが丸括弧を使うたびに会話・記憶・profileが一切残らない健忘症バグだった。
+    if ai_text and not ai_text.startswith("（メイド"):
         await save_butler_history(uid, "user", raw_content[:200])
         await save_butler_history(uid, "assistant", ai_text, persona=personality_key)
         await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
@@ -2223,12 +2285,16 @@ async def maid_respond_cmd(interaction: discord.Interaction, content: str):
         sent = await interaction.followup.send(_reply_text)  # 非ephemeral=削除可・追跡可
         _track_maid_message(sent, _reply_text)  # 消されても復活させるため記録
 
-    if "（" not in ai_text:
+    # sentinel「（メイドは今、…）」のみ弾く（丸括弧を含む正常応答は保存する）
+    if ai_text and not ai_text.startswith("（メイド"):
         await save_butler_history(uid, "user", raw_content[:200])
         await save_butler_history(uid, "assistant", ai_text, persona=personality_key)
         await users_col.update_one({"_id": uid}, {"$inc": {"conv_count": 1}}, upsert=True)
         asyncio.create_task(extract_and_save_profile(
             uid, interaction.user.display_name, raw_content, ai_text
+        ))
+        asyncio.create_task(_extract_claims_and_memories(
+            uid, interaction.user.display_name, raw_content
         ))
 
 # =============================================================================
@@ -2406,6 +2472,7 @@ class MyBot(discord.Client):
         self.loop.create_task(init_invite_snapshot(self))
         self.loop.create_task(_load_advocate_flags())
         self.loop.create_task(_load_quiz_gate())
+        self.loop.create_task(youtube_live_task())
 
 async def init_invite_snapshot(bot: discord.Client):
     await bot.wait_until_ready()
@@ -3842,7 +3909,7 @@ async def introduce_cmd(interaction: discord.Interaction):
         ),
     )
     text = await _run_ai_booster(base)
-    if not text or "（" in text:
+    if not text or text.startswith("（メイド"):
         text = (
             "ふ〜ん、あんたたちのお守りに来てあげた新人メイドだよ♡ "
             "よわよわなお兄さんたちが私に勝てるわけないけどさ♡ "
@@ -4747,7 +4814,7 @@ async def _generate_advocacy(target: discord.Member, channel, situation: str = "
         channel_context=channel_context,
     )
     text = await _run_ai_booster(prompt)
-    if not text or "（" in text:
+    if not text or text.startswith("（メイド"):
         return None
     return text.strip()
 
@@ -7671,7 +7738,7 @@ async def _generate_idle_opener() -> tuple[str, dict] | None:
     else:
         prompt = base
     text = await _run_ai_booster(prompt)
-    if not text or "（" in text:
+    if not text or text.startswith("（メイド"):
         return None
     return text, personality
 
@@ -7828,6 +7895,109 @@ async def notification_task():
         except Exception as e:
             print(f"[ERROR] Notify: {e}")
         await asyncio.sleep(600)
+
+async def youtube_live_task():
+    """自分のYouTube配信開始を検知してDiscordに通知する。
+
+    quota節約のため RSS(0 unit) で直近の動画IDを拾い、videos.list(1 unit) で
+    liveBroadcastContent == 'live' を確認してから通知する。旧GASの
+    Search.list(100 unit/回) 方式より約1/100の消費で済む。
+    通知済みIDは Mongo(system) に持つので Render の再起動/スリープをまたいでも
+    二重通知しない。"""
+    await client.wait_until_ready()
+    if not YOUTUBE_API_KEY:
+        print("[youtube] YOUTUBE_API_KEY 未設定のため配信通知タスクは無効")
+        return
+    if not YOUTUBE_NOTIFY_CHANNEL_ID:
+        print("[youtube] YOUTUBE_NOTIFY_CHANNEL_ID 未設定のため配信通知タスクは無効")
+        return
+
+    import aiohttp
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+    api_url = "https://www.googleapis.com/youtube/v3/videos"
+    print(f"[youtube] 配信通知タスク開始 (channel={YOUTUBE_CHANNEL_ID}, "
+          f"interval={YOUTUBE_POLL_INTERVAL}s)")
+
+    while not client.is_closed():
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 1. RSSで直近の動画IDを取得（quota消費ゼロ）
+                async with session.get(
+                    rss_url, timeout=aiohttp.ClientTimeout(total=20)
+                ) as r:
+                    xml = await r.text()
+                ids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", xml)[:5]
+                if not ids:
+                    await asyncio.sleep(YOUTUBE_POLL_INTERVAL)
+                    continue
+
+                # 2. videos.listでライブ判定（呼び出し1回=1 unit）
+                params = {"part": "snippet", "id": ",".join(ids),
+                          "key": YOUTUBE_API_KEY}
+                async with session.get(
+                    api_url, params=params,
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as r:
+                    data = await r.json()
+
+            if data.get("error"):
+                # APIキー不正 / quota超過などを黙殺せず出す
+                print(f"[ERROR] youtube videos.list: {data['error']}")
+                await asyncio.sleep(YOUTUBE_POLL_INTERVAL)
+                continue
+
+            items = data.get("items") or []
+            live = next(
+                (v for v in items
+                 if v.get("snippet", {}).get("liveBroadcastContent") == "live"),
+                None,
+            )
+
+            state   = await system_col.find_one({"_id": "youtube_live_state"}) or {}
+            last_id = state.get("last_live_id")
+
+            if not live:
+                # 配信終了 → 次の配信を検知できるようリセット
+                if last_id:
+                    await system_col.update_one(
+                        {"_id": "youtube_live_state"},
+                        {"$set": {"last_live_id": None}}, upsert=True,
+                    )
+                await asyncio.sleep(YOUTUBE_POLL_INTERVAL)
+                continue
+
+            vid = live["id"]
+            if last_id == vid:
+                await asyncio.sleep(YOUTUBE_POLL_INTERVAL)
+                continue  # 通知済み
+
+            ch = client.get_channel(YOUTUBE_NOTIFY_CHANNEL_ID)
+            if ch:
+                title = live["snippet"].get("title", "配信")
+                role  = (ch.guild.get_role(YOUTUBE_PING_ROLE_ID)
+                         if (ch.guild and YOUTUBE_PING_ROLE_ID) else None)
+                mention = (role.mention + " ") if role else "@here "
+                await ch.send(
+                    f"{mention}\n🔴 **配信開始！**\n**{title}**\n"
+                    f"https://www.youtube.com/watch?v={vid}",
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=(role is None), users=False,
+                        roles=[role] if role else False,
+                    ),
+                )
+                await system_col.update_one(
+                    {"_id": "youtube_live_state"},
+                    {"$set": {"last_live_id": vid}}, upsert=True,
+                )
+                print(f"[youtube] 配信開始通知: {title} ({vid})")
+            else:
+                print(f"[WARN] youtube: 通知先チャンネル {YOUTUBE_NOTIFY_CHANNEL_ID} "
+                      f"が見つからない")
+
+        except Exception as e:
+            print(f"[ERROR] youtube_live_task: {e}")
+
+        await asyncio.sleep(YOUTUBE_POLL_INTERVAL)
 
 # =============================================================================
 # エントリーポイント
