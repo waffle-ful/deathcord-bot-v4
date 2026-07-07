@@ -923,21 +923,50 @@ SUMMARY_TRIGGER_WORDS = MEMORY_TRIGGER_WORDS + [
 ]
 
 
-def _parse_query_date_prefixes(query: str, now_year: int) -> list[str]:
-    """クエリから年月の手がかりを抽出し、日報の日付(YYYY-MM-DD)に対する一致パターンを返す。
-    各要素: "YYYY-MM"(その年月) / "YYYY-"(その年) / "*-MM"(年不明のその月)。手がかりなしは []。
-    例: '2025年5月'→['2025-05'] / '去年の5月'(今2026)→['2025-05'] / '2025の話'→['2025-'] / '5月'→['*-05']。"""
+_WEEKDAY_JA = "月火水木金土日"  # datetime.weekday() 対応（0=月）
+
+
+def _parse_query_date_prefixes(query: str, now_jst: datetime.datetime) -> list[str]:
+    """クエリから日付の手がかりを抽出し、日報の日付(YYYY-MM-DD)に対する一致パターンを返す。
+    各要素: "YYYY-MM-DD"(その日) / "YYYY-MM"(その年月) / "YYYY-"(その年) /
+    "*-MM"(年不明のその月) / "*-MM-DD"(年不明の月日)。手がかりなしは []。
+    例: '一昨日'(今日2026-07-08)→['2026-07-06'] / '7月6日'→['*-07-06'] /
+    '2025年5月'→['2025-05'] / '去年の5月'(今2026)→['2025-05'] / '5月'→['*-05']。
+    ※「今日」は非対応（最新要約が別経路で常時注入されるため意図的に除外）。"""
     q = query
+    today    = now_jst.date()
+    now_year = today.year
+    # ① 相対日（日単位）。「一昨日」は「昨日」を部分文字列に含むので先に判定。
+    rel_days = None
+    if "一昨日" in q or "おととい" in q:
+        rel_days = 2
+    elif "昨日" in q or "きのう" in q:
+        rel_days = 1
+    else:
+        m = re.search(r"(?<!\d)(\d{1,2})\s*日前", q)
+        if m:
+            rel_days = int(m.group(1))
+    if rel_days is not None:
+        return [(today - datetime.timedelta(days=rel_days)).strftime("%Y-%m-%d")]
     rel_year = None
     if "去年" in q or "昨年" in q:
         rel_year = now_year - 1
     elif "今年" in q:
         rel_year = now_year
-    # ① 年+月（2025年5月 / 2025-05 / 2025/5）を最優先で確定
+    # ② 年+月+日（2025年3月1日 / 2025-03-01）を最優先で確定
+    m = re.search(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*[月\-/\.]\s*(\d{1,2})\s*日?(?!\d)", q)
+    if m and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+        return [f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"]
+    # ③ 月+日（7月6日）。相対年があれば確定、無ければ年ワイルドカード
+    m = re.search(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日(?!\d)", q)
+    if m and 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31:
+        mo_d = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        return [f"{rel_year:04d}-{mo_d}" if rel_year else f"*-{mo_d}"]
+    # ④ 年+月（2025年5月 / 2025-05 / 2025/5）
     m = re.search(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*月?", q)
     if m:
         return [f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"]
-    # ② 年のみ / 月のみ / 相対年の組み合わせ
+    # ⑤ 年のみ / 月のみ / 相対年の組み合わせ
     y  = re.search(r"(20\d{2})\s*年?", q)
     mo = re.search(r"(?<!\d)(\d{1,2})\s*月", q)
     year = rel_year if rel_year else (int(y.group(1)) if y else None)
@@ -950,16 +979,33 @@ def _parse_query_date_prefixes(query: str, now_year: int) -> list[str]:
     return []
 
 
+def _doc_date_jst(doc: dict) -> str:
+    """日報docの内容日付 "YYYY-MM-DD"。retro_date優先。created_at はUTC保存
+    (update_mongodb.py が utcnow isoformat)なのでJSTへ変換してから日付化する
+    （変換しないと JST 0〜9時の深夜要約が前日扱いになり日単位マッチがズレる）。"""
+    ds = doc.get("retro_date")
+    if ds:
+        return str(ds)[:10]
+    ca = doc.get("created_at")
+    try:
+        dt = ca if isinstance(ca, datetime.datetime) else datetime.datetime.fromisoformat(str(ca))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d")
+    except Exception:
+        return str(ca or "")[:10]
+
+
 def _date_prefix_hit(doc: dict, prefixes: list[str]) -> bool:
-    """日報docの内容日付(retro_date優先・無ければcreated_at)が prefixes のいずれかに一致するか。"""
-    ds = doc.get("retro_date") or str(doc.get("created_at", ""))[:10]   # "YYYY-MM-DD"
+    """日報docの内容日付(retro_date優先・無ければcreated_at→JST)が prefixes のいずれかに一致するか。"""
+    ds = _doc_date_jst(doc)   # "YYYY-MM-DD"
     if len(ds) < 7:
         return False
     for p in prefixes:
-        if p.startswith("*-"):          # 年不明の月一致（例: '*-05' → 任意年の5月）
-            if ds[5:7] == p[2:]:
+        if p.startswith("*-"):          # 年不明（'*-05'=任意年の5月 / '*-07-06'=任意年の7月6日）
+            if ds[5:].startswith(p[2:]):
                 return True
-        elif ds.startswith(p):          # 'YYYY-MM' or 'YYYY-'
+        elif ds.startswith(p):          # 'YYYY-MM-DD' / 'YYYY-MM' / 'YYYY-'
             return True
     return False
 
@@ -1002,9 +1048,10 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
     """
     if len(query) < 8:
         return []
-    # 日付の手がかり(年月)があればトリガー語なしでも発火させる（「2025年5月どうだった?」を拾う）
-    now_year      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).year
-    date_prefixes = _parse_query_date_prefixes(query, now_year)
+    # 日付の手がかり(年月日・相対日)があればトリガー語なしでも発火させる
+    # （「2025年5月どうだった?」「一昨日何してた?」を拾う）
+    now_jst       = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    date_prefixes = _parse_query_date_prefixes(query, now_jst)
     # 旧: ここでトリガー語/日付ゲートで早期return していた＝トリガー語を含まない自然な想起質問を
     # 一切拾えなかった。今は先に埋め込んで採点し、日付/トリガ語に加え「際立った意味一致」でも発火させる。
     qvec = await _embed_query_for_summaries(query)
@@ -2093,7 +2140,8 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     parts = []
     parts.append(
-        f"【現在日時】{now_jst.strftime('%Y年%m月%d日 %H:%M')}（JST）"
+        f"【現在日時】{now_jst.strftime('%Y年%m月%d日')}"
+        f"（{_WEEKDAY_JA[now_jst.weekday()]}曜日） {now_jst.strftime('%H:%M')}（JST）"
     )
     parts.append(
         "【応答時の情報優先度】\n"
@@ -2184,8 +2232,10 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     # 小型モデルでも効くよう、日付と反ハルシネーションは末尾でも再掲する。
     honesty = (
         "【応答の鉄則（人格設定より優先）】\n"
-        f"- 今日は{now_jst.strftime('%Y年%m月%d日')}（JST）。年・日付の話題は必ずこれを基準にせよ。"
-        "聞かれてもいない年を勝手に持ち出すな。\n"
+        f"- 今日は{now_jst.strftime('%Y年%m月%d日')}"
+        f"（{_WEEKDAY_JA[now_jst.weekday()]}曜日・JST）。年・日付の話題は必ずこれを基準にせよ。"
+        "聞かれてもいない年を勝手に持ち出すな。"
+        "過去の日付の曜日は、資料に書いてあるか自力で確実に計算できる場合以外は口にするな。\n"
         "- 上に挙げた資料（直前の会話・会話履歴・過去の記憶・サーバー要約）に無い固有名詞・"
         "出来事・数字を、事実であるかのように断定するな。確証がなければ創作せず、"
         "「正確には分かりません／覚えていません」と述べよ。\n"
