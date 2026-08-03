@@ -987,6 +987,87 @@ def _split_for_field(text: str, limit: int = 1020) -> list[str]:
     return chunks
 
 
+def _embed_chars(embed: dict) -> tuple[int, int]:
+    """Discordが6000字上限の対象に数える文字数と、フィールド数を返す（診断用）。"""
+    n  = len(embed.get("title", "")) + len(embed.get("description", ""))
+    n += len(embed.get("footer", {}).get("text", ""))
+    n += sum(len(f.get("name", "")) + len(f.get("value", "")) for f in embed.get("fields", []))
+    return n, len(embed.get("fields", []))
+
+
+def _post_json(url: str, headers: dict, payload: dict, what: str, tries: int = 5) -> bool:
+    """Discordへの投稿を再試行つきで行う。
+
+    レポート1本の生成にはLLM呼び出し＋429待ちで数分かかっており、投稿の一時失敗で
+    それを捨てるのは損失が大きいので、回復可能なものは必ず粘る。
+    ・5xx / 通信エラー … Discord側の一時障害。指数バックオフで再試行。
+    ・429            … retry_after に従って待つ（複数通に分けた結果、新たに当たりうる）。
+    ・その他4xx      … ペイロード不正なので再試行しても同じ。即諦めて診断材料を吐く。
+      （Discordの検証エラーは 400 + code 5xxxx + errors という形で返る。500/code 0 は別物）
+    """
+    for attempt in range(tries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        except requests.RequestException as e:
+            wait = min(2 ** attempt * 2, 30)
+            print(f"[WARN] {what}: 通信エラー({e}) → {wait}s後に再試行 ({attempt+1}/{tries})")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code in (200, 201):
+            return True
+
+        if resp.status_code == 429:
+            try:
+                wait = float(resp.json().get("retry_after", 5.0)) + 0.5
+            except Exception:
+                wait = 5.0
+            print(f"[WARN] {what}: 429 → {wait:.1f}s待機して再試行 ({attempt+1}/{tries})")
+            time.sleep(wait)
+            continue
+
+        if 500 <= resp.status_code < 600:
+            wait = min(2 ** attempt * 2, 30)
+            print(f"[WARN] {what}: {resp.status_code} Discord側エラー → {wait}s後に再試行 "
+                  f"({attempt+1}/{tries}) {resp.text[:200]}")
+            time.sleep(wait)
+            continue
+
+        print(f"[ERROR] {what}: 投稿失敗 {resp.status_code} {resp.text[:500]}")
+        return False
+
+    print(f"[ERROR] {what}: 再試行{tries}回すべて失敗")
+    return False
+
+
+def _post_as_plaintext(url: str, headers: dict, embed: dict, what: str) -> bool:
+    """embed投稿がどうしても通らないときの最後の砦。中身を平文に落として送る。
+
+    embedは見栄えの都合でしかなく、レポートの中身が届くことのほうが重要。
+    平文は1メッセージ2000字上限なので1900字ずつに割って送る。"""
+    blocks = [f"**{f.get('name','')}**\n{f.get('value','')}" for f in embed.get("fields", [])]
+    text   = (embed.get("title", "") + "\n\n" + "\n\n".join(blocks)).strip()
+    chunks, cur = [], ""
+    for block in text.split("\n\n"):
+        while len(block) > 1900:
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(block[:1900]); block = block[1900:]
+        if cur and len(cur) + 2 + len(block) > 1900:
+            chunks.append(cur); cur = block
+        else:
+            cur = f"{cur}\n\n{block}" if cur else block
+    if cur:
+        chunks.append(cur)
+
+    ok = True
+    for i, chunk in enumerate(chunks):
+        if not _post_json(url, headers, {"content": chunk}, f"{what} 平文{i+1}/{len(chunks)}", tries=3):
+            ok = False
+        time.sleep(1.0)
+    return ok
+
+
 def post_report(report: str, bigfive: dict | None = None):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
@@ -1045,12 +1126,20 @@ def post_report(report: str, bigfive: dict | None = None):
     # Discordの6000字上限は「1メッセージ内の全embed合計」。束ねると即50035になるため
     # post_summary.py / retro_summarize.py と同様に1メッセージ1embedで送る。
     for idx, embed in enumerate(embeds):
-        resp = requests.post(url, headers=headers,
-                             json={"embeds": [embed]}, timeout=10)
-        if resp.status_code in (200, 201):
+        chars, nfields = _embed_chars(embed)
+        what = f"embed {idx+1}/{len(embeds)}"
+        # 失敗時に「6000/25/1024のどれに当たったのか」を後から言い当てられるようにしておく
+        print(f"[post] {what} 送信: {chars}字 / {nfields}フィールド "
+              f"(最長field={max((len(f['value']) for f in embed['fields']), default=0)}字)")
+        if _post_json(url, headers, {"embeds": [embed]}, what):
             print(f"[post] 投稿成功 ({idx+1}/{len(embeds)})")
         else:
-            print(f"[ERROR] 投稿失敗: {resp.status_code} {resp.text}")
+            # embedが通らなくてもレポート本文は失いたくないので平文に落として送る
+            print(f"[WARN] {what}: embedを諦めて平文で投稿を試みます")
+            if _post_as_plaintext(url, headers, embed, what):
+                print(f"[post] 平文フォールバック成功 ({idx+1}/{len(embeds)})")
+            else:
+                print(f"[ERROR] {what}: 平文フォールバックも失敗。この部分は失われました")
         time.sleep(1.0)   # 連投レート制限回避
 
 
