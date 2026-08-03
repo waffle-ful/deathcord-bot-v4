@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types
 
 from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
+from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
 
 FOCUS_TYPE    = os.environ["FOCUS_TYPE"]    # "member" or "keyword"
 FOCUS_TARGET  = os.environ["FOCUS_TARGET"]  # user_id or keyword
@@ -40,8 +41,7 @@ SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
 # 従来どおり SUMMARY_CHANNEL_ID にフォールバックする。
 FOCUS_CHANNEL_ID   = os.environ.get("FOCUS_CHANNEL_ID", "").strip() or SUMMARY_CHANNEL_ID
 
-MODEL          = "models/gemma-4-31b-it"
-MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
+# モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
 DB_NAME        = "discord_bot_db"
 JST            = timezone(timedelta(hours=9))
 FETCH_DAYS     = 7    # 直近何日分の生ログを取得するか
@@ -727,8 +727,9 @@ def _extract_retry_wait(err: str) -> float:
 
 def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
             temperature: float = 0.3) -> str | None:
-    for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
-        for attempt in range(5):
+    max_tokens = output_tokens(max_tokens)   # thinking 系の空応答対策（下限を効かせる）
+    for model, label in HEAVY_MODEL_CHAIN:
+        for attempt in range(ATTEMPTS_PER_MODEL):
             try:
                 resp = client_ai.models.generate_content(
                     model=model,
@@ -867,7 +868,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 【観察レポート】
 {report[:4000]}"""
 
-    # call_ai 経由で MODEL→MODEL_FALLBACK のリトライ/フォールバックに乗せる
+    # call_ai 経由で HEAVY_MODEL_CHAIN のリトライ/フォールバックに乗せる
     # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
     raw = call_ai(client_ai, prompt, max_tokens=2000, temperature=0.1)
     if not raw:

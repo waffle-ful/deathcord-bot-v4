@@ -17,10 +17,10 @@ from google import genai
 from google.genai import types
 
 from embed_util import embed_document   # focus Tier3: summaries 意味検索用 embedding 規約
+from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
 
 GEMINI_API_KEY         = os.environ["GEMINI_API_KEY"]
-MODEL_SUMMARY          = "models/gemma-4-31b-it"        # 要約生成用（TPM無制限）
-MODEL_SUMMARY_FALLBACK = "models/gemma-4-26b-a4b-it"       # フォールバック（同世代・別インスタンス。旧 gemma-3-27b-it は現APIで404）
+# 要約生成モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
 INPUT_PATH             = "/tmp/logs.json"
 OUTPUT_PATH            = "/tmp/summary_result.json"
 
@@ -102,20 +102,17 @@ def _generate_with_model(client: genai.Client, model: str, log_text: str) -> str
         config=types.GenerateContentConfig(
             system_instruction=SUMMARY_SYSTEM_PROMPT,
             temperature=0.3,
-            max_output_tokens=5500,
+            max_output_tokens=output_tokens(5500),   # thinking 系の空応答対策
         ),
     )
     return response.text
 
 
 def generate_summary(client: genai.Client, log_text: str) -> str:
-    for model, label in [
-        (MODEL_SUMMARY,          "メインモデル"),
-        (MODEL_SUMMARY_FALLBACK, "フォールバック"),
-    ]:
-        for attempt in range(3):
+    for model, label in HEAVY_MODEL_CHAIN:
+        for attempt in range(ATTEMPTS_PER_MODEL):
             try:
-                print(f"[summarize] {label} ({model}) 試行{attempt + 1}/3...")
+                print(f"[summarize] {label} ({model}) 試行{attempt + 1}/{ATTEMPTS_PER_MODEL}...")
                 summary = _generate_with_model(client, model, log_text)
                 if summary and summary.strip():
                     print(f"[summarize] 完了 ({len(summary)} chars) - {label}")

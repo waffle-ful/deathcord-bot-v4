@@ -9,6 +9,8 @@ from pymongo import MongoClient, DESCENDING
 from google import genai
 from google.genai import types
 
+from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+
 # --- 環境変数 ---
 TARGET_DATE_STR    = os.environ.get("TARGET_DATE", "")   # YYYY-MM-DD（backfillから import する際は未設定でも可）
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
@@ -20,8 +22,7 @@ EXCLUDE_IDS        = set(int(c.strip()) for c in EXCLUDE_IDS_RAW.split(",") if c
 GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
-MODEL              = "models/gemma-4-31b-it"
-MODEL_FALLBACK     = "models/gemma-4-26b-a4b-it"
+# モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
 DB_NAME            = "discord_bot_db"
 JST                = timezone(timedelta(hours=9))
 CONTEXT_DAYS       = 2
@@ -223,13 +224,16 @@ def generate_summary(client_ai: genai.Client, log_text: str, context: str) -> st
         user_prompt += f"【前後の文脈】\n{context}\n\n---\n\n"
     user_prompt += f"【対象日のログ】\n{log_text}"
 
-    for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
-        for attempt in range(5):
+    for model, label in HEAVY_MODEL_CHAIN:
+        for attempt in range(ATTEMPTS_PER_MODEL):
             try:
                 resp = client_ai.models.generate_content(
                     model=model,
                     contents=user_prompt,
-                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=5500),
+                    config=types.GenerateContentConfig(
+                        temperature=0.3,
+                        max_output_tokens=output_tokens(5500),   # thinking 系の空応答対策
+                    ),
                 )
                 text = getattr(resp, "text", None)
                 if text and text.strip():

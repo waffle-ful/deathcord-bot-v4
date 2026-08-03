@@ -11,7 +11,7 @@ on:
 jobs:
   personality:
     runs-on: ubuntu-latest
-    timeout-minutes: 90    # gemma-4は遅い。25人×3呼び出し分の余裕
+    timeout-minutes: 90    # 25人×3呼び出し＋連鎖フォールバック(4モデル)の待ち時間ぶんの余裕
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

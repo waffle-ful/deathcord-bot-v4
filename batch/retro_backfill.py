@@ -5,7 +5,7 @@ retro_backfill.py
 focus/記憶の素材になる summaries アーカイブの「空白期間」を埋め戻すための一括処理。
 
 設計方針:
-- 逐次処理＋日間スリープで Discord のレート制限/BAN を回避（Gemini=gemma-4 は 1500/日で余裕）。
+- 逐次処理＋日間スリープで Discord のレート制限/BAN を回避（Gemini 側は連鎖フォールバックで吸収）。
 - 既存 retro_date はスキップ＝中断しても再開可能。
 - 各日を Discord にも投稿する（BACKFILL_POST、既定ON）。OFF にすれば Mongo 保存のみ。
 - 429/レート制限を検知したら安全のため即停止。

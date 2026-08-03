@@ -28,10 +28,11 @@ from pymongo import MongoClient
 from google import genai
 from google.genai import types
 
+from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
-MODEL          = "models/gemma-4-31b-it"
-MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
+# モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
 DB_NAME        = "discord_bot_db"
 
 # 自サーバーのチャット分析（内部バッチ）なので safety ブロックで空レスポンスにならないよう緩和。
@@ -170,8 +171,10 @@ def _extract_retry_wait(err: str) -> float:
 
 
 def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 1500) -> str | None:
-    for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
-        for attempt in range(5):
+    # 関数名は歴史的経緯（旧 gemma 主体）。中身は HEAVY_MODEL_CHAIN の Gemini flash 連鎖。
+    max_tokens = output_tokens(max_tokens)   # thinking 系の空応答対策（下限を効かせる）
+    for model, label in HEAVY_MODEL_CHAIN:
+        for attempt in range(ATTEMPTS_PER_MODEL):
             try:
                 resp = client.models.generate_content(
                     model=model,
@@ -522,7 +525,7 @@ def infer_bigfive(client: genai.Client, name: str, utterances: list[str]) -> dic
         signals=signals_to_text(signals),
         utterances="\n".join(f"- {u}" for u in utterances),
     )
-    raw = call_gemma(client, prompt, max_tokens=3000)   # 10項目JSON＋gemma-4 thinking予算の余裕
+    raw = call_gemma(client, prompt, max_tokens=3000)   # 10項目JSON＋thinking予算の余裕
     parsed = parse_json(raw, name)
     if not parsed or "items" not in parsed:
         return None

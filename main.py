@@ -136,32 +136,41 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # モデル名 (実際に動作確認済みのもの)
 MODEL_BOOSTER        = "models/gemini-3.1-flash-lite"          # メイン (会話用・高速)
-MODEL_FALLBACK       = "models/gemma-4-26b-a4b-it"            # フォールバック (Gemma 4 26B) ※Render.comでlocation errorが出たらgemini-3.1-flash-liteへ戻すこと
+MODEL_FALLBACK       = "models/gemini-3.5-flash"               # 会話の第一フォールバック（別quotaプール）
 MODEL_GENERAL_FB     = "models/gemini-3.1-flash-lite"          # バックグラウンド処理用
-# 裏処理（profile/claims抽出等・速度不問）は gemma-4 に寄せる。理由: flash-lite は無料枠の容量429
-# （深夜＝欧米ビジネス時間帯に共有プールが枯れる）に弱く、裏処理まで巻き込まれる。gemma-4 は TPM が
-# 実質潤沢で容量に余裕があり、品質も同等以上（遅さは撃ちっぱなしの裏処理では無関係）。
-# 注意: gemma-4 は thinking 予算を出力トークンから食うため、必ず大きめの max_output_tokens を渡すこと。
-MODEL_BACKGROUND     = "models/gemma-4-26b-a4b-it"            # 裏処理用（gemma-4・速度不問・容量に強い）
+# 裏処理（profile/claims抽出等・速度不問）。以前は「TPM無制限」を理由に gemma-4 へ寄せていたが、
+# その無制限枠が撤廃されたため利点が消滅（2026-08-03）。以後は Gemini flash 系の連鎖
+# （BACKGROUND_CHAIN）で「別モデル＝別quotaプール」へ横滑りして容量429を凌ぐ。
+MODEL_BACKGROUND     = "models/gemini-3.5-flash"               # 裏処理用の先頭モデル
 
-# 会話用フォールバック連鎖（_run_ai_booster が上から順に試し、最初に本文が返ったモデルを採用）。
-# 狙い: flash-lite が無料枠の容量429（深夜=欧米ピークで共有プール枯渇）で落ちても、別quotaの
-# 複数モデルへ順にフェイルオーバーして「メイドが黙る」のを防ぐ。各タプル=(model_id, max_output_tokens)。
-# thinking系は枠を大きめに（小さいとMAX_TOKENSで空応答になる）。最後は容量潤沢だが低速のgemmaで確実に受ける。
+# ---- フォールバック連鎖 -------------------------------------------------------
+# 狙い: 1本のモデルが無料枠の容量429（深夜=欧米ピークで共有プールが枯れる）で落ちても、
+# 別quotaの次モデルへ即フェイルオーバーして「メイドが黙る」「裏処理が丸ごと欠ける」のを防ぐ。
+# 各タプル=(model_id, max_output_tokens)。thinking系は枠を大きめに（小さいと思考で枯れて
+# finish_reason=MAX_TOKENS の空応答になる）。
 # ★重要: モデルIDは必ず /listmodels で実在確認してから追加すること。無効名は例外で黙ってスキップされ、
 #   「容量が増えた気がするだけで実際ゼロ」になる（ログには NotFound→次モデルへ と出るので確認可能）。
+#   下記5モデルは 2026-08-03 に models.list で実在確認済み。
+# ★gemma-4（31b/26b-a4b）は TPM 無制限枠の撤廃により 2026-08-03 に全チェーンから撤去。
 MODEL_CHAIN: list[tuple[str, int]] = [
-    (MODEL_BOOSTER,                    300),    # ① primary: flash-lite 3.1（高速・実績）
-    # ↓ /listmodels で実在確認済（各々別quota≒20回/日で容量を積み増す）。3.5→3→2.5の順に下げる。
-    ("models/gemini-3.5-flash",       2048),   # ② 3.5 flash（thinking系なので枠大きめ）
-    ("models/gemini-3-flash-preview", 2048),   # ③ 3 flash preview
-    ("models/gemini-2.5-flash-lite",  2048),   # ④ 2.5 flash-lite（兄弟が思考572-1031の実測→枠不足回避で2048に統一）
-    (MODEL_FALLBACK,                  3000),   # ⑤ gemma-4-26b（容量潤沢・低速・実績）
-    ("models/gemma-4-31b-it",         3000),   # ⑥ gemma-4-31b（最終フォールバック・batch実績）
+    (MODEL_BOOSTER,                    300),   # ① primary: flash-lite 3.1（高速・実績）
+    (MODEL_FALLBACK,                  2048),   # ② 3.5 flash（thinking系なので枠大きめ）
+    ("models/gemini-2.5-flash-lite",  2048),   # ③ 2.5 flash-lite（思考572-1031の実測→枠不足回避で2048）
+    ("models/gemini-2.5-flash",       2048),   # ④ 2.5 flash
+    ("models/gemini-3.6-flash",       2048),   # ⑤ 3.6 flash（最終フォールバック）
+]
+
+# 重い裏処理（プロフィール/記憶抽出・トーン分析等）用。速度不問なので thinking の枠を厚く取り、
+# 空応答（MAX_TOKENS）を潰す。batch 側 model_chain.py と同じ順序・同じ思想。
+BACKGROUND_CHAIN: list[tuple[str, int]] = [
+    (MODEL_BACKGROUND,                4000),   # ① 3.5 flash
+    ("models/gemini-2.5-flash-lite",  4000),   # ② 2.5 flash-lite
+    ("models/gemini-2.5-flash",       4000),   # ③ 2.5 flash
+    ("models/gemini-3.6-flash",       4000),   # ④ 3.6 flash
 ]
 # 注: レスバ専用の gemma主チェーンを一度試したが、gemma は thinking_config 非対応＋思考青天井で
 # 空応答が頻発し、80トークンの返信に1800〜3000トークン消費＝非効率。レスバも標準 MODEL_CHAIN
-# （flash-lite主）に戻した（2026-06-27）。gemma はあくまで末尾の容量フォールバックとしてのみ使う。
+# （flash-lite主）に戻した（2026-06-27）。gemma 自体はその後 2026-08-03 に完全撤去。
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
 
 # --- ランク・ロール設定 ---
@@ -1159,13 +1168,9 @@ JSON形式で返せ。含まれない場合は null を返せ。
 【発言】
 {user_msg[:200]}"""
 
-        raw = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=MODEL_BACKGROUND,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=3000),  # gemma-4 thinking予算込み
-        )
-        text = raw.text.strip().replace("```json", "").replace("```", "").strip()
+        # 従来からRPM計数外の裏処理なので record_rate=False（メイドの体感速度を変えないため）
+        raw = await _run_ai_background(prompt, temperature=0.1, record_rate=False)
+        text = raw.replace("```json", "").replace("```", "").strip()
         if text and text != "null":
             extracted = json.loads(text)
             if extracted and extracted.get("category"):
@@ -1278,7 +1283,7 @@ def build_smart_summary(summary: str) -> str:
 # 動的レートリミッター（クールダウンメッセージなし・自然な遅延で吸収）
 # =============================================================================
 
-# gemma-4 は TPM 無制限だが、Discord 上の自然な会話ペースを維持するため RPM を制御
+# Discord 上の自然な会話ペースを維持するため RPM を制御（無料枠の実quotaとは別のソフトリミット）
 # 1分あたり最大12リクエストをソフトリミットとして設定
 _RATE_LIMIT_RPM   = 12          # 1分あたり最大リクエスト数
 _rate_timestamps: list[datetime.datetime] = []   # 直近リクエストのタイムスタンプ一覧
@@ -1358,13 +1363,9 @@ async def extract_and_save_profile(uid: str, display_name: str, user_msg: str, b
             user_msg=user_msg[:300],
             bot_msg=bot_msg[:300],
         )
-        raw = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=MODEL_BACKGROUND,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=3000),  # gemma-4 thinking予算込み
-        )
-        text = raw.text.strip().replace("```json", "").replace("```", "").strip()
+        # 従来からRPM計数外の裏処理なので record_rate=False（メイドの体感速度を変えないため）
+        raw = await _run_ai_background(prompt, temperature=0.1, record_rate=False)
+        text = raw.replace("```json", "").replace("```", "").strip()
         extracted = json.loads(text)
 
         # 既存プロフィールとマージ
@@ -1823,19 +1824,18 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
 
 
 async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
-                      temperature: float = 0.8) -> str:
+                      temperature: float = 0.8, record_rate: bool = True) -> str:
     """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。
-    max_tokens 未指定時はモデル名から自動判定（gemma系はthinking予算ぶん大きめ）。
-    temperature を上げたい呼び出し（例: ミミックの本音生成=0.85）は引数で渡す。"""
-    _rate_record()  # レートリミッター記録
+    max_tokens 未指定時はモデル名から自動判定（thinking系は枠を大きめに）。
+    temperature を上げたい呼び出し（例: ミミックの本音生成=0.85）は引数で渡す。
+    record_rate=False は「従来からRPM計数に含めていなかった裏処理」用（体感速度を変えないため）。"""
+    if record_rate:
+        _rate_record()  # レートリミッター記録
     if max_tokens is None:
-        # gemma-4系は thinking 予算を出力トークンから消費するため、300では思考だけで枯れて
-        # 本文ゼロ（finish_reason=MAX_TOKENS）になる。batch側の実績（3000）に倣い大きめの枠を与える。
-        # flash-lite 等は従来どおり 300（短文返信＋コスト最小）。
-        max_tokens = 3000 if "gemma" in model else 300
-    # 注意: gemma-4系は thinking_config 自体が 400 INVALID_ARGUMENT「Thinking budget is not supported
-    # for this model.」で拒否される（実機確認 2026-06-27）＝思考のオフ/上限設定は不可。思考は必須・青天井で、
-    # 時に cap を思考で食い尽くし answer=0(MAX_TOKENS) 空応答になる。max_tokens を大きめに与えるのが唯一の緩和。
+        # thinking 系（gemini-3.5/3.6/2.5-flash 等）は思考トークンを出力枠から消費するため、
+        # 300では思考だけで枯れて本文ゼロ（finish_reason=MAX_TOKENS）になる。
+        # 主力の flash-lite 3.1 は短文返信なので従来どおり 300（コスト最小）。
+        max_tokens = 300 if model == MODEL_BOOSTER else 2048
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=model,
@@ -1982,6 +1982,25 @@ async def _run_ai_with_cache(prompt: str, cache_name: str | None) -> str:
     return await _run_ai_booster(prompt)
 
 
+async def _run_ai_background(prompt: str, temperature: float = 0.1,
+                             record_rate: bool = True) -> str:
+    """裏処理（プロフィール/記憶抽出・トーン分析等）用のAI呼び出し。
+    BACKGROUND_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
+    速度不問なので粘らず、429/空応答は即座に別quotaの次モデルへ。全滅時は空文字を返す
+    （呼び出し側は従来どおり try/except または falsy チェックで握り潰す）。"""
+    for model, max_tokens in BACKGROUND_CHAIN:
+        try:
+            text = await _call_model(model, prompt, max_tokens,
+                                     temperature=temperature, record_rate=record_rate)
+            if text:
+                return text
+            print(f"[WARN] bg-chain {model}: 空レスポンス→次モデルへ")
+        except Exception as e:
+            print(f"[WARN] bg-chain {model}: {type(e).__name__}: {str(e)[:160]}→次モデルへ")
+    print(f"[WARN] _run_ai_background: 全モデル失敗 prompt_len={len(prompt)}")
+    return ""
+
+
 async def _analyze_nonbooster_realtime(uid: str, name: str):
     """非ブースター向けリアルタイム性格分析（10回会話ごとに実行）"""
     try:
@@ -2006,7 +2025,7 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
 【{name}の発言ログ】
 {utterances}"""
 
-        tone_raw  = await _call_model(MODEL_BACKGROUND, tone_prompt)
+        tone_raw  = await _run_ai_background(tone_prompt)   # JSON抽出なので低温度＋連鎖フォールバック
         tone_data = {}
         if tone_raw:
             try:
@@ -2035,7 +2054,7 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
 【要約ログ】
 {summaries_text[:3000]}"""
 
-        ctx_raw  = await _call_model(MODEL_BACKGROUND, ctx_prompt)
+        ctx_raw  = await _run_ai_background(ctx_prompt)   # JSON抽出なので低温度＋連鎖フォールバック
         ctx_data = {}
         if ctx_raw:
             try:

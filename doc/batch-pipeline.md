@@ -89,13 +89,21 @@ enrich_memories.py
 
 ### 使用モデル
 
-| スクリプト | メインモデル | フォールバック |
-|----------|-----------|--------------|
-| summarize.py | `gemma-4-31b-it` | `gemma-3-27b-it` |
-| analyze_personality.py | `gemma-4-31b-it` | `gemma-3-27b-it` |
-| analyze_nonbooster.py | `gemma-4-31b-it` | `gemma-4-26b-a4b-it` |
-| enrich_memories.py | `gemma-4-31b-it` | `gemma-4-26b-a4b-it` |
-| Embedding | `gemini-embedding-001`（3072次元） | なし（失敗で skip） |
+2026-08-03 以降、重い処理のモデルは **`batch/model_chain.py` の `HEAVY_MODEL_CHAIN` に集約**。
+各スクリプトはこの連鎖を上から順に試し、最初に本文が返ったモデルを採用する（1モデルあたり
+`ATTEMPTS_PER_MODEL`=2 回）。gemma-4 は TPM 無制限枠の撤廃により全撤去。
+
+| 順序 | モデル | 備考 |
+|-----|-------|-----|
+| ① | `gemini-3.5-flash` | 主力 |
+| ② | `gemini-2.5-flash-lite` | 実績枠・thinking なし |
+| ③ | `gemini-2.5-flash` | |
+| ④ | `gemini-3.6-flash` | 最終フォールバック |
+
+対象: summarize.py / analyze_personality.py / analyze_nonbooster.py / enrich_memories.py /
+retro_summarize.py / focus_summary.py。Embedding のみ別系統（`gemini-embedding-001`・3072次元・
+失敗で skip）。thinking 系が思考トークンで枠を食い切って空応答になるのを防ぐため、
+`output_tokens()` が max_output_tokens に下限 4000 を効かせる。
 
 ## パイプライン 3: 手動トリガー
 

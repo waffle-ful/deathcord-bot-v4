@@ -23,10 +23,11 @@ from pymongo import MongoClient
 from google import genai
 from google.genai import types
 
+from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
-MODEL          = "models/gemma-4-31b-it"
-MODEL_FALLBACK = "models/gemma-4-26b-a4b-it"
+# モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
 
 # 内部バッチなので safety ブロックで空レスポンスにならないよう緩和（analyze_personality/focus と同方針）。
 try:
@@ -74,15 +75,15 @@ def _extract_retry_wait(err: str) -> float:
 
 
 def call_ai(client: genai.Client, prompt: str) -> str | None:
-    for model, label in [(MODEL, "main"), (MODEL_FALLBACK, "fallback")]:
-        for attempt in range(5):
+    for model, label in HEAVY_MODEL_CHAIN:
+        for attempt in range(ATTEMPTS_PER_MODEL):
             try:
                 resp = client.models.generate_content(
                     model=model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.25,
-                        max_output_tokens=2000,
+                        max_output_tokens=output_tokens(2000),   # thinking 系の空応答対策
                         safety_settings=SAFETY_OFF,
                     ),
                 )
