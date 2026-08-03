@@ -994,10 +994,12 @@ def post_report(report: str, bigfive: dict | None = None):
             name = f"{icon_c} {title}" if i == 0 else f"{icon_c} {title}（続き{i+1}）"
             fields.append({"name": name[:256], "value": chunk, "inline": False})
 
+    # 1embed=6000字。title/footer もこの6000に含まれるので、その分を予約して本文上限を決める。
+    body_limit = 6000 - len(title_str) - 120
     embeds, current_fields, current_chars = [], [], 0
     for field in fields:
         fc = len(field["name"]) + len(field["value"])
-        if (current_chars + fc > 5800 or len(current_fields) >= 25) and current_fields:
+        if (current_chars + fc > body_limit or len(current_fields) >= 25) and current_fields:
             embed = {"color": 0x9B59B6, "fields": current_fields,
                      "title": title_str if not embeds else f"{icon} {FOCUS_NAME} のフォーカス要約（続き）"}
             embeds.append(embed)
@@ -1016,13 +1018,16 @@ def post_report(report: str, bigfive: dict | None = None):
 
     url     = f"https://discord.com/api/v10/channels/{FOCUS_CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
-    for i in range(0, len(embeds), 10):
+    # Discordの6000字上限は「1メッセージ内の全embed合計」。束ねると即50035になるため
+    # post_summary.py / retro_summarize.py と同様に1メッセージ1embedで送る。
+    for idx, embed in enumerate(embeds):
         resp = requests.post(url, headers=headers,
-                             json={"embeds": embeds[i:i+10]}, timeout=10)
+                             json={"embeds": [embed]}, timeout=10)
         if resp.status_code in (200, 201):
-            print(f"[post] 投稿成功")
+            print(f"[post] 投稿成功 ({idx+1}/{len(embeds)})")
         else:
             print(f"[ERROR] 投稿失敗: {resp.status_code} {resp.text}")
+        time.sleep(1.0)   # 連投レート制限回避
 
 
 # =============================================================================
