@@ -1068,6 +1068,43 @@ def _post_as_plaintext(url: str, headers: dict, embed: dict, what: str) -> bool:
     return ok
 
 
+def _post_embed_bisect(url: str, headers: dict, embed: dict, what: str, depth: int = 0) -> bool:
+    """5xxが続くembedをフィールド単位で二分割して投稿し直す（救出と原因特定を兼ねる）。
+
+    2026-08-04の実測で、Discordは仕様上限（6000字/25フィールド）の内側でも規模が大きいと
+    400ではなく 500 code:0 を返すことが分かった。エラーが原因を教えてくれない以上、
+    こちらで割って試すのが唯一の切り分け手段になる。
+    ・割ったら通った → 規模が原因。ログに通った粒度が残るので次回の詰め方を決められる。
+    ・1フィールドまで割っても500 → そのフィールドが原因。name と先頭を吐いて特定する。
+    """
+    if _post_json(url, headers, {"embeds": [embed]}, what, tries=5 if depth == 0 else 2):
+        return True
+
+    fields = embed.get("fields", [])
+    if len(fields) <= 1:
+        f = fields[0] if fields else {}
+        print(f"[ERROR] {what}: 単一フィールドでも500。これが原因フィールド → "
+              f"name={f.get('name','')!r} value長={len(f.get('value',''))}字 "
+              f"先頭100字={f.get('value','')[:100]!r}")
+        return False
+
+    mid = len(fields) // 2
+    print(f"[WARN] {what}: {len(fields)}フィールド({_embed_chars(embed)[0]}字)を "
+          f"{mid}+{len(fields)-mid} に分割して再試行")
+    ok = True
+    for i, part in enumerate((fields[:mid], fields[mid:])):
+        sub = dict(embed)
+        sub["fields"] = part
+        sub.pop("timestamp", None)
+        sub["footer"] = {"text": f"{what}-{i+1}（分割投稿）"}
+        if i:
+            sub["title"] = f"{embed.get('title','')}（続き）"
+        if not _post_embed_bisect(url, headers, sub, f"{what}-{i+1}", depth + 1):
+            ok = False
+        time.sleep(1.0)
+    return ok
+
+
 def post_report(report: str, bigfive: dict | None = None):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
@@ -1099,27 +1136,40 @@ def post_report(report: str, bigfive: dict | None = None):
             name = f"{icon_c} {title}" if i == 0 else f"{icon_c} {title}（続き{i+1}）"
             fields.append({"name": name[:256], "value": chunk, "inline": False})
 
-    # 1embed=6000字。title/footer もこの6000に含まれるので、その分を予約して本文上限を決める。
-    body_limit = 6000 - len(title_str) - 120
-    embeds, current_fields, current_chars = [], [], 0
+    # 実測（2026-08-04）: 5483字/8フィールドのembedは 500 code:0 を5回連続で返され、
+    # 直後に同一チャンネルへ送った 3076字/4フィールドは一発で通った。同じ本文が平文では
+    # 全通したので文字内容は無罪で、embedの規模側に文書化されていない実効上限がある。
+    # 仕様上の 6000字/25フィールド を信用せず、実績のある規模まで大きく絞って詰める。
+    # （それでも詰まったら _post_embed_bisect が自動で割って救出＋原因を特定する）
+    # 実績OK(3076字/4フィールド)の内側に収める。実績NGは5483字/8フィールド。
+    EMBED_CHAR_BUDGET = 3000
+    EMBED_MAX_FIELDS  = 4
+
+    groups, cur, cur_chars = [], [], 0
     for field in fields:
         fc = len(field["name"]) + len(field["value"])
-        if (current_chars + fc > body_limit or len(current_fields) >= 25) and current_fields:
-            embed = {"color": 0x9B59B6, "fields": current_fields,
-                     "title": title_str if not embeds else f"{icon} {FOCUS_NAME} のフォーカス要約（続き）"}
-            embeds.append(embed)
-            current_fields, current_chars = [], 0
-        current_fields.append(field)
-        current_chars += fc
+        if (cur_chars + fc > EMBED_CHAR_BUDGET or len(cur) >= EMBED_MAX_FIELDS) and cur:
+            groups.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(field)
+        cur_chars += fc
+    if cur:
+        groups.append(cur)
 
-    if current_fields:
-        embeds.append({
+    # footer は全embedに付ける。失敗したembedだけ footer/timestamp が無いという構造差が
+    # あると原因切り分けのノイズになるため、構造を揃える（ついでにページ番号が出る）。
+    total  = len(groups)
+    embeds = []
+    for i, group in enumerate(groups):
+        e = {
             "color":  0x9B59B6,
-            "title":  title_str if not embeds else f"{icon} {FOCUS_NAME} のフォーカス要約（続き）",
-            "fields": current_fields,
-            "footer": {"text": f"空気くんフォーカス要約 • {now_jst.strftime('%H:%M')} JST"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+            "title":  title_str if i == 0 else f"{icon} {FOCUS_NAME} のフォーカス要約（続き{i+1}）",
+            "fields": group,
+            "footer": {"text": f"空気くんフォーカス要約 • {i+1}/{total} • {now_jst.strftime('%H:%M')} JST"},
+        }
+        if i == total - 1:
+            e["timestamp"] = datetime.now(timezone.utc).isoformat()
+        embeds.append(e)
 
     url     = f"https://discord.com/api/v10/channels/{FOCUS_CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
@@ -1131,10 +1181,11 @@ def post_report(report: str, bigfive: dict | None = None):
         # 失敗時に「6000/25/1024のどれに当たったのか」を後から言い当てられるようにしておく
         print(f"[post] {what} 送信: {chars}字 / {nfields}フィールド "
               f"(最長field={max((len(f['value']) for f in embed['fields']), default=0)}字)")
-        if _post_json(url, headers, {"embeds": [embed]}, what):
+        # まず素直に送る。500が続いたら二分割して救出＋原因特定（_post_embed_bisect）。
+        if _post_embed_bisect(url, headers, embed, what):
             print(f"[post] 投稿成功 ({idx+1}/{len(embeds)})")
         else:
-            # embedが通らなくてもレポート本文は失いたくないので平文に落として送る
+            # 分割しても通らなかった＝規模以外の原因。本文は失いたくないので平文に落とす
             print(f"[WARN] {what}: embedを諦めて平文で投稿を試みます")
             if _post_as_plaintext(url, headers, embed, what):
                 print(f"[post] 平文フォールバック成功 ({idx+1}/{len(embeds)})")
