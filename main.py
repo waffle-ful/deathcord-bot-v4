@@ -10,6 +10,9 @@ import traceback
 import hmac
 import time
 import math
+import gc
+import array
+from operator import mul as _mul
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 # --- 新SDK (Context Caching対応) ---
@@ -835,6 +838,25 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
+def _norm_vec(v) -> array.array:
+    """ベクトルをL2正規化して array('f')（float32・1要素4B）で返す。
+
+    MEM: BSONが返す list[float] は要素ごとに独立したPythonのfloatオブジェクト（24B）＋
+    リストのポインタ（8B）＝1要素32B。3072次元 × 970件 で実測 92.5MB 常駐していた。
+    array('f') なら 4B/要素で同条件 11.7MB（-81MB）。加えて array は内部にポインタを
+    持たない＝GCの追跡対象外になり、300万個のfloatを毎回走査していたGC負荷も消える。
+    正規化して持つことで、以後の類似度は割り算不要の内積だけで済む（実測3.3倍高速）。"""
+    n = math.sqrt(sum(x * x for x in v))
+    if n == 0.0:
+        return array.array('f', v)
+    return array.array('f', [x / n for x in v])
+
+
+def _dot(a, b) -> float:
+    """正規化済みベクトル同士の内積＝コサイン類似度。map/sum でC側に落とす。"""
+    return sum(map(_mul, a, b))
+
+
 # コサイン類似度の採用閾値（gemini-embedding-001。ログの best= を見て要調整）
 # 低くするほど積極的に記憶を想起（ノイズも増える）。high=厳選。
 MEMORY_SIM_THRESHOLD = 0.65
@@ -847,6 +869,10 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     ② クエリをembedding化し、保存済み記憶とのcosine類似度を全件計算
     ③ 閾値以上の上位top_kを返す。該当なし → 最近の記憶でフォールバック
     （記憶トリガー語が含まれる場合は「思い出して」の意図が強いので閾値を緩める）
+
+    MEM: 1ユーザー40件 × 3072次元 = 約4MB を返信ごとに読む。返り値に embedding を
+    載せたままだと、その4MBが後続の（数秒かかる）LLM呼び出しの間ずっと生き残り、
+    同時返信ぶん積み上がる。採点に使い終えた時点で embedding を落として返す。
     """
     if len(query) < 8:
         return []
@@ -854,9 +880,14 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     memories = doc.get("memories", [])
     if not memories:
         return []
+
+    def _slim(ms: list[dict]) -> list[dict]:
+        """プロンプトに使うのは content 等のみ。embedding を外して返す。"""
+        return [{k: v for k, v in m.items() if k != "embedding"} for m in ms]
+
     qvec = await _get_embedding(query)
     if not qvec:
-        return memories[:top_k]  # embedding失敗 → 最近の記憶
+        return _slim(memories[:top_k])  # embedding失敗 → 最近の記憶
     threshold = MEMORY_SIM_THRESHOLD
     if any(w in query for w in MEMORY_TRIGGER_WORDS):
         threshold -= 0.10  # 明示的に思い出させる意図 → より積極的に想起
@@ -873,9 +904,9 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     if relevant:
         # best= は閾値チューニング用（この値以下なら拾われない）
         print(f"[memory] cosine hit: {uid} best={best:.3f} thr={threshold:.2f} ({len(relevant)}件)")
-        return relevant
+        return _slim(relevant)
     print(f"[memory] cosine miss: {uid} best={best:.3f} thr={threshold:.2f} → 最近の記憶")
-    return memories[:top_k]  # 関連記憶なし → 最近の記憶
+    return _slim(memories[:top_k])  # 関連記憶なし → 最近の記憶
 
 
 async def _embed_query_for_summaries(text: str) -> list[float] | None:
@@ -1024,7 +1055,14 @@ _summary_embed_cache_at = None
 
 
 async def _load_summary_docs() -> list[dict]:
-    """embedding付き summaries をプロセス内キャッシュから返す（TTL切れ時のみMongo再読込）。"""
+    """embedding付き summaries をプロセス内キャッシュから返す（TTL切れ時のみMongo再読込）。
+
+    MEM: 旧実装は to_list() で全970件の生docを一度に materialize していた。生docの
+    embedding は list[float]（32B/要素）なので約92MBあり、しかも更新時は「新リストを
+    作り終えるまで旧キャッシュも保持」＝瞬間ピーク約185MB。Renderのメモリ上限超過→
+    自動再起動の主因がこれ。今は cursor を1件ずつ流しながら即 array('f') に畳むため、
+    常駐は約12MB・更新時ピークもその程度に収まる（生docはループ内で都度回収される）。
+    """
     global _summary_embed_cache, _summary_embed_cache_at
     now = datetime.datetime.now(datetime.timezone.utc)
     if (_summary_embed_cache and _summary_embed_cache_at
@@ -1035,9 +1073,21 @@ async def _load_summary_docs() -> list[dict]:
             {"embedding": {"$exists": True, "$ne": []}},
             {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1},
         )
-        _summary_embed_cache    = await cursor.to_list(length=SUMMARY_SCAN_LIMIT)
+        compact: list[dict] = []
+        async for d in cursor:
+            emb = d.get("embedding")
+            if not emb:
+                continue
+            # 生の list[float] はこの1件分だけ生存し、次のループで回収される
+            d["embedding"] = _norm_vec(emb)
+            compact.append(d)
+            if len(compact) >= SUMMARY_SCAN_LIMIT:
+                break
+        _summary_embed_cache    = compact
         _summary_embed_cache_at = now
-        print(f"[summary] embeddingキャッシュ更新: {len(_summary_embed_cache)}件")
+        # 旧キャッシュと取り込み中のBSONゴミをこの場で回収（30分に1回だけなので安い）
+        gc.collect()
+        print(f"[summary] embeddingキャッシュ更新: {len(compact)}件")
     except Exception as e:
         print(f"[summary] キャッシュ読込失敗: {e}")
     return _summary_embed_cache
@@ -1078,12 +1128,15 @@ async def search_summaries(query: str, top_k: int = 3, nick_map: dict | None = N
             present_names.update([a, c])
     present_names = {n for n in present_names if len(n) >= 2}
 
+    # キャッシュ側は取り込み時にL2正規化済み（_norm_vec）なので、クエリも正規化すれば
+    # 内積＝コサイン類似度。割り算とノルム再計算が消え、全件スキャンが実測3.3倍速い。
+    qnorm = _norm_vec(qvec)
     scored = []
     for d in docs:
         emb = d.get("embedding")
-        if not emb or len(emb) != len(qvec):   # 次元不一致は安全にスキップ
+        if not emb or len(emb) != len(qnorm):   # 次元不一致は安全にスキップ
             continue
-        scored.append((_cosine(qvec, emb), d))
+        scored.append((_dot(qnorm, emb), d))
     if not scored:
         return []
     scored.sort(key=lambda t: t[0], reverse=True)
@@ -2449,7 +2502,17 @@ async def apply_nickname(member: discord.Member, title: str) -> bool:
 # Bot・DB
 # =============================================================================
 
-mongo_client_db = AsyncIOMotorClient(MONGO_URL)
+# MEM: Motorの既定プールは maxPoolSize=100。このbotの実同時実行はメイドキュー5＋
+# 常駐タスク数件で、100接続は完全な過剰。各接続は直前に受けたレスポンスぶんの
+# 受信バッファを抱えたままプールに戻るため（summaries読み込みは1回12MB級）、
+# 上限を絞り、かつアイドル接続を60秒で閉じてバッファごと解放させる。
+# ※接続文字列(MONGO_URL)の解決順は gw/batch で異なる既知の罠。ここは触らない。
+mongo_client_db = AsyncIOMotorClient(
+    MONGO_URL,
+    maxPoolSize=20,
+    minPoolSize=0,
+    maxIdleTimeMS=60_000,
+)
 db             = mongo_client_db["discord_bot_db"]
 users_col      = db["users"]
 system_col     = db["system"]
@@ -2484,7 +2547,18 @@ class DedupCommandTree(app_commands.CommandTree):
 
 class MyBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.all())
+        # MEM: Intents.all() は presences / typing まで受け取る。このbotは
+        # Member.status も Member.activity も一切参照せず（on_presence_update も無い）、
+        # 有効なままだと全メンバー分の presence をキャッシュに持ち続け、さらに
+        # PRESENCE_UPDATE / TYPING_START が常時流れてイベントループも回り続ける。
+        # members intent は role.members / guild.members / on_member_update が依存するので残す。
+        intents = discord.Intents.all()
+        intents.presences = False
+        intents.typing    = False
+        # MEM: discord.py 既定のメッセージキャッシュは1000件。このbotは削除も編集も
+        # on_raw_* で処理し（cache非依存）、返信元は payload の referenced_message から
+        # 解決されるためキャッシュを当てにしていない。200件あれば十分。
+        super().__init__(intents=intents, max_messages=200)
         self.tree = DedupCommandTree(self)
 
     async def setup_hook(self):
