@@ -86,6 +86,15 @@ MEMBER_FOCUS_PROMPT = """\
 過去数ヶ月から現在への「変化・継続・一過性の出来事」を時系列で具体的に書くこと。
 直近{days}日だけで分かることの繰り返しは禁止。1ヶ月以上前の話題・エピソード・関係性の移り変わりを優先して拾うこと。
 
+【分量の要件（必ず守ること）】
+これは「要約」ではなく「詳細な観察レポート」である。短くまとめることを禁止する。
+・各セクションは最低400字以上・5文以上の地の文で書く。箇条書きの羅列で済ませない。
+・主張には必ず根拠となる実際の発言を「」で直接引用して添える。
+・「数ヶ月の変遷・時系列」と「総合評価」は本レポートの核なので、それぞれ800字以上を充てる。
+・レポート全体で6000字以上を目安とする。
+・根拠が薄いセクションを埋めるために推測で捏造してはならない。その場合は
+　「観察できた範囲」と「判断材料が不足している点」を具体的に書いて厚みを出すこと。
+
 ## 発言の口調・語彙
 ## 性格・行動パターン
 ## サーバー内での立場・役割
@@ -102,6 +111,15 @@ KEYWORD_FOCUS_PROMPT = """\
 「{keyword}」に関する発言・話題に絞って分析し、
 このトピックについての詳細なレポートを書いてください。
 前置き・導入文は不要です。各セクションの見出しから即座に書き始めてください。
+
+【分量の要件（必ず守ること）】
+これは「要約」ではなく「詳細なレポート」である。短くまとめることを禁止する。
+・各セクションは最低400字以上・5文以上の地の文で書く。箇条書きの羅列で済ませない。
+・主張には必ず根拠となる実際の発言を「」で直接引用して添える。
+・「主な議論の流れ」と「結論・現在の状況」はそれぞれ800字以上を充てる。
+・レポート全体で5000字以上を目安とする。
+・根拠が薄いセクションを埋めるために推測で捏造してはならない。その場合は
+　「観察できた範囲」と「判断材料が不足している点」を具体的に書いて厚みを出すこと。
 
 ## このトピックの概要
 ## 主な議論の流れ
@@ -807,13 +825,19 @@ def generate_report(client_ai: genai.Client, log_text: str, summary_text: str = 
         )
 
     full_prompt = prompt + "\n\n" + "\n\n".join(parts)
-    # 8セクション（時系列見出し追加）で出力が伸びたため上限を引き上げ、総合評価が途切れないように
-    return call_ai(client_ai, full_prompt, max_tokens=5000)
+    # 8セクション × 400字以上（うち2つは800字以上）＝本文だけで6000字超を要求している。
+    # 日本語は概ね1字≒1トークンなので本文で7000前後、さらに HEAVY_MODEL_CHAIN の
+    # Gemini flash 系は thinking トークンをこの同じ枠から食う（batch/model_chain.py 参照）。
+    # 旧値5000のままだと本文が尻切れ（finish_reason=MAX_TOKENS）になるので大きく取る。
+    # バッチは速度もコストも不問なので上限に余裕を持たせて枯渇を潰す方針。
+    return call_ai(client_ai, full_prompt, max_tokens=16000)
 
 
 def extract_profile(client_ai: genai.Client, report: str) -> dict | None:
     """人物フォーカスの場合のみプロフィールをJSON抽出"""
-    prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:4000])
+    # レポートは分量要件で6000字超になる。4000字で切ると後半の「時系列」「総合評価」を
+    # 丸ごと捨ててプロフィールを抽出することになるため、全文が入る余裕を取る。
+    prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:12000])
     raw    = call_ai(client_ai, prompt, max_tokens=2000)
     if not raw:
         return None
@@ -866,7 +890,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 }}
 
 【観察レポート】
-{report[:4000]}"""
+{report[:12000]}"""
 
     # call_ai 経由で HEAVY_MODEL_CHAIN のリトライ/フォールバックに乗せる
     # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
