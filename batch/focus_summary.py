@@ -23,6 +23,7 @@ from google.genai import types
 
 from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
 
 FOCUS_TYPE    = os.environ["FOCUS_TYPE"]    # "member" or "keyword"
 FOCUS_TARGET  = os.environ["FOCUS_TARGET"]  # user_id or keyword
@@ -966,145 +967,6 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 # Discord投稿
 # =============================================================================
 
-def _split_for_field(text: str, limit: int = 1020) -> list[str]:
-    """Discordの1フィールド=1024字制限に収まるよう、本文を行境界で複数チャンクに分割。
-    切り捨てず全文を表示するため。1行自体が limit 超なら強制分割。"""
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return [text] if text else []
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        while len(line) > limit:                      # 1行が長すぎる場合は強制分割
-            if cur:
-                chunks.append(cur); cur = ""
-            chunks.append(line[:limit]); line = line[limit:]
-        if cur and len(cur) + 1 + len(line) > limit:
-            chunks.append(cur); cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def _embed_chars(embed: dict) -> tuple[int, int]:
-    """Discordが6000字上限の対象に数える文字数と、フィールド数を返す（診断用）。"""
-    n  = len(embed.get("title", "")) + len(embed.get("description", ""))
-    n += len(embed.get("footer", {}).get("text", ""))
-    n += sum(len(f.get("name", "")) + len(f.get("value", "")) for f in embed.get("fields", []))
-    return n, len(embed.get("fields", []))
-
-
-def _post_json(url: str, headers: dict, payload: dict, what: str, tries: int = 5) -> bool:
-    """Discordへの投稿を再試行つきで行う。
-
-    レポート1本の生成にはLLM呼び出し＋429待ちで数分かかっており、投稿の一時失敗で
-    それを捨てるのは損失が大きいので、回復可能なものは必ず粘る。
-    ・5xx / 通信エラー … Discord側の一時障害。指数バックオフで再試行。
-    ・429            … retry_after に従って待つ（複数通に分けた結果、新たに当たりうる）。
-    ・その他4xx      … ペイロード不正なので再試行しても同じ。即諦めて診断材料を吐く。
-      （Discordの検証エラーは 400 + code 5xxxx + errors という形で返る。500/code 0 は別物）
-    """
-    for attempt in range(tries):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        except requests.RequestException as e:
-            wait = min(2 ** attempt * 2, 30)
-            print(f"[WARN] {what}: 通信エラー({e}) → {wait}s後に再試行 ({attempt+1}/{tries})")
-            time.sleep(wait)
-            continue
-
-        if resp.status_code in (200, 201):
-            return True
-
-        if resp.status_code == 429:
-            try:
-                wait = float(resp.json().get("retry_after", 5.0)) + 0.5
-            except Exception:
-                wait = 5.0
-            print(f"[WARN] {what}: 429 → {wait:.1f}s待機して再試行 ({attempt+1}/{tries})")
-            time.sleep(wait)
-            continue
-
-        if 500 <= resp.status_code < 600:
-            wait = min(2 ** attempt * 2, 30)
-            print(f"[WARN] {what}: {resp.status_code} Discord側エラー → {wait}s後に再試行 "
-                  f"({attempt+1}/{tries}) {resp.text[:200]}")
-            time.sleep(wait)
-            continue
-
-        print(f"[ERROR] {what}: 投稿失敗 {resp.status_code} {resp.text[:500]}")
-        return False
-
-    print(f"[ERROR] {what}: 再試行{tries}回すべて失敗")
-    return False
-
-
-def _post_as_plaintext(url: str, headers: dict, embed: dict, what: str) -> bool:
-    """embed投稿がどうしても通らないときの最後の砦。中身を平文に落として送る。
-
-    embedは見栄えの都合でしかなく、レポートの中身が届くことのほうが重要。
-    平文は1メッセージ2000字上限なので1900字ずつに割って送る。"""
-    blocks = [f"**{f.get('name','')}**\n{f.get('value','')}" for f in embed.get("fields", [])]
-    text   = (embed.get("title", "") + "\n\n" + "\n\n".join(blocks)).strip()
-    chunks, cur = [], ""
-    for block in text.split("\n\n"):
-        while len(block) > 1900:
-            if cur:
-                chunks.append(cur); cur = ""
-            chunks.append(block[:1900]); block = block[1900:]
-        if cur and len(cur) + 2 + len(block) > 1900:
-            chunks.append(cur); cur = block
-        else:
-            cur = f"{cur}\n\n{block}" if cur else block
-    if cur:
-        chunks.append(cur)
-
-    ok = True
-    for i, chunk in enumerate(chunks):
-        if not _post_json(url, headers, {"content": chunk}, f"{what} 平文{i+1}/{len(chunks)}", tries=3):
-            ok = False
-        time.sleep(1.0)
-    return ok
-
-
-def _post_embed_bisect(url: str, headers: dict, embed: dict, what: str, depth: int = 0) -> bool:
-    """5xxが続くembedをフィールド単位で二分割して投稿し直す（救出と原因特定を兼ねる）。
-
-    2026-08-04の実測で、Discordは仕様上限（6000字/25フィールド）の内側でも規模が大きいと
-    400ではなく 500 code:0 を返すことが分かった。エラーが原因を教えてくれない以上、
-    こちらで割って試すのが唯一の切り分け手段になる。
-    ・割ったら通った → 規模が原因。ログに通った粒度が残るので次回の詰め方を決められる。
-    ・1フィールドまで割っても500 → そのフィールドが原因。name と先頭を吐いて特定する。
-    """
-    if _post_json(url, headers, {"embeds": [embed]}, what, tries=5 if depth == 0 else 2):
-        return True
-
-    fields = embed.get("fields", [])
-    if len(fields) <= 1:
-        f = fields[0] if fields else {}
-        print(f"[ERROR] {what}: 単一フィールドでも500。これが原因フィールド → "
-              f"name={f.get('name','')!r} value長={len(f.get('value',''))}字 "
-              f"先頭100字={f.get('value','')[:100]!r}")
-        return False
-
-    mid = len(fields) // 2
-    print(f"[WARN] {what}: {len(fields)}フィールド({_embed_chars(embed)[0]}字)を "
-          f"{mid}+{len(fields)-mid} に分割して再試行")
-    ok = True
-    for i, part in enumerate((fields[:mid], fields[mid:])):
-        sub = dict(embed)
-        sub["fields"] = part
-        sub.pop("timestamp", None)
-        sub["footer"] = {"text": f"{what}-{i+1}（分割投稿）"}
-        if i:
-            sub["title"] = f"{embed.get('title','')}（続き）"
-        if not _post_embed_bisect(url, headers, sub, f"{what}-{i+1}", depth + 1):
-            ok = False
-        time.sleep(1.0)
-    return ok
-
-
 def post_report(report: str, bigfive: dict | None = None):
     now_jst    = datetime.now(JST)
     icon       = "👤" if FOCUS_TYPE == "member" else "🔍"
@@ -1131,67 +993,23 @@ def post_report(report: str, bigfive: dict | None = None):
     for title, body in sections:
         icon_c = next((v for k, v in ICONS.items() if k in title), "📋")
         # 1024字超のセクションは切り捨てず、続きフィールドに分割して全文表示
-        chunks = _split_for_field(body, 1020)
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(split_for_field(body)):
             name = f"{icon_c} {title}" if i == 0 else f"{icon_c} {title}（続き{i+1}）"
             fields.append({"name": name[:256], "value": chunk, "inline": False})
 
-    # 実測（2026-08-04）: 5483字/8フィールドのembedは 500 code:0 を5回連続で返され、
-    # 直後に同一チャンネルへ送った 3076字/4フィールドは一発で通った。同じ本文が平文では
-    # 全通したので文字内容は無罪で、embedの規模側に文書化されていない実効上限がある。
-    # 仕様上の 6000字/25フィールド を信用せず、実績のある規模まで大きく絞って詰める。
-    # （それでも詰まったら _post_embed_bisect が自動で割って救出＋原因を特定する）
-    # 実績OK(3076字/4フィールド)の内側に収める。実績NGは5483字/8フィールド。
-    EMBED_CHAR_BUDGET = 3000
-    EMBED_MAX_FIELDS  = 4
-
-    groups, cur, cur_chars = [], [], 0
-    for field in fields:
-        fc = len(field["name"]) + len(field["value"])
-        if (cur_chars + fc > EMBED_CHAR_BUDGET or len(cur) >= EMBED_MAX_FIELDS) and cur:
-            groups.append(cur)
-            cur, cur_chars = [], 0
-        cur.append(field)
-        cur_chars += fc
-    if cur:
-        groups.append(cur)
-
-    # footer は全embedに付ける。失敗したembedだけ footer/timestamp が無いという構造差が
-    # あると原因切り分けのノイズになるため、構造を揃える（ついでにページ番号が出る）。
-    total  = len(groups)
-    embeds = []
-    for i, group in enumerate(groups):
-        e = {
-            "color":  0x9B59B6,
-            "title":  title_str if i == 0 else f"{icon} {FOCUS_NAME} のフォーカス要約（続き{i+1}）",
-            "fields": group,
-            "footer": {"text": f"空気くんフォーカス要約 • {i+1}/{total} • {now_jst.strftime('%H:%M')} JST"},
-        }
-        if i == total - 1:
-            e["timestamp"] = datetime.now(timezone.utc).isoformat()
-        embeds.append(e)
+    # 詰め方・再試行・二分割・平文フォールバックは batch/discord_post.py に集約。
+    # （embedの実効上限が仕様値より小さい件の経緯もそちらに記録）
+    embeds = pack_fields_into_embeds(
+        fields,
+        color=0x9B59B6,
+        title_for=lambda i, n: title_str if i == 0 else f"{icon} {FOCUS_NAME} のフォーカス要約（続き{i+1}）",
+        footer_for=lambda i, n: f"空気くんフォーカス要約 • {i+1}/{n} • {now_jst.strftime('%H:%M')} JST",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
 
     url     = f"https://discord.com/api/v10/channels/{FOCUS_CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
-    # Discordの6000字上限は「1メッセージ内の全embed合計」。束ねると即50035になるため
-    # post_summary.py / retro_summarize.py と同様に1メッセージ1embedで送る。
-    for idx, embed in enumerate(embeds):
-        chars, nfields = _embed_chars(embed)
-        what = f"embed {idx+1}/{len(embeds)}"
-        # 失敗時に「6000/25/1024のどれに当たったのか」を後から言い当てられるようにしておく
-        print(f"[post] {what} 送信: {chars}字 / {nfields}フィールド "
-              f"(最長field={max((len(f['value']) for f in embed['fields']), default=0)}字)")
-        # まず素直に送る。500が続いたら二分割して救出＋原因特定（_post_embed_bisect）。
-        if _post_embed_bisect(url, headers, embed, what):
-            print(f"[post] 投稿成功 ({idx+1}/{len(embeds)})")
-        else:
-            # 分割しても通らなかった＝規模以外の原因。本文は失いたくないので平文に落とす
-            print(f"[WARN] {what}: embedを諦めて平文で投稿を試みます")
-            if _post_as_plaintext(url, headers, embed, what):
-                print(f"[post] 平文フォールバック成功 ({idx+1}/{len(embeds)})")
-            else:
-                print(f"[ERROR] {what}: 平文フォールバックも失敗。この部分は失われました")
-        time.sleep(1.0)   # 連投レート制限回避
+    post_embeds(url, headers, embeds, label="focus")
 
 
 # =============================================================================

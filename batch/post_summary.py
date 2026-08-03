@@ -14,6 +14,8 @@ from datetime import datetime, timezone, timedelta
 import requests
 from pymongo import MongoClient
 
+from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
+
 MONGODB_URI        = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 SUMMARY_CHANNEL_ID = os.environ["SUMMARY_CHANNEL_ID"]
@@ -67,26 +69,6 @@ def fetch_latest_summary(col) -> dict | None:
     )
 
 
-def _split_for_field(text: str, limit: int = 1020) -> list[str]:
-    """Discord 1フィールド=1024字制限に収まるよう本文を行境界で分割（切り捨てず全文表示）。"""
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return [text] if text else []
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            if cur:
-                chunks.append(cur); cur = ""
-            chunks.append(line[:limit]); line = line[limit:]
-        if cur and len(cur) + 1 + len(line) > limit:
-            chunks.append(cur); cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
 def parse_sections(summary: str) -> list[tuple[str, str]]:
     """## セクション名\n本文 を (title, body) のリストに変換"""
     parts    = re.split(r"\n##\s+", "\n" + summary)
@@ -138,7 +120,7 @@ def build_embeds(doc: dict) -> list[dict]:
     for title, body in sections:
         icon  = next((v for k, v in SECTION_ICONS.items() if k in title), "📋")
         # 1024字超は切り捨てず「(続きN)」フィールドに分割して全文表示
-        for i, chunk in enumerate(_split_for_field(body, 1020)):
+        for i, chunk in enumerate(split_for_field(body)):
             label = f"{icon} {title}" if i == 0 else f"{icon} {title}（続き{i+1}）"
             fields.append({"name": label[:256], "value": chunk, "inline": False})
 
@@ -149,79 +131,37 @@ def build_embeds(doc: dict) -> list[dict]:
         "inline": False,
     })
 
-    # 6000文字制限でEmbedを分割（フィールド25個制限も考慮）
-    embeds       = []
-    current_fields = []
-    current_chars  = 0
-    title_str      = f"📰 {date_str} のサーバー日報"
-
-    for i, field in enumerate(fields):
-        field_chars = len(field["name"]) + len(field["value"])
-        # 最初のEmbedはtitleとfooterの分を引く
-        limit = 5800 if embeds else 5800 - len(title_str)
-
-        if (current_chars + field_chars > limit or len(current_fields) >= 25) and current_fields:
-            # 新しいEmbedを作成
-            embed = {
-                "color":  0x5865F2,
-                "fields": current_fields,
-            }
-            if not embeds:
-                embed["title"] = title_str
-            else:
-                embed["title"] = f"📰 {date_str} のサーバー日報（続き）"
-            embeds.append(embed)
-            current_fields = []
-            current_chars  = 0
-
-        current_fields.append(field)
-        current_chars += field_chars
-
-    # 残りをまとめて最後のEmbedに
-    if current_fields:
-        embed = {
-            "color":  0x5865F2,
-            "fields": current_fields,
-            "footer": {
-                "text": f"空気くん日報 • {now_jst.strftime('%H:%M')} JST",
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if not embeds:
-            embed["title"] = title_str
-        else:
-            embed["title"] = f"📰 {date_str} のサーバー日報（続き）"
-        embeds.append(embed)
-
-    return embeds
+    # 詰め方は batch/discord_post.py に集約。旧実装は 5800字/25フィールド で詰めていたが、
+    # Discordは仕様上限の内側でも規模が大きいと 400 ではなく 500 code:0 を返す
+    # （2026-08-04に focus で実測。経緯は discord_post.py 冒頭）。実績のある規模まで絞る。
+    title_str = f"📰 {date_str} のサーバー日報"
+    return pack_fields_into_embeds(
+        fields,
+        color=0x5865F2,
+        title_for=lambda i, n: title_str if i == 0 else f"📰 {date_str} のサーバー日報（続き{i+1}）",
+        footer_for=lambda i, n: f"空気くん日報 • {i+1}/{n} • {now_jst.strftime('%H:%M')} JST",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 def post_to_discord(embeds: list[dict]):
     """Discord APIにPOSTする（1Embed = 1メッセージ）。
 
     Discordの6000文字制限は「1メッセージ内の全Embedの合計」に対する制限であり、
-    Embed単位ではない。build_embeds が各Embedを ≤5800字 で分割しているので、
-    1メッセージ1Embedで送れば必ず 6000 未満に収まる。複数Embedを同梱すると
-    合計が6000を超えて 400 Bad Request になり日報が落ちていた。
+    Embed単位ではない。複数Embedを同梱すると合計が6000を超えて 400 になり日報が落ちる。
+
+    投稿の再試行・二分割救出・平文フォールバックは discord_post.post_embeds が担う。
+    旧実装は1回の失敗で raise_for_status していたため、Discord側の一時的な5xxで
+    その日の日報が丸ごと落ち、残りのEmbedも投稿されないまま終わっていた。
     """
     url     = f"https://discord.com/api/v10/channels/{SUMMARY_CHANNEL_ID}/messages"
     headers = {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
         "Content-Type":  "application/json",
     }
-
-    for idx, embed in enumerate(embeds):
-        payload = {
-            "embeds": [embed],
-            "allowed_mentions": {"parse": []}  # すべてのメンションを無効化
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        if resp.status_code in (200, 201):
-            print(f"[post] 投稿成功 ({idx+1}/{len(embeds)}): message_id={resp.json().get('id')}")
-        else:
-            print(f"[ERROR] 投稿失敗: {resp.status_code} {resp.text}")
-            resp.raise_for_status()
-        time.sleep(0.5)  # メッセージ間レート制限の緩和
+    # 救出手段を尽くしてなお届かなかった場合だけ、ワークフローを赤くして気づけるようにする
+    if not post_embeds(url, headers, embeds, label="日報", pace=0.5):
+        raise RuntimeError("日報の一部がDiscordに投稿できませんでした（上のログを参照）")
 
 
 def main():

@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
 
 # --- 環境変数 ---
 TARGET_DATE_STR    = os.environ.get("TARGET_DATE", "")   # YYYY-MM-DD（backfillから import する際は未設定でも可）
@@ -272,24 +273,6 @@ def parse_sections(summary: str) -> list[tuple[str, str]]:
         if len(split) > 1: sections.append((split[0].strip(), split[1].strip()))
     return sections
 
-def _split_for_field(text: str, limit: int = 1020) -> list[str]:
-    """Discord 1フィールド=1024字制限に収まるよう本文を行境界で分割（切り捨てず全文表示）。"""
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return [text] if text else []
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            if cur:
-                chunks.append(cur); cur = ""
-            chunks.append(line[:limit]); line = line[limit:]
-        if cur and len(cur) + 1 + len(line) > limit:
-            chunks.append(cur); cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        chunks.append(cur)
-    return chunks
 
 
 def post_to_discord(summary: str, target_date: date_cls, msg_count: int):
@@ -300,36 +283,25 @@ def post_to_discord(summary: str, target_date: date_cls, msg_count: int):
     fields = []
     for title, body in sections:
         icon = next((v for k, v in SECTION_ICONS.items() if k in title), "📋")
-        for i, chunk in enumerate(_split_for_field(body, 1020)):
+        for i, chunk in enumerate(split_for_field(body)):
             name = f"{icon} {title}" if i == 0 else f"{icon} {title}（続き{i+1}）"
             fields.append({"name": name[:256], "value": chunk, "inline": False})
     fields.append({"name": "📊 集計", "value": f"対象日: {target_date.isoformat()} / {msg_count:,}件", "inline": False})
 
-    # 6000字/25フィールド制限で複数Embedに分割し、1Embed=1メッセージで投稿（合計6000超の400回避）
+    # 詰め方・再試行・二分割救出・平文フォールバックは batch/discord_post.py に集約。
+    # 旧実装は 5800字/25フィールド で詰めたうえ投稿失敗を1回で見捨てていた
+    # （Discordは仕様上限の内側でも規模が大きいと 500 code:0 を返す。経緯は discord_post.py 冒頭）。
     title_str = f"📜 {date_str} の過去日報（遡及作成）"
-    groups, cur, chars = [], [], 0
-    for f in fields:
-        fc = len(f["name"]) + len(f["value"])
-        if (chars + fc > 5800 or len(cur) >= 25) and cur:
-            groups.append(cur); cur, chars = [], 0
-        cur.append(f); chars += fc
-    if cur:
-        groups.append(cur)
+    embeds = pack_fields_into_embeds(
+        fields,
+        color=0x8B4513,
+        title_for=lambda i, n: title_str if i == 0 else f"{title_str}（続き{i+1}）",
+        footer_for=lambda i, n: f"空気くん遡及日報 • {i+1}/{n}",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
 
     url = f"https://discord.com/api/v10/channels/{SUMMARY_CHANNEL_ID}/messages"
-    for idx, fset in enumerate(groups):
-        embed = {
-            "title": title_str if idx == 0 else f"{title_str}（続き）",
-            "color": 0x8B4513,
-            "fields": fset,
-        }
-        if idx == len(groups) - 1:
-            embed["footer"]    = {"text": "空気くん遡及日報"}
-            embed["timestamp"] = datetime.now(timezone.utc).isoformat()
-        resp = requests.post(url, headers=REST_HEADERS, json={"embeds": [embed]}, timeout=10)
-        if resp.status_code not in (200, 201):
-            print(f"[ERROR] 投稿失敗: {resp.status_code} {resp.text}")
-        time.sleep(0.5)
+    post_embeds(url, REST_HEADERS, embeds, label="遡及日報", pace=0.5)
     print("[post] Discord投稿完了")
 
 def _build_log_text(messages: list[dict]) -> str:
