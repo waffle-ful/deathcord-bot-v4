@@ -2598,7 +2598,8 @@ class MyBot(discord.Client):
             self.add_view(ModPanelView())
             self.add_view(NotifyConsentView())
             self.add_view(QuizStartView())
-            print("[INFO] mod-guard/modpanel/通知同意/入場クイズ 永続UI登録完了")
+            self.add_view(TosConsentView())
+            print("[INFO] mod-guard/modpanel/通知同意/入場クイズ/規約同意 永続UI登録完了")
         except Exception as e:
             print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
         # 無敵リストを Mongo から読み込み（seed と合算）
@@ -2615,6 +2616,7 @@ class MyBot(discord.Client):
         self.loop.create_task(init_invite_snapshot(self))
         self.loop.create_task(_load_advocate_flags())
         self.loop.create_task(_load_quiz_gate())
+        self.loop.create_task(_load_tos_gate())
         self.loop.create_task(youtube_live_task())
 
 async def init_invite_snapshot(bot: discord.Client):
@@ -2827,6 +2829,14 @@ async def on_message(message: discord.Message):
                 await check_bump(message)
             elif message.webhook_id:
                 await check_bump_webhook(message)
+            return
+
+        # === 規約同意ゲート（記録側の保険）===
+        # 権限ロックは「喋れなくする」だけで、明示allowを持つロールには効かない（allowがdenyに勝つ）。
+        # 実際に守るべきは「同意していない人のデータを取らない」ことなので、記録の手前でも止める。
+        # ここで return するので XP・メイド応答・要約対象からも自動的に外れる。
+        # 管理者も例外にしない（権限上は喋れるが、同意するまで記録はしない）。
+        if _tos_gate.get("enabled") and message.author.id not in _tos_agreed_ids:
             return
 
         # === Phase 1: messages コレクションに記録 ===
@@ -5718,6 +5728,676 @@ async def quiz_teardown_cmd(interaction: discord.Interaction):
     await interaction.followup.send(
         f"✅ 原状復帰。権限上書き解除: {removed}箇所 / 未認証剥がし: {stripped}人 / ゲートOFF。",
         ephemeral=True)
+
+
+# =============================================================================
+# 規約同意ゲート（allow-list 方式）
+#   目的: 「黙って発言していたら同意したものとみなす」を廃し、明示同意を取ってから喋らせる。
+#         無料枠 Gemini API に発言が送られる＝Google の学習に使われ人間レビュアーが読み得る、
+#         という事実がある以上、みなし同意では説明責任を果たせない。
+#
+#   方式: 全チャンネルの @everyone から送信系を deny し、「同意済み」ロールにだけ allow する。
+#         ＝ 既定状態が「喋れない」なので、bot が落ちていても未同意者が素通りしない。
+#
+#   「未同意ロールを全員に配って黙らせる」方式を採らない理由（重要）:
+#     ① 既存メンバー全員への一括付与が要る。取りこぼした人はそのまま喋れてしまう（fail-open）
+#     ② チャンネル上書きは「全ロールの deny をまとめて適用 → 全ロールの allow をまとめて適用」
+#        の順で解決される。つまり同じロール階層では allow が deny に勝つので、他ロールに
+#        明示 allow があると未同意ロールの deny が無言で負ける
+#   （②は allow-list 方式でも「明示 allow を持つロール」には効かない。/規約ロック の
+#     dry-run がその穴を列挙するので、ロック前に必ず確認すること）
+#
+#   権限だけに頼らず on_message 側でも未同意者の記録を止める（二重の保険）。
+# =============================================================================
+
+TOS_VERSION      = 1              # 規約の版。改定して上げた場合は再同意を求める（強制はv2で）
+TOS_CHANNEL_NAME = "利用規約"
+TOS_DOC_URL      = os.environ.get("TOS_DOC_URL") or ""   # 規約全文の掲載先（任意）
+
+# deny/allow する送信系権限。スレッドを塞がないとスレッドで喋られてゲートが飾りになる。
+_TOS_SEND_PERMS = ("send_messages", "send_messages_in_threads",
+                   "create_public_threads", "create_private_threads")
+
+_tos_gate: dict = {"enabled": False, "role_id": 0, "channel_id": 0, "locked": False}
+_tos_agreed_ids: set[int] = set()   # 同意済み user_id。毎メッセージの DB 読みを避けるため in-memory
+
+
+async def _load_tos_gate():
+    """起動時に規約ゲート設定と同意済みリストを読み込む。
+    読込に失敗したときは「誰も同意していない」状態に倒す＝記録を止める側（fail-closed）。
+    プライバシー機構なので、疑わしいときは取らない方向に倒すのが正しい。"""
+    try:
+        doc = await system_col.find_one({"_id": "tos_gate"}) or {}
+        _tos_gate["enabled"]    = bool(doc.get("enabled", False))
+        _tos_gate["role_id"]    = int(doc.get("role_id", 0) or 0)
+        _tos_gate["channel_id"] = int(doc.get("channel_id", 0) or 0)
+        _tos_gate["locked"]     = bool(doc.get("locked", False))
+        _tos_agreed_ids.clear()
+        async for d in users_col.find({"tos_agreed.version": {"$gte": TOS_VERSION}}, {"_id": 1}):
+            try:
+                _tos_agreed_ids.add(int(d["_id"]))
+            except (ValueError, KeyError):
+                continue
+        print(f"[tos] 規約ゲート: enabled={_tos_gate['enabled']} locked={_tos_gate['locked']} "
+              f"role={_tos_gate['role_id']} ch={_tos_gate['channel_id']} "
+              f"同意済み={len(_tos_agreed_ids)}人 (v{TOS_VERSION})")
+    except Exception as e:
+        print(f"[tos] ★設定読込失敗（未同意扱いで継続＝記録を止める側に倒す）: {e}")
+
+
+async def _save_tos_gate():
+    await system_col.update_one({"_id": "tos_gate"}, {"$set": {
+        "enabled":    _tos_gate["enabled"],
+        "role_id":    _tos_gate["role_id"],
+        "channel_id": _tos_gate["channel_id"],
+        "locked":     _tos_gate["locked"],
+        "version":    TOS_VERSION,
+    }}, upsert=True)
+
+
+def _tos_embed() -> discord.Embed:
+    """同意パネル本体。ここで一番伝えるべきは『無料枠なので学習に使われる』という一点。
+    リンク先を読まない人が大半なので、核心はパネルに直接書く。"""
+    e = discord.Embed(
+        title="📜 空気くん 利用規約・データの取扱いについて",
+        description=(
+            "このサーバーでは、bot「空気くん」があなたの発言を記録・解析します。\n"
+            "**内容を確認して同意いただくまで、発言できない設定になっています。**"
+        ),
+        color=0xF2B705,
+    )
+    e.add_field(
+        name="① 何を取得するか",
+        value=("全チャンネルの発言本文・ユーザーID・表示名・投稿日時、DMでのやりとり、"
+               "活動統計。会話からAIが推定した性格・口調・交友関係・記憶も保存します。"),
+        inline=False)
+    e.add_field(
+        name="② 外部AIサービスへ送られます（重要）",
+        value=("発言は Google の Gemini API へ送信されます。**現在は無料枠で運用しているため、"
+               "Googleの規約により、送信内容はGoogleの製品改善・機械学習に利用され、"
+               "人間のレビュアーが読む可能性があります。**\n"
+               "→ **本名・住所・連絡先・秘密・健康や信条などの機微な情報は書き込まないでください。**"),
+        inline=False)
+    e.add_field(
+        name="③ 保存期間",
+        value=("生の発言ログは30日で自動削除。ただし日報・要約・プロフィール・記憶は"
+               "削除請求があるまで残ります。"),
+        inline=False)
+    # ★既存メンバーは同意時点で既に数ヶ月分のデータがある。ここを書かないと
+    #   「何に同意したのか」が特定できず、同意そのものの効力が弱くなる。
+    e.add_field(
+        name="④ この同意より前に集めたデータについて",
+        value=("このゲートを導入する前から、あなたの発言や推定プロフィールは**すでに保存されています**。\n"
+               "同意すると、それらも引き続き保持されます。**不要な場合は、同意した後でも"
+               "運営へDMで削除を請求できます**（請求があり次第、速やかに消去します）。\n"
+               "※削除しても**XP・ランクは残ります**。消えるのは性格推定・記憶・会話履歴・"
+               "二つ名などの、あなた個人に紐づく情報です。"),
+        inline=False)
+    e.add_field(
+        name="⑤ あなたができること",
+        value=("`/privacy` AI性格推定の停止 ／ `/myprofile` 保存内容の確認 ／ "
+               "`/clearmaid` 会話履歴の消去 ／ 運営へDMで照会・削除請求"),
+        inline=False)
+    if TOS_DOC_URL:
+        e.add_field(name="規約全文", value=TOS_DOC_URL, inline=False)
+    e.set_footer(text=f"規約バージョン v{TOS_VERSION} ・ 同意した日時が記録されます")
+    return e
+
+
+class TosConsentView(discord.ui.View):
+    """#利用規約 に常設する同意パネル（永続View・custom_idで再起動後も有効）。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="同意して参加する", style=discord.ButtonStyle.success,
+                       custom_id="tos:agree", emoji="✅")
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # ① 同意記録を先に書く（＝法的な証跡。ロール付与はあくまで見た目の解放）
+        try:
+            await users_col.update_one(
+                {"_id": uid},
+                {"$set": {"tos_agreed": {"version": TOS_VERSION, "at": now.isoformat(),
+                                         "name": interaction.user.display_name}}},
+                upsert=True)
+        except Exception as e:
+            print(f"[tos] ★同意記録の保存に失敗 uid={uid}: {e}")
+            await interaction.response.send_message(
+                "同意の記録に失敗しました…。時間をおいて、もう一度押してみてください。", ephemeral=True)
+            return
+        _tos_agreed_ids.add(interaction.user.id)
+        # ② ロール付与（何度押しても壊れないように冪等）
+        note = ""
+        role = interaction.guild.get_role(_tos_gate["role_id"]) if interaction.guild else None
+        if role and isinstance(interaction.user, discord.Member):
+            if role not in interaction.user.roles:
+                try:
+                    await interaction.user.add_roles(role, reason=f"利用規約v{TOS_VERSION}に同意")
+                except Exception as e:
+                    print(f"[tos] ロール付与失敗 uid={uid}: {e}")
+                    note = ("\n⚠️ ロールの付与に失敗しました。運営に `/規約同意付与` の実行を"
+                            "お願いしてください（同意自体は記録済みです）。")
+        await interaction.response.send_message(
+            f"✅ 同意を記録しました（v{TOS_VERSION} / "
+            f"{now.astimezone(datetime.timezone(datetime.timedelta(hours=9))):%Y-%m-%d %H:%M} JST）。\n"
+            f"発言できるようになりました。ようこそ！🎉\n"
+            f"※この同意より前に保存された分の削除を希望する場合は、いつでも運営へDMでご連絡ください。{note}",
+            ephemeral=True)
+
+    @discord.ui.button(label="同意しない場合", style=discord.ButtonStyle.secondary,
+                       custom_id="tos:decline", emoji="🚪")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "同意しない場合、このサーバーでは発言できません（閲覧はできます）。\n"
+            "すでに保存されているあなたのデータの削除を希望する場合は、運営へDMでご連絡ください。\n"
+            "気が変わったら、いつでも「✅ 同意して参加する」を押してくださいね。", ephemeral=True)
+
+
+def _tos_is_admin(interaction: discord.Interaction) -> bool:
+    return getattr(interaction.user.guild_permissions, "administrator", False)
+
+
+def _tos_lockable_channels(guild: discord.Guild) -> list:
+    """ロック対象チャンネル。カテゴリも含める（同期チャンネルの継承元になるため）。"""
+    out = []
+    for c in guild.channels:
+        if isinstance(c, (discord.TextChannel, discord.ForumChannel,
+                          discord.VoiceChannel, discord.StageChannel,
+                          discord.CategoryChannel)):
+            out.append(c)
+    return out
+
+
+def _tos_bypass_roles(ch, everyone, agreed_role, self_role) -> list[str]:
+    """このチャンネルで『明示 allow を持っていてゲートを素通りできる』ロール名を列挙。
+    role overwrite は allow が deny に勝つため、ここに出たロールの保持者は未同意でも喋れる。"""
+    leaks = []
+    for tgt, ow in ch.overwrites.items():
+        if not isinstance(tgt, discord.Role):
+            continue
+        if tgt == everyone or (agreed_role and tgt == agreed_role) or (self_role and tgt == self_role):
+            continue
+        if any(getattr(ow, p, None) is True for p in _TOS_SEND_PERMS):
+            leaks.append(tgt.name)
+    return leaks
+
+
+@client.tree.command(name="規約ゲート設定",
+                     description="【管理者】規約同意ゲートを設置（利用規約ch作成＋同意パネル設置）")
+@app_commands.describe(role="「同意済み」ロール（同意した人にだけ付与＝これが発言許可証になる）")
+@app_commands.default_permissions(administrator=True)
+async def tos_setup_cmd(interaction: discord.Interaction, role: discord.Role):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # ① 利用規約ch（全員が閲覧できるが発言はできない）
+    ch = discord.utils.get(guild.text_channels, name=TOS_CHANNEL_NAME)
+    if ch is None:
+        ch = await guild.create_text_channel(
+            TOS_CHANNEL_NAME,
+            overwrites={guild.default_role: discord.PermissionOverwrite(
+                view_channel=True, send_messages=False, read_message_history=True)},
+            reason="規約同意ゲート")
+    else:
+        await ch.set_permissions(guild.default_role, view_channel=True,
+                                 send_messages=False, read_message_history=True,
+                                 reason="規約同意ゲート")
+    # 入場クイズの未認証ロールがあると全chが非表示になるので、規約chだけは見せる
+    quiz_role = guild.get_role(_quiz_gate.get("role_id", 0)) if _quiz_gate.get("role_id") else None
+    if quiz_role:
+        try:
+            await ch.set_permissions(quiz_role, view_channel=True, send_messages=False,
+                                     read_message_history=True, reason="規約同意ゲート")
+        except Exception as e:
+            print(f"[tos] 未認証ロールへの規約ch可視化に失敗: {e}")
+
+    # ② 同意パネル設置
+    await ch.send(embed=_tos_embed(), view=TosConsentView())
+
+    # ③ 設定保存（ロックはまだ掛けない＝この時点では誰も締め出さない）
+    _tos_gate["role_id"]    = role.id
+    _tos_gate["channel_id"] = ch.id
+    _tos_gate["enabled"]    = False
+    _tos_gate["locked"]     = False
+    await _save_tos_gate()
+
+    await interaction.followup.send(
+        f"✅ 設置しました。\n規約ch: {ch.mention}\n同意済みロール: {role.mention}\n\n"
+        f"まだ**誰も締め出していません**。次の手順で進めてね:\n"
+        f"1️⃣ 自分でパネルの「同意する」を押して動作確認\n"
+        f"2️⃣ `/規約ロック`（既定は下見モード）で、何が変わるか・素通りする穴が無いかを確認\n"
+        f"3️⃣ 問題なければ `/規約ロック dry_run:False` で本適用\n"
+        f"⚠️ ロール「{role.name}」が**誰にも付いていない**ことを先に確認してね"
+        f"（付いている人は最初から喋れてしまいます）。", ephemeral=True)
+
+
+@client.tree.command(name="規約ロック",
+                     description="【管理者】全chを『同意者だけ発言可』にする（既定は下見モード）")
+@app_commands.describe(dry_run="True=変更せず影響だけ表示（既定）。False=実際に適用する")
+@app_commands.default_permissions(administrator=True)
+async def tos_lock_cmd(interaction: discord.Interaction, dry_run: bool = True):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    guild = interaction.guild
+    agreed_role = guild.get_role(_tos_gate.get("role_id", 0))
+    if not agreed_role:
+        await interaction.response.send_message(
+            "先に `/規約ゲート設定` を実行してね。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    everyone   = guild.default_role
+    self_role  = guild.self_role                      # bot自身の管理ロール
+    bot_is_admin = bool(guild.me and guild.me.guild_permissions.administrator)
+    skip_ids   = {_tos_gate.get("channel_id", 0), _quiz_gate.get("channel_id", 0)}
+
+    targets, already_ro, leaks = [], [], {}
+    for ch in _tos_lockable_channels(guild):
+        if ch.id in skip_ids:
+            continue
+        ow = ch.overwrites_for(everyone)
+        # ★権限の格上げを防ぐ: 元々 @everyone が喋れないch（お知らせ等）は触らない。
+        #   ここで同意済みロールに allow を付けると、読み専chが喋れるchに化けてしまう。
+        if ow.send_messages is False:
+            already_ro.append(ch.name)
+            continue
+        targets.append(ch)
+        lk = _tos_bypass_roles(ch, everyone, agreed_role, self_role)
+        if lk:
+            leaks[ch.name] = lk
+
+    leak_lines = [f"・#{n}: {', '.join(rs)}" for n, rs in list(leaks.items())[:10]]
+    leak_txt = ("\n".join(leak_lines) + (f"\n…他{len(leaks)-10}ch" if len(leaks) > 10 else "")
+                ) if leaks else "（なし）"
+    bot_txt = ("botは管理者なので影響なし" if bot_is_admin
+               else f"botは管理者でないため `{self_role.name if self_role else '?'}` にも"
+                    f"送信allowを付けます（付けないと空気くんが全ch沈黙します）")
+
+    if dry_run:
+        await interaction.followup.send(
+            f"🔍 **下見モード（何も変更していません）**\n\n"
+            f"ロック対象: **{len(targets)}ch** ／ 元から読み専で除外: {len(already_ro)}ch\n"
+            f"bot: {bot_txt}\n\n"
+            f"⚠️ **ゲートを素通りできるロール**（明示allowがあり deny に勝ちます）:\n{leak_txt}\n\n"
+            f"{'→ 上記ロールの保持者は未同意でも喋れます。該当chの上書きを外してから本適用してね。' if leaks else '→ 穴はありません。'}\n"
+            f"問題なければ `/規約ロック dry_run:False` で本適用。", ephemeral=True)
+        return
+
+    # ★二重適用の禁止: ロック済みだと全chが「元から読み専」と判定されて targets が空になり、
+    #   直後の upsert が entries=[] でスナップショットを上書きして復元不能になる。
+    #   （下見モードはスナップショットを書かないのでロック中でも使える）
+    if _tos_gate.get("locked"):
+        await interaction.followup.send(
+            "⚠️ 既にロックを適用中です。ここで再適用すると復元用スナップショットが空で上書きされ、"
+            "**元の権限に戻せなくなります**。やり直す場合は先に `/規約ロック解除` を実行してね。",
+            ephemeral=True)
+        return
+
+    # --- 本適用: 破壊操作の前にスナップショットを保存（＝復元の真実の源） ---
+    entries = []
+    for ch in targets:
+        ow = ch.overwrites_for(everyone)
+        entries.append({
+            "channel_id": ch.id,
+            "channel_name": ch.name,
+            "everyone_prior": {p: getattr(ow, p, None) for p in _TOS_SEND_PERMS},
+            "agreed_existed": agreed_role in ch.overwrites,
+            "agreed_prior": ({p: getattr(ch.overwrites_for(agreed_role), p, None)
+                              for p in _TOS_SEND_PERMS} if agreed_role in ch.overwrites else None),
+        })
+    await system_col.update_one({"_id": "tos_lock_snapshot"}, {"$set": {
+        "entries": entries,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "actor": str(interaction.user),
+        "role_id": agreed_role.id,
+    }}, upsert=True)
+
+    applied, failed = 0, []
+    for ch in targets:
+        try:
+            ow = ch.overwrites_for(everyone)
+            for p in _TOS_SEND_PERMS:
+                setattr(ow, p, False)
+            await ch.set_permissions(everyone, overwrite=ow, reason="規約同意ゲート: ロック")
+            aow = ch.overwrites_for(agreed_role)
+            for p in _TOS_SEND_PERMS:
+                setattr(aow, p, True)
+            await ch.set_permissions(agreed_role, overwrite=aow, reason="規約同意ゲート: 同意者を解放")
+            if not bot_is_admin and self_role:
+                sow = ch.overwrites_for(self_role)
+                for p in _TOS_SEND_PERMS:
+                    setattr(sow, p, True)
+                await ch.set_permissions(self_role, overwrite=sow, reason="規約同意ゲート: bot自身の発言確保")
+            applied += 1
+        except Exception as e:
+            failed.append(f"#{ch.name}: {e}")
+
+    _tos_gate["locked"]  = True
+    _tos_gate["enabled"] = True          # 未同意者の記録も止める（二重の保険をここで有効化）
+    await _save_tos_gate()
+
+    fail_txt = ("\n❌ 失敗:\n" + "\n".join(failed[:5])) if failed else ""
+    await interaction.followup.send(
+        f"🔒 **ロックを適用しました**（{applied}ch）。\n"
+        f"・未同意者は発言できません（管理者は権限上そのまま喋れますが、同意するまで**記録されません**）\n"
+        f"・未同意者の発言は `messages` にも保存されず、AIにも送られません\n"
+        f"・巻き戻しは `/規約ロック解除`（適用前の状態をスナップショットから復元）\n"
+        f"・botが落ちても未同意者は喋れません。詰まった人がいたら `/規約同意付与` で手動解放\n"
+        f"{fail_txt}", ephemeral=True)
+
+
+@client.tree.command(name="規約ロック解除",
+                     description="【管理者】規約ロックを巻き戻して適用前の権限に戻す")
+@app_commands.default_permissions(administrator=True)
+async def tos_unlock_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    snap = await system_col.find_one({"_id": "tos_lock_snapshot"})
+    if not snap or not snap.get("entries"):
+        await interaction.followup.send(
+            "スナップショットが見つからないよ（ロックが未適用か、記録が消えている）。", ephemeral=True)
+        return
+    guild       = interaction.guild
+    everyone    = guild.default_role
+    agreed_role = guild.get_role(snap.get("role_id", 0)) or guild.get_role(_tos_gate.get("role_id", 0))
+
+    restored, failed = 0, []
+    for ent in snap["entries"]:
+        ch = guild.get_channel(ent["channel_id"])
+        if ch is None:
+            continue
+        try:
+            # 適用前の三値（True/False/None）をそのまま復元する。Noneに倒すと元がTrueだった
+            # チャンネルの設定を失うので、必ず記録した値を戻す。
+            ow = ch.overwrites_for(everyone)
+            for p, v in (ent.get("everyone_prior") or {}).items():
+                setattr(ow, p, v)
+            await ch.set_permissions(everyone, overwrite=ow, reason="規約ロック解除")
+            if agreed_role:
+                if ent.get("agreed_existed"):
+                    aow = ch.overwrites_for(agreed_role)
+                    for p, v in (ent.get("agreed_prior") or {}).items():
+                        setattr(aow, p, v)
+                    await ch.set_permissions(agreed_role, overwrite=aow, reason="規約ロック解除")
+                else:
+                    # 元々上書きが無かったchからは上書きごと削除する
+                    await ch.set_permissions(agreed_role, overwrite=None, reason="規約ロック解除")
+            restored += 1
+        except Exception as e:
+            failed.append(f"#{getattr(ch, 'name', '?')}: {e}")
+
+    _tos_gate["locked"]  = False
+    _tos_gate["enabled"] = False
+    await _save_tos_gate()
+    fail_txt = ("\n❌ 失敗:\n" + "\n".join(failed[:5])) if failed else ""
+    await interaction.followup.send(
+        f"🔓 復元しました（{restored}ch）。ゲートはOFF＝全員が元どおり喋れます。\n"
+        f"同意記録自体は消えていないので、再ロックすれば同意済みの人はそのまま解放されます。{fail_txt}",
+        ephemeral=True)
+
+
+@client.tree.command(name="規約ゲート状態", description="【管理者】同意状況と未同意メンバーを確認")
+@app_commands.default_permissions(administrator=True)
+async def tos_status_cmd(interaction: discord.Interaction):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild   = interaction.guild
+    humans  = [m for m in guild.members if not m.bot]
+    pending = [m for m in humans if m.id not in _tos_agreed_ids]
+    names   = "、".join(m.display_name for m in pending[:20])
+    if len(pending) > 20:
+        names += f" …他{len(pending)-20}人"
+    role = guild.get_role(_tos_gate.get("role_id", 0))
+    await interaction.followup.send(
+        f"📜 **規約ゲート状態**（規約 v{TOS_VERSION}）\n"
+        f"・ロック: {'🔒 適用中' if _tos_gate.get('locked') else '🔓 未適用'}\n"
+        f"・記録ガード: {'ON（未同意者は記録しない）' if _tos_gate.get('enabled') else 'OFF'}\n"
+        f"・同意済みロール: {role.mention if role else '未設定'}\n"
+        f"・同意済み: **{len(humans) - len(pending)}人** / 未同意: **{len(pending)}人**\n"
+        f"・未同意者: {names or '（なし）'}", ephemeral=True)
+
+
+@client.tree.command(name="規約同意付与", description="【管理者】指定メンバーを手動で同意済みにする（保険）")
+@app_commands.describe(member="解放するメンバー")
+@app_commands.default_permissions(administrator=True)
+async def tos_grant_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    now = datetime.datetime.now(datetime.timezone.utc)
+    await users_col.update_one(
+        {"_id": str(member.id)},
+        {"$set": {"tos_agreed": {"version": TOS_VERSION, "at": now.isoformat(),
+                                 "name": member.display_name,
+                                 "granted_by": str(interaction.user)}}},
+        upsert=True)
+    _tos_agreed_ids.add(member.id)
+    role = interaction.guild.get_role(_tos_gate.get("role_id", 0))
+    if role and role not in member.roles:
+        try:
+            await member.add_roles(role, reason=f"管理者による手動同意付与 by {interaction.user}")
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 記録はしたがロール付与に失敗: {e}", ephemeral=True)
+            return
+    await interaction.response.send_message(
+        f"✅ {member.mention} を同意済みにしました（実行者: {interaction.user.display_name} として記録）。",
+        ephemeral=True)
+
+
+# =============================================================================
+# データ削除請求の実行（/データ削除）
+#   規約 §6「請求があり次第、速やかに消去します」を実際に履行するための機構。
+#   ドキュメントごと消すのではなく**フィールド単位で消す**のが要点:
+#   問題なのは人格・発言由来の情報であって、XP や Bump 回数といった活動量ではない。
+#   全消しにするとランクや順位まで巻き戻り、本人が望んでいない副作用が出る。
+# =============================================================================
+
+# 消すもの（人格・発言に由来する情報）。$unset は存在しないフィールドに対しては no-op。
+_ERASE_FIELDS = (
+    "profile",          # 口調・性格・交友関係・誕生日・趣味・Big Five(推定/自己申告)
+    "simple_profile",   # 非ブースター向け簡易プロフィール
+    "butler_history",   # メイドとの会話原文
+    "memories",         # 長期記憶（embedding付き）
+    "claims",           # 過去の主張
+    "title",            # 二つ名（本人が付けた文字列＝本人由来の情報）
+    "maid_callname",    # 呼ばれ方（「お兄ちゃん」等）
+    "last_content",     # 直前の発言の原文（連投検知用に残っている）
+)
+# 残すもの: xp / bump_count / invite_count / streak_days / conv_count* / last_active_date /
+#           name / tos_agreed / persona_override / notify_consented / saved_roles
+#   → 活動量とサーバー運営上の設定であり、人格情報を含まない。
+# 残すもの（意図的）: mod_warnings / guard_events / killswitch_snapshots
+#   → モデレーション記録。荒らし対応の証跡なので削除請求の対象外として扱う。
+
+
+async def _erase_preview(uid: str) -> dict:
+    """削除前に「何がどれだけ消えるか」を数える。実行しない。"""
+    doc = await users_col.find_one({"_id": uid}) or {}
+    prof = doc.get("profile") or {}
+    return {
+        "exists":     bool(doc),
+        "name":       doc.get("name", ""),
+        "xp":         doc.get("xp", 0),
+        "messages":   await messages_col.count_documents({"author_id": uid}),
+        "memories":   len(doc.get("memories") or []),
+        "claims":     len(doc.get("claims") or []),
+        "history":    len(doc.get("butler_history") or []),
+        "has_profile": bool(prof or doc.get("simple_profile")),
+        "has_bigfive": bool(prof.get("bigfive") or prof.get("bigfive_self")),
+        "title":      doc.get("title", ""),
+        "mimic_logs": await system_col.count_documents(
+            {"type": "mimic_log", "$or": [{"target_id": uid}, {"invoker_id": uid}]}),
+    }
+
+
+async def _erase_user_data(uid: str, actor: str, delete_xp: bool = False) -> dict:
+    """削除請求の実行本体。消した件数を返す。
+    ★再生成の防止が肝: profile を消しても personality_optout を立てないと、
+      その晩のバッチが残った要約から人格を作り直してしまう（enrich/analyze 系は
+      personality_optout != True で対象を絞っているので、これを立てれば止まる）。"""
+    result = {"messages": 0, "mimic_logs": 0, "nickname": [], "invincible": 0, "fields": 0}
+
+    # ① 生ログ（mimic・性格分析の生ソース）
+    r = await messages_col.delete_many({"author_id": uid})
+    result["messages"] = r.deleted_count
+
+    # ② users のフィールド単位削除 ＋ 再生成の停止
+    unset = {f: "" for f in _ERASE_FIELDS}
+    if delete_xp:
+        for f in ("xp", "bump_count", "invite_count", "streak_days",
+                  "conv_count", "conv_count_nb", "last_active_date"):
+            unset[f] = ""
+    upd = await users_col.update_one(
+        {"_id": uid},
+        {"$unset": unset,
+         "$set": {"personality_optout": True,      # ←これが無いと夜のバッチが作り直す
+                  "data_erased": {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                  "actor": actor, "xp_deleted": bool(delete_xp)}}},
+        upsert=False)
+    result["fields"] = upd.modified_count
+
+    # ③ mimic 実行ログ（対象・実行者どちらでも本人のIDが載る）
+    r = await system_col.delete_many(
+        {"type": "mimic_log", "$or": [{"target_id": uid}, {"invoker_id": uid}]})
+    result["mimic_logs"] = r.deleted_count
+
+    # ④ ニックネーム対応表（あだ名→正式名。本人の名前を含むエントリを外す）
+    try:
+        nm  = await system_col.find_one({"_id": "nickname_map"}) or {}
+        mp  = nm.get("map") or {}
+        doc = await users_col.find_one({"_id": uid}, {"name": 1}) or {}
+        me  = (doc.get("name") or "").strip()
+        if me and mp:
+            drop = [k for k, v in mp.items() if k == me or v == me]
+            for k in drop:
+                await system_col.update_one({"_id": "nickname_map"}, {"$unset": {f"map.{k}": ""}})
+            result["nickname"] = drop
+    except Exception as e:
+        print(f"[erase] nickname_map の掃除に失敗: {e}")
+
+    # ⑤ 無敵リスト（登録されていれば外す）
+    r = await invincible_col.delete_one({"_id": uid})
+    result["invincible"] = r.deleted_count
+    _invincible_ids.discard(int(uid))
+
+    # ⑥ 実施記録（履行した証跡。中身は残さず件数だけ）
+    await system_col.insert_one({
+        "type": "erasure_log", "target_id": uid, "actor": actor,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "deleted": result, "xp_deleted": bool(delete_xp),
+    })
+    return result
+
+
+class EraseConfirmView(discord.ui.View):
+    """削除は取り消せないので、必ずワンクッション置く。実行者本人以外は押せない。"""
+    def __init__(self, uid: str, invoker_id: int, delete_xp: bool):
+        super().__init__(timeout=120)
+        self.uid, self.invoker_id, self.delete_xp = uid, invoker_id, delete_xp
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("実行者本人だけが操作できます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="削除を実行する", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def do_erase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="削除中…", embed=None, view=self)
+        try:
+            r = await _erase_user_data(self.uid, str(interaction.user), self.delete_xp)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 削除中にエラー: {e}", ephemeral=True)
+            return
+        nick = ("、".join(r["nickname"])) if r["nickname"] else "なし"
+        await interaction.followup.send(
+            f"✅ **削除しました**（対象: `{self.uid}`）\n"
+            f"・発言ログ: {r['messages']}件\n"
+            f"・プロフィール/記憶/主張/会話履歴/二つ名: 削除\n"
+            f"・mimic実行ログ: {r['mimic_logs']}件\n"
+            f"・ニックネーム登録: {nick}\n"
+            f"・XP等の活動データ: {'削除' if self.delete_xp else '**保持**'}\n"
+            f"・以後の再分析を停止（`personality_optout`）\n\n"
+            f"⚠️ 過去の日報・要約の本文に含まれる記述は、文章に溶け込んでいるため"
+            f"個別に取り出して消せません。必要なら該当する要約ごとの削除が必要です。\n"
+            f"⚠️ 既にGoogleへ送信済みのデータはこちらから取り消せません。\n"
+            f"⚠️ モデレーション記録（警告・ban/kick履歴）は証跡として残しています。",
+            ephemeral=True)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(
+            content="中止しました（何も削除していません）。", embed=None, view=self)
+
+
+@client.tree.command(name="データ削除",
+                     description="【管理者】削除請求に応じて、指定ユーザーの人格・発言データを消す")
+@app_commands.describe(user_id="対象のユーザーID（サーバーを抜けた人にも使えるようID指定）",
+                       delete_xp="TrueにするとXP・ランクも消す（既定False＝XPは残す）")
+@app_commands.default_permissions(administrator=True)
+async def erase_data_cmd(interaction: discord.Interaction, user_id: str,
+                         delete_xp: bool = False):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    uid = user_id.strip()
+    if not uid.isdigit():
+        await interaction.response.send_message(
+            "ユーザーIDは数字だけで指定してね（Discordの開発者モードで右クリック→IDをコピー）。",
+            ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    p = await _erase_preview(uid)
+    if not p["exists"] and p["messages"] == 0:
+        await interaction.followup.send(
+            f"`{uid}` のデータは見つからなかったよ（既に削除済み、またはID違い）。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🗑️ データ削除の確認",
+        description=f"対象: **{p['name'] or '(名前不明)'}** (`{uid}`)\n"
+                    f"**この操作は取り消せません。**",
+        color=0xE04A4A)
+    embed.add_field(name="消えるもの", value=(
+        f"・発言ログ: **{p['messages']}件**\n"
+        f"・記憶: {p['memories']}件 ／ 主張: {p['claims']}件 ／ メイド会話: {p['history']}件\n"
+        f"・プロフィール推定: {'あり' if p['has_profile'] else 'なし'}"
+        f"（Big Five: {'あり' if p['has_bigfive'] else 'なし'}）\n"
+        f"・二つ名: {p['title'] or 'なし'}\n"
+        f"・mimic実行ログ: {p['mimic_logs']}件"), inline=False)
+    embed.add_field(name="残るもの", value=(
+        f"・XP: **{p['xp']:,}**（{'★今回は消します' if delete_xp else 'そのまま保持'}）\n"
+        f"・Bump回数・招待数・連続参加日数\n"
+        f"・過去の日報/要約の本文（個別削除は技術的に不可）\n"
+        f"・モデレーション記録（警告・ban/kick履歴）"), inline=False)
+    embed.set_footer(text="削除後は自動的に personality_optout が有効化され、再分析されなくなります")
+    await interaction.followup.send(
+        embed=embed, view=EraseConfirmView(uid, interaction.user.id, delete_xp), ephemeral=True)
 
 
 def _build_retro_embeds(doc: dict) -> list[dict]:
