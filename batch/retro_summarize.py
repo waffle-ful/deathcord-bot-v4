@@ -11,6 +11,7 @@ from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
 from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
+from consent_util import get_consent_filter  # 規約未同意ユーザーの発言をLLMへ送らない
 
 # --- 環境変数 ---
 TARGET_DATE_STR    = os.environ.get("TARGET_DATE", "")   # YYYY-MM-DD（backfillから import する際は未設定でも可）
@@ -111,7 +112,12 @@ def is_excluded(channel: dict) -> bool:
     return int(channel["id"]) in EXCLUDE_IDS
 
 def fetch_day_logs(target_date: date_cls) -> list[dict]:
-    """指定日のDiscordログをREST APIで取得"""
+    """指定日のDiscordログをREST APIで取得（規約未同意ユーザーの発言は除外）"""
+    # REST 直読みは main.py の on_message 同意ガードを通らないため、ここで弾く。
+    # backfill が日数分ループしても get_consent_filter がキャッシュするので問い合わせは1回。
+    consent          = get_consent_filter()
+    skipped_unagreed = 0
+
     after_dt  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
     before_dt = after_dt + timedelta(days=1)
     after_sf  = _datetime_to_snowflake(after_dt)
@@ -180,12 +186,16 @@ def fetch_day_logs(target_date: date_cls) -> list[dict]:
                 author = msg.get("author", {})
                 if author.get("bot") or msg.get("webhook_id"):
                     continue
+                if not consent.allows(author.get("id")):
+                    skipped_unagreed += 1
+                    continue
                 all_messages.append({
                     "channel":   ch_name,
                     "author":    author.get("global_name") or author.get("username", ""),
                     "author_id": author.get("id", ""),
                     "timestamp": msg.get("timestamp", ""),
-                    "content":   msg.get("content", ""),
+                    # 未同意者へのメンション(<@ID>)は送信前に伏せる
+                    "content":   consent.mask_content(msg.get("content", "")),
                 })
                 ch_count += 1
 
@@ -206,6 +216,10 @@ def fetch_day_logs(target_date: date_cls) -> list[dict]:
         print(f"[fetch] 取得期間 {all_messages[0]['timestamp'][:10]}〜{all_messages[-1]['timestamp'][:10]} "
               f"(対象日={target_date.isoformat()}) ← 対象日と一致しなければ日境界異常")
     print(f"[fetch] Final unique messages count: {len(all_messages)}")
+    if skipped_unagreed:
+        print(f"[fetch] 規約未同意により除外: {skipped_unagreed}件")
+    if consent.masked_mentions:
+        print(f"[fetch] 未同意者へのメンションを伏せ字化: {consent.masked_mentions}件（累計）")
     return all_messages
 
 def fetch_context_summaries(col, target_date: date_cls, days: int) -> str:

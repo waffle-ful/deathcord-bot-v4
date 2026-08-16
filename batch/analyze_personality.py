@@ -29,6 +29,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from consent_util import get_consent_filter  # 規約未同意者を分析母集団から外す
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
@@ -397,7 +398,8 @@ def compute_cohort_percentiles(users_col) -> int:
     返り値は pct を更新した人数。"""
     docs = list(users_col.find(
         {"profile.behavior_signals.raw": {"$exists": True},
-         "personality_optout": {"$ne": True}},  # オプトアウト者は母集団からも除外
+         "personality_optout": {"$ne": True},   # オプトアウト者は母集団からも除外
+         **get_consent_filter().mongo_filter()},  # 規約未同意者も同様
         {"profile.behavior_signals.raw": 1},
     ))
     if len(docs) < MIN_COHORT:
@@ -617,11 +619,15 @@ def safe_merge(existing: dict, tone: dict | None, context: dict | None,
 def select_targets(users_col, now: datetime) -> list[dict]:
     """分析対象を選ぶ。メイドと活発に話した人(conv_count)を最優先し、
     残り枠を「まだ/久しく分析していない一般チャット民」でローテーション補充する。
-    メイドと話さない人もmessagesログから診断できるようにするのが狙い。"""
+    メイドと話さない人もmessagesログから診断できるようにするのが狙い。
+
+    規約未同意者は母集団から外す。ゲート有効化後は新規発言が記録されないが、
+    過去に溜まった messages を毎晩 LLM へ送り続けないための措置。"""
     all_users = list(users_col.find({
         "xp":                 {"$gt": 0},
         "name":               {"$exists": True},
         "personality_optout": {"$ne": True},
+        **get_consent_filter().mongo_filter(),
     }))
     maid_fresh = [d for d in all_users if d.get("conv_count", 0) >= MIN_CONV_COUNT]
     maid_ids   = {d["_id"] for d in maid_fresh}

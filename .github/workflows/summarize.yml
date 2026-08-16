@@ -30,6 +30,9 @@ jobs:
           DISCORD_GUILD_ID:     ${{ secrets.DISCORD_GUILD_ID }}
           DISCORD_CHANNEL_IDS:  ${{ secrets.DISCORD_CHANNEL_IDS }}
           EXCLUDE_CHANNEL_IDS:  ${{ secrets.EXCLUDE_CHANNEL_IDS }}
+          # 規約同意ゲートの判定に必須（consent_util）。未設定だと fetch は
+          # 「未同意者を弾けない」と判断して中止する（fail-closed）。
+          MONGODB_URI:          ${{ secrets.MONGODB_URI }}
         run: python batch/fetch_discord_logs.py
 
       - name: Summarize

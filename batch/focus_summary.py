@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types
 
 from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
+from consent_util import get_consent_filter  # 規約未同意ユーザーの発言をLLMへ送らない
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
 from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
 
@@ -257,6 +258,11 @@ def is_excluded(channel: dict) -> bool:
 
 
 def fetch_logs(days: int) -> list[dict]:
+    # 規約同意ゲート: REST 直読みは main.py の on_message ガードを通らないので、ここで弾く。
+    # 未同意なら判定不能時も含め送らない側へ倒す（consent_util は fail-closed）。
+    consent          = get_consent_filter()
+    skipped_unagreed = 0
+
     after_dt     = datetime.now(timezone.utc) - timedelta(days=days)
     after_sf     = _datetime_to_snowflake(after_dt)
     TEXT_TYPES   = {0, 5}
@@ -302,12 +308,16 @@ def fetch_logs(days: int) -> list[dict]:
                 author = msg.get("author", {})
                 if author.get("bot") or msg.get("webhook_id"):
                     continue
+                if not consent.allows(author.get("id")):
+                    skipped_unagreed += 1
+                    continue
                 msgs.append({
                     "channel":   ch_name,
                     "author":    author.get("global_name") or author.get("username", ""),
                     "author_id": author.get("id", ""),
                     "timestamp": msg.get("timestamp", ""),
-                    "content":   msg.get("content", ""),
+                    # 未同意者へのメンション(<@ID>)は送信前に伏せる
+                    "content":   consent.mask_content(msg.get("content", "")),
                 })
             last_id = int(batch[-1]["id"])
             if len(batch) < 100:
@@ -317,6 +327,10 @@ def fetch_logs(days: int) -> list[dict]:
 
     msgs.sort(key=lambda m: m["timestamp"])
     print(f"[fetch] {len(msgs)} messages")
+    if skipped_unagreed:
+        print(f"[fetch] 規約未同意により除外: {skipped_unagreed}件")
+    if consent.masked_mentions:
+        print(f"[fetch] 未同意者へのメンションを伏せ字化: {consent.masked_mentions}件")
     return msgs
 
 

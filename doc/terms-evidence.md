@@ -25,7 +25,7 @@
 | 監査ログを参照する | `main.py:3093`, `main.py:3100`, `main.py:3262`（`view_audit_log` / `audit_logs()`） |
 | `/focus`・`/retroreport` は30日超の履歴をDiscordから再取得 | `batch/focus_summary.py:469-483`（lookback日数分をチャンク取得）、`batch/retro_summarize.py:116` |
 | `/privacy` は性格推定を停止する | `main.py:4563-4575`（`personality_optout` を書く）。尊重側：`batch/analyze_personality.py:624`, `batch/analyze_nonbooster.py:210`, `batch/enrich_memories.py:71`, `batch/focus_summary.py:650` |
-| `/privacy` でも日報・mimicは止まらない | `mimic_cmd`（`main.py:4762-4816`）と `_build_mimic_utterances`（`main.py:619-634`）に `personality_optout` チェックが無い。要約系（`batch/summarize.py`）も全発言が対象 |
+| `/privacy` でも日報・mimicは止まらない | `mimic_cmd`（`main.py:4762-4816`）と `_build_mimic_utterances`（`main.py:619-634`）に `personality_optout` チェックが無い。要約系も `personality_optout` は見ない（※未同意者の除外は 2026-08-16 に `consent_util` で別途実装。`/privacy` 由来の除外は依然として未対応） |
 | `/相性` は公開表示・第三者2人を指定可 | `main.py:4451-4506`（`followup.send(embed=embed)` に `ephemeral` 指定なし。引数 `member`/`member2` で他人同士を指定できる） |
 | `/mimic` は本人の実発言を材料に、本人の名前とアイコンで代弁 | `main.py:600-634`（`messages_col` から直近12件＋`butler_history`＋`claims`）、`main.py:4793-4807`（`ephemeral=False`／`avatar_url`）、`main.py:4810-4816`（`mimic_log` 記録） |
 | `/myprofile`・`/clearmaid` | `main.py:4173-4175`（ephemeral）、`main.py:4578-4589` |
@@ -41,8 +41,40 @@
 |---|---|
 | 設定・同意済みリスト（in-memory）・fail-closed 読込 | `_load_tos_gate` / `_tos_gate` / `_tos_agreed_ids` |
 | 同意パネル（永続View） | `TosConsentView`（`tos:agree` / `tos:decline`）。`setup_hook` で `add_view` 登録 |
-| 記録ガード（二重の保険） | `on_message` 内、`messages` insert の直前。未同意なら `return`（XP・AI応答・要約からも自動的に外れる） |
+| 判定ヘルパー | `tos_allows(user_id)`。ゲート無効時は常に True。**記録も LLM 送信も、未同意者を扱う全箇所はこれを通す** |
+| 記録ガード（二重の保険） | `on_message` 内、`messages` insert の直前。未同意なら `return`（XP・AI応答・`messages` への記録から外れる） |
+| **会話文脈ガード** | `_maid_respond_inner`（メイド応答のたびに `channel.history(limit=12)` を読む）と `_recent_channel_text`（弁護・レスバ文脈）。未同意者の行をプロンプトに載せない |
+| **`/mimic` ガード** | `mimic_cmd`。未同意者は物真似の対象にできない（過去の `messages` を LLM へ送らないため） |
+| **バッチ側フィルタ** | `batch/consent_util.py`（2026-08-16 追加）。要約系は Discord REST 直読みで記録ガードを通らないため、こちらで別途除外する |
 | コマンド | `/規約ゲート設定` `/規約ロック`(dry_run既定True) `/規約ロック解除` `/規約ゲート状態` `/規約同意付与` |
+
+### バッチ側フィルタ（`batch/consent_util.py`）
+
+**発見の経緯**：`on_message` の記録ガードは `messages` コレクションしか塞がない。日報・`/focus`・`/retroreport` は **Discord REST API から生ログを直接読む**ため、未同意者の発言がそのまま Gemini（無料枠＝学習利用あり）へ送られ `summaries` に永久保存されていた。実装当初のコメント「要約からも自動的に外れる」は**事実誤認**だった（2026-08-16 に修正）。
+
+| 適用先 | 箇所 | 効果 |
+|---|---|---|
+| 日報（4時間ごと） | `batch/fetch_discord_logs.py:main` + author ループ | 未同意者の発言を logs.json に入れない |
+| `/focus` | `batch/focus_summary.py:fetch_logs` | 同上 |
+| `/retroreport`・backfill | `batch/retro_summarize.py:fetch_day_logs` | 同上（`retro_backfill.py` は同関数を経由） |
+| 性格分析 | `batch/analyze_personality.py:select_targets` / `compute_cohort_percentiles` | 未同意者を母集団から除外 |
+| 非ブースター分析 | `batch/analyze_nonbooster.py:main` | 同上 |
+| 記憶・主張の抽出 | `batch/enrich_memories.py:select_targets` | 同上 |
+
+- **真実の所在**：規約バージョンは `system._id="tos_gate"` の `version` を読む（`TOS_VERSION` を batch にハードコードしない）。ゲートの `enabled` もこのdocから取る。★`main.py` の `TOS_VERSION` を上げても、`_save_tos_gate()` が再実行されるまで doc 側は古い版のまま。**改定時は必ず `/規約ゲート設定` 等を叩き直す**こと。
+- **fail-closed**：`MONGODB_URI` 未設定・接続失敗・クエリ失敗はすべて `SystemExit(1)`＝その回の要約を中止する。判定できないなら送らない側に倒す。ゲートが `enabled=False`（未導入）のときだけ従来どおり全員を対象にする。
+- **env 配管**：`summarize.yml` の Fetch ステップに `MONGODB_URI` を追加済み。他の workflow（focus / retro / daily_tasks）は元から設定済み。
+- 除外件数は `[fetch] 規約未同意により除外: N件` としてログに出る（Actions のログで効いているか確認できる）。
+
+**未同意者へのメンションのマスキング（`ConsentFilter.mask_content`）**
+
+同意済みユーザーの発言に含まれる `<@未同意者ID>` を、LLM へ送る前に `[非公開ユーザー]` へ置換する。REST 取得3本の `content` に適用（`[fetch] 未同意者へのメンションを伏せ字化: N件`）。
+
+- **他人の発言そのものは消さない**。A の発言は A のものであり、B のために消すのは A の発言の検閲になる。消すのは B の ID だけ。
+- ID は一意なので**誤爆ゼロ**。`<@!123>` 形式も対象。ロール `<@&123>` / チャンネル `<#123>` / 絵文字 `<:name:123>` はマッチしない。
+- ★**表示名・ニックネームには手を出さない**（意図的な設計）。`nickname_map` に無い愛称は拾えず網羅できないうえ、一般名詞と同じ名前で誤爆して要約が壊れる。中途半端に効く対策は「効いているつもり」を作るぶん有害。
+- **限界**：これは完全な対策ではない。「他人の発言に含まれる第三者への言及」は原理的に防げず（防ぐには発言者側を検閲することになる）、同意ゲートは「自分の発言」の同意であって「自分について語られること」の同意ではない。この限界は**未同意者だけでなく同意済みメンバーにも等しく当てはまる**。規約 §6 に明記済み。
+- **根本的な緩和策は課金 Tier1 への移行**（下記「未解決」1）。学習利用・人間レビューの前提が消えれば、この問題の危険度そのものが一段下がる。
 
 **設計上の要点**
 - **allow-list 方式**：`@everyone` から送信系を deny し、`同意済み`ロールにだけ allow。既定が「喋れない」なので **botが落ちていても未同意者が素通りしない**。逆方式（未同意ロールを全員に配る）は、付与漏れで fail-open になるうえ、role overwrite が「全deny→全allow」の順で解決される仕様上、他ロールの明示 allow に負ける

@@ -12,6 +12,12 @@ Discordの過去 HOURS_BACK 時間分（既定5時間）のログをREST APIで�
 - 全テキストチャンネル + アクティブスレッド
 - NSFWチャンネルを除外
 - EXCLUDE_CHANNEL_IDS で個別除外も可能
+- 規約同意ゲートが有効なら、未同意ユーザーの発言を除外（consent_util）
+
+【重要2】
+このスクリプトは Discord REST から生ログを直接読むため、main.py の on_message 側の
+同意ガード（messages コレクションへの記録を止めるだけ）を素通りする。
+未同意者の発言を Gemini（無料枠 = 学習利用あり）へ送らないため、ここでも必ずフィルタする。
 """
 
 import os
@@ -20,6 +26,8 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import requests
+
+from consent_util import get_consent_filter
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_GUILD_ID  = os.environ["DISCORD_GUILD_ID"]
@@ -186,6 +194,11 @@ def datetime_to_snowflake(dt: datetime) -> int:
 
 def main():
     print(f"[fetch] Starting REST API fetch (no Gateway connection)")
+
+    # 規約同意ゲート: 未同意者の発言は要約（＝Geminiへの送信）の対象外にする。
+    # 判定できない場合はここで SystemExit(1) して要約自体を中止する（fail-closed）。
+    consent = get_consent_filter()
+
     after_dt        = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     after_snowflake = datetime_to_snowflake(after_dt)
 
@@ -198,6 +211,7 @@ def main():
     print(f"[fetch] Target channels: {len(targets)}")
 
     all_messages = []
+    skipped_unagreed = 0
     for ch in targets:
         ch_id   = int(ch["id"])
         ch_name = ch.get("name", str(ch_id))
@@ -214,13 +228,18 @@ def main():
             # Webhookメッセージを除外
             if msg.get("webhook_id"):
                 continue
+            # 規約に同意していないユーザーの発言は除外（LLMへ送らない）
+            if not consent.allows(author.get("id")):
+                skipped_unagreed += 1
+                continue
 
             all_messages.append({
                 "channel":   ch_name,
                 "author":    author.get("global_name") or author.get("username", ""),
                 "author_id": author.get("id", ""),
                 "timestamp": msg.get("timestamp", ""),
-                "content":   msg.get("content", ""),
+                # 未同意者へのメンション(<@ID>)は送信前に伏せる
+                "content":   consent.mask_content(msg.get("content", "")),
             })
 
         time.sleep(0.2)  # チャンネル間のレート制限対策
@@ -229,6 +248,10 @@ def main():
     all_messages.sort(key=lambda m: m["timestamp"])
 
     print(f"[fetch] Total messages: {len(all_messages)}")
+    if skipped_unagreed:
+        print(f"[fetch] 規約未同意により除外: {skipped_unagreed}件")
+    if consent.masked_mentions:
+        print(f"[fetch] 未同意者へのメンションを伏せ字化: {consent.masked_mentions}件")
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(

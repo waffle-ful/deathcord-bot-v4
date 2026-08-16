@@ -24,6 +24,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from consent_util import get_consent_filter  # 規約未同意者を抽出対象から外す
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
@@ -64,11 +65,13 @@ def needs_rotation(doc: dict, now: datetime, days: int) -> bool:
 
 
 def select_targets(users_col, now: datetime) -> list:
-    """メイド会話者(conv_count≥MIN_CONV_COUNT)を最優先し、残りをローテーション補充。"""
+    """メイド会話者(conv_count≥MIN_CONV_COUNT)を最優先し、残りをローテーション補充。
+    規約未同意者は対象外（過去の要約から記憶・主張を作り続けない）。"""
     all_users = list(users_col.find({
         "xp":                 {"$gt": 0},
         "name":               {"$exists": True},
         "personality_optout": {"$ne": True},
+        **get_consent_filter().mongo_filter(),
     }))
     maid_fresh = [d for d in all_users if d.get("conv_count", 0) >= MIN_CONV_COUNT]
     maid_ids   = {d["_id"] for d in maid_fresh}

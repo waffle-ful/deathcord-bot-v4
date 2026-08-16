@@ -24,6 +24,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from consent_util import get_consent_filter  # 規約未同意者を分析母集団から外す
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MONGODB_URI    = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")
@@ -208,6 +209,7 @@ def main():
         "name":               {"$exists": True},
         "xp":                 {"$gt": 0},
         "personality_optout": {"$ne": True},   # /privacy でオプトアウトした人は分析しない
+        **get_consent_filter().mongo_filter(), # 規約未同意者も分析しない
     }))
     print(f"[nonbooster] Target users: {len(targets)}")
     if not targets:
