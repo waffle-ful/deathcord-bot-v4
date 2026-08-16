@@ -1,10 +1,14 @@
-# Discord Bot (Render.com)
+# Discord Bot (Render.com) — main.py 専用。batch は requirements-batch.txt を見る
 discord.py==2.5.2
 motor==3.6.0
 pymongo==4.9.2
-flask==3.0.3
-google-genai>=1.10.0
 dnspython
-waitress
-
 aiohttp
+
+# flask / waitress は削除（2026-08-16）。ヘルスサーバーは discord.py 同梱の aiohttp で
+# 動いており、リポジトリ内のどこからも import されていなかった。
+
+# google-genai は「逃げ道」用に残す。既定では import しない（import しただけで
+# 実測 約60MB 常駐する。512MB枠では重すぎるため aiohttp 直RESTに置き換え済み）。
+# REST側に問題が出たら Render の env に GEMINI_USE_SDK=1 を足せば即座に旧SDK経路へ戻る。
+google-genai>=1.10.0

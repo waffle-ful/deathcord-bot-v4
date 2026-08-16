@@ -15,9 +15,12 @@ import array
 from operator import mul as _mul
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-# --- 新SDK (Context Caching対応) ---
-from google import genai
-from google.genai import types
+# MEM: google-genai SDK は「importしただけ」で約78MB常駐する（実測: SDK本体 +56MB /
+# httpx +12MB / pydantic +10MB。types.py が起動時に数千のpydanticモデルを構築するため）。
+# Render無料枠512MBの約15%をこれ1つが占めていた。このbotがSDKに求める機能は
+# generateContent / embedContent / models.list の3本だけなので、discord.py が既に依存して
+# いる aiohttp で REST を直接叩く薄いシム（下記 _gemini_* 群）に置き換えた＝追加依存ゼロ。
+# 逃げ道: env GEMINI_USE_SDK=1 で従来のSDK経路に戻る（遅延importなので、立てない限り78MBは払わない）。
 
 # --- Webサーバー (aiohttp: discord.pyの依存関係に含まれるため追加インストール不要) ---
 async def _health_handler(request):
@@ -134,8 +137,301 @@ INVINCIBLE_REPOST_WHEN_UNKNOWN = (
     os.environ.get("INVINCIBLE_REPOST_WHEN_UNKNOWN", "1").strip().lower()
     not in ("0", "false", "no", ""))
 
-# --- Gemini クライアント (新SDK) ---
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# =============================================================================
+# Gemini クライアント（aiohttp直REST。SDK非依存）
+# =============================================================================
+# 使う口は3つだけ:
+#   POST {base}/{model}:generateContent   … 会話・裏処理
+#   POST {base}/{model}:embedContent      … 記憶/日報の埋め込み
+#   GET  {base}/models                    … /listmodels・起動時の実在確認
+# 例外は必ず「"<code> <status>: <message>"」の文字列にする。_is_503 / _is_location_error /
+# _main の 429 判定はすべて str(e) の部分一致で動いているため、この形を崩すと
+# フォールバック連鎖が黙って壊れる（SDKの例外文字列と同じ情報を含む形に揃えてある）。
+GEMINI_USE_SDK = (os.environ.get("GEMINI_USE_SDK", "").strip().lower()
+                  in ("1", "true", "yes", "on"))
+GEMINI_API_BASE = (os.environ.get("GEMINI_API_BASE")
+                   or "https://generativelanguage.googleapis.com/v1beta")
+# aiohttpの既定タイムアウトは5分。1本の遅延がメイドキュー全体を止めるので明示的に短くする。
+GEMINI_HTTP_TIMEOUT = float(os.environ.get("GEMINI_HTTP_TIMEOUT") or 90)
+
+_gemini_session = None          # aiohttp.ClientSession（プロセスで1本を使い回す）
+_gemini_session_loop = None
+_gemini_sdk_client = None       # 逃げ道（GEMINI_USE_SDK=1）用の遅延生成SDKクライアント
+
+
+class GeminiAPIError(Exception):
+    """Gemini REST のエラー。str() は "429 RESOURCE_EXHAUSTED: ..." の形になる。"""
+    def __init__(self, code, status: str, message: str):
+        self.code    = code
+        self.status  = status or ""
+        self.message = message or ""
+        super().__init__(f"{code} {self.status}: {self.message}".strip())
+
+
+def _gemini_sdk():
+    """逃げ道: 本物のSDKクライアント。GEMINI_USE_SDK=1 のときだけ import する
+    （import 自体が約78MB なので、既定では絶対に触らせない）。"""
+    global _gemini_sdk_client
+    if _gemini_sdk_client is None:
+        from google import genai as _genai          # noqa: PLC0415  (遅延importは意図的)
+        _gemini_sdk_client = _genai.Client(api_key=GEMINI_API_KEY)
+        print("[gemini] SDK経路で動作中（GEMINI_USE_SDK=1）")
+    return _gemini_sdk_client
+
+
+async def _gemini_http():
+    """Gemini用の共有 aiohttp セッション。実行中のループに紐づけて遅延生成する。"""
+    global _gemini_session, _gemini_session_loop
+    import aiohttp
+    loop = asyncio.get_running_loop()
+    if (_gemini_session is None or _gemini_session.closed
+            or _gemini_session_loop is not loop):
+        _gemini_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=GEMINI_HTTP_TIMEOUT),
+            # 同時実行はメイドキュー1本＋裏処理程度。接続を絞ってバッファ常駐も抑える。
+            connector=aiohttp.TCPConnector(limit=8, ttl_dns_cache=300),
+        )
+        _gemini_session_loop = loop
+    return _gemini_session
+
+
+def _gemini_model_path(model: str) -> str:
+    """"models/xxx" でも "xxx" でも URL パスに使える形に正規化。"""
+    m = (model or "").strip().lstrip("/")
+    return m if m.startswith("models/") else f"models/{m}"
+
+
+async def _gemini_request(method: str, path: str, payload: dict | None = None,
+                          params: dict | None = None) -> dict:
+    if not GEMINI_API_KEY:
+        raise GeminiAPIError(0, "NO_API_KEY", "GEMINI_API_KEY が未設定")
+    sess = await _gemini_http()
+    url  = f"{GEMINI_API_BASE}/{path.lstrip('/')}"
+    # キーはURLではなくヘッダで送る（ログ/例外文にURLが出てもキーが漏れない）
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    async with sess.request(method, url, json=payload, params=params,
+                            headers=headers) as resp:
+        raw = await resp.text()
+        if resp.status >= 400:
+            code, status, msg = resp.status, "", raw[:400]
+            try:
+                err = ((json.loads(raw) or {}).get("error") or {})
+                code   = err.get("code") or resp.status
+                status = err.get("status") or ""
+                msg    = err.get("message") or msg
+            except Exception:
+                pass
+            raise GeminiAPIError(code, status, msg)
+        try:
+            return json.loads(raw) or {}
+        except Exception as e:
+            raise GeminiAPIError(resp.status, "BAD_JSON", f"{e}: {raw[:200]}")
+
+
+def _gemini_parse_text(data: dict) -> str:
+    """SDKの response.text 相当。先頭候補のパートを連結する。
+    thinking系が思考パート（thought:true）を返すことがあるので本文だけ拾う。"""
+    for cand in (data.get("candidates") or []):
+        parts = ((cand.get("content") or {}).get("parts") or [])
+        return "".join(p.get("text") or "" for p in parts if not p.get("thought"))
+    return ""
+
+
+async def _gemini_generate(model: str, prompt: str, max_tokens: int,
+                           temperature: float) -> dict:
+    """generateContent。返り値は {text, finish_reason, prompt_feedback, usage} に正規化。"""
+    if GEMINI_USE_SDK:
+        from google.genai import types as _types    # noqa: PLC0415
+        r = await asyncio.to_thread(
+            _gemini_sdk().models.generate_content,
+            model=model, contents=prompt,
+            config=_types.GenerateContentConfig(
+                temperature=temperature, max_output_tokens=max_tokens),
+        )
+        um = getattr(r, "usage_metadata", None)
+        try:
+            fr = r.candidates[0].finish_reason if r.candidates else None
+        except Exception:
+            fr = None
+        return {
+            "text": r.text or "",
+            "finish_reason": fr,
+            "prompt_feedback": getattr(r, "prompt_feedback", None),
+            "usage": {
+                "prompt":   getattr(um, "prompt_token_count", 0) or 0,
+                "thoughts": getattr(um, "thoughts_token_count", 0) or 0,
+                "answer":   getattr(um, "candidates_token_count", 0) or 0,
+                "total":    getattr(um, "total_token_count", 0) or 0,
+            } if um else None,
+        }
+    data = await _gemini_request(
+        "POST", f"{_gemini_model_path(model)}:generateContent",
+        {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature,
+                                 "maxOutputTokens": max_tokens},
+        },
+    )
+    um   = data.get("usageMetadata") or {}
+    cand = (data.get("candidates") or [{}])[0]
+    return {
+        "text": _gemini_parse_text(data),
+        "finish_reason": cand.get("finishReason"),
+        "prompt_feedback": data.get("promptFeedback"),
+        "usage": {
+            "prompt":   um.get("promptTokenCount") or 0,
+            "thoughts": um.get("thoughtsTokenCount") or 0,
+            "answer":   um.get("candidatesTokenCount") or 0,
+            "total":    um.get("totalTokenCount") or 0,
+        } if um else None,
+    }
+
+
+async def _gemini_embed(model: str, text: str, task_type: str | None = None,
+                        output_dim: int | None = None) -> list[float] | None:
+    """embedContent。task_type/output_dim を渡すか渡さないかで別の埋め込み空間になるため、
+    呼び出し側の指定をそのまま透過させる（勝手に既定値を足さないこと）。"""
+    if GEMINI_USE_SDK:
+        from google.genai import types as _types    # noqa: PLC0415
+        cfg = None
+        if task_type or output_dim:
+            cfg = _types.EmbedContentConfig(task_type=task_type,
+                                            output_dimensionality=output_dim)
+        r = await asyncio.to_thread(_gemini_sdk().models.embed_content,
+                                    model=model, contents=text, config=cfg)
+        if getattr(r, "embeddings", None):
+            return list(r.embeddings[0].values)
+        if getattr(r, "embedding", None):
+            return list(r.embedding.values)
+        return None
+    payload: dict = {"content": {"parts": [{"text": text}]}}
+    if task_type:
+        payload["taskType"] = task_type
+    if output_dim:
+        payload["outputDimensionality"] = output_dim
+    data = await _gemini_request(
+        "POST", f"{_gemini_model_path(model)}:embedContent", payload)
+    emb = data.get("embedding") or {}
+    vals = emb.get("values")
+    if vals:
+        return vals
+    # 複数形フォールバック（将来のAPI形状変更・batchEmbed互換用）
+    embs = data.get("embeddings") or []
+    if embs and embs[0].get("values"):
+        return embs[0]["values"]
+    return None
+
+
+async def _gemini_list_models(max_pages: int = 5) -> list[str]:
+    """利用可能なモデル名一覧。ページングは上限つき（無限ループ禁止）。"""
+    if GEMINI_USE_SDK:
+        return await asyncio.to_thread(
+            lambda: [m.name for m in _gemini_sdk().models.list() if getattr(m, "name", None)])
+    names, token = [], None
+    for _ in range(max_pages):
+        params = {"pageSize": "200"}
+        if token:
+            params["pageToken"] = token
+        data = await _gemini_request("GET", "models", params=params)
+        for m in (data.get("models") or []):
+            if m.get("name"):
+                names.append(m["name"])
+        token = data.get("nextPageToken")
+        if not token:
+            break
+    return names
+
+
+# =============================================================================
+# メモリ監視（Render無料枠は512MB。超えると強制再起動される）
+# =============================================================================
+# 「たまに上限を超える」は瞬間ピークの問題で、平均値を見ていても捕まらない。
+# VmRSS（今）と VmHWM（プロセス生涯の最高値）の両方を出すことで、サンプル間で
+# 起きたスパイクも事後に検出できるようにする。常駐dictの件数も一緒に出して、
+# 「増え続けているのはどれか」をログだけで切り分けられるようにしてある。
+MEM_WATCH_INTERVAL = int(os.environ.get("MEM_WATCH_INTERVAL") or 300)   # 秒。0で無効
+MEM_WARN_MB        = float(os.environ.get("MEM_WARN_MB") or 380)        # 超えたら回収＋警告
+
+_malloc_trim_fn = None      # None=未初期化 / False=使用不可 / callable=使える
+
+
+def _read_rss_mb() -> tuple[float, float] | None:
+    """(現在RSS, 生涯ピークRSS) をMBで返す。Linux(/proc)以外は None。"""
+    try:
+        rss = hwm = 0.0
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = float(line.split()[1]) / 1024
+                elif line.startswith("VmHWM:"):
+                    hwm = float(line.split()[1]) / 1024
+        return (rss, hwm) if rss else None
+    except Exception:
+        return None
+
+
+def _malloc_trim() -> None:
+    """glibcが抱えたままのfree済みヒープをOSへ返す。
+
+    MEM: CPythonがオブジェクトを解放しても、arena（glibcのヒープ）はプロセスに
+    残り続ける＝RSSは下がらない。日報キャッシュ更新(12MB級)や記憶検索(4MB級)の
+    ような大きな一時確保を繰り返すとRSSが片道で上がっていき、数日かけて上限に
+    届く。malloc_trim(0) はこの「返し忘れ」を明示的に回収する。glibc以外（musl等）
+    では単に失敗するので、一度失敗したら以後呼ばない。"""
+    global _malloc_trim_fn
+    if _malloc_trim_fn is False:
+        return
+    try:
+        if _malloc_trim_fn is None:
+            import ctypes                                    # noqa: PLC0415
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype  = ctypes.c_int
+            _malloc_trim_fn = libc.malloc_trim
+        _malloc_trim_fn(0)
+    except Exception as e:
+        print(f"[mem] malloc_trim 使用不可（以後スキップ）: {type(e).__name__}: {e}")
+        _malloc_trim_fn = False
+
+
+def _mem_cache_sizes() -> str:
+    """常駐コンテナの件数。増え続けるものがあればここに出る。"""
+    try:
+        return (f"summary={len(_summary_embed_cache)} "
+                f"maidmsg={len(_maid_msg_cache)} inv={len(_invincible_msg_cache)} "
+                f"bump={len(_processed_bump_ids)} tos={len(_tos_agreed_ids)} "
+                f"invite={len(_invite_snapshot)} rate={len(_rate_timestamps)} "
+                f"mimic={len(_mimic_sessions)} resuba={len(_resuba_sessions)}")
+    except Exception:
+        return "n/a"
+
+
+async def _mem_watch_task():
+    """定期的にRSSを記録し、閾値超えならGC＋malloc_trimで回収を試みる。"""
+    if MEM_WATCH_INTERVAL <= 0:
+        return
+    if _read_rss_mb() is None:
+        print("[mem] /proc が読めないためメモリ監視は無効（Linux以外）")
+        return
+    await asyncio.sleep(30)   # 起動直後の重い初期化が落ち着いてから
+    while True:
+        try:
+            cur = _read_rss_mb()
+            if cur:
+                rss, hwm = cur
+                if rss >= MEM_WARN_MB:
+                    # 上限に近い＝ここで回収しないと再起動される。世代2まで回して返す。
+                    gc.collect()
+                    _malloc_trim()
+                    after = _read_rss_mb()
+                    print(f"[mem] ⚠ rss={rss:.0f}MB hwm={hwm:.0f}MB → 回収後 "
+                          f"{(after[0] if after else rss):.0f}MB | {_mem_cache_sizes()}")
+                else:
+                    _malloc_trim()   # 平時も返し忘れだけは毎回回収（GCは回さない＝CPU影響なし）
+                    print(f"[mem] rss={rss:.0f}MB hwm={hwm:.0f}MB | {_mem_cache_sizes()}")
+        except Exception as e:
+            print(f"[mem] 監視エラー: {type(e).__name__}: {e}")
+        await asyncio.sleep(MEM_WATCH_INTERVAL)
 
 # モデル名 (実際に動作確認済みのもの)
 MODEL_BOOSTER        = "models/gemini-3.1-flash-lite"          # メイン (会話用・高速)
@@ -746,15 +1042,9 @@ async def _get_embedding(text: str) -> list[float] | None:
     embedding 側クォータ(数十〜数百RPM)はホームギルドの会話量では余裕がある。
     """
     try:
-        resp = await asyncio.to_thread(
-            gemini_client.models.embed_content,
-            model="models/gemini-embedding-001",
-            contents=text[:500],
-        )
-        if hasattr(resp, "embeddings") and resp.embeddings:
-            return resp.embeddings[0].values
-        if hasattr(resp, "embedding"):
-            return resp.embedding.values
+        # ★task_type / output_dimensionality を「渡さない」のが仕様（既定次元）。
+        #   summaries 用の _embed_query_for_summaries とは別空間なので混ぜてはいけない。
+        return await _gemini_embed("models/gemini-embedding-001", text[:500])
     except Exception as e:
         print(f"[WARN] embedding: {e}")
     return None
@@ -857,6 +1147,15 @@ def _dot(a, b) -> float:
     return sum(map(_mul, a, b))
 
 
+def _unit_list(v) -> list[float]:
+    """L2正規化した list[float]（float64のまま＝_cosine と同じ精度）を返す。
+
+    常駐キャッシュ用の `_norm_vec`（array('f')・省メモリ優先）とは用途が別。
+    こちらは1回きりのクエリ用で、以後 `sum(map(_mul, ...))` でC側採点するための下ごしらえ。"""
+    n = math.sqrt(sum(map(_mul, v, v)))
+    return list(v) if n == 0.0 else [x / n for x in v]
+
+
 # コサイン類似度の採用閾値（gemini-embedding-001。ログの best= を見て要調整）
 # 低くするほど積極的に記憶を想起（ノイズも増える）。high=厳選。
 MEMORY_SIM_THRESHOLD = 0.65
@@ -891,13 +1190,21 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     threshold = MEMORY_SIM_THRESHOLD
     if any(w in query for w in MEMORY_TRIGGER_WORDS):
         threshold -= 0.10  # 明示的に思い出させる意図 → より積極的に想起
+    # MEM/CPU: 採点をC側に落とす。クエリを一度だけ単位ベクトル化しておけば
+    # cosine = 内積 / |emb| で求まり、記憶40件×3072次元の純Pythonループ（毎返信12万回）が
+    # sum(map(mul, ...)) 2本に置き換わる。ループ内で一時floatを積まないぶんGC負荷も減る。
+    # float64のまま計算するので _cosine と数値は一致する（下の閾値は据え置きで安全）。
+    qn = _unit_list(qvec)
     scored = []
     for m in memories:
         emb = m.get("embedding")
-        # 次元不一致（旧モデル由来の記憶等）は安全にスキップ
-        if not emb or len(emb) != len(qvec):
+        # 次元不一致（旧モデル由来の記憶等）・ゼロベクトルは安全にスキップ
+        if not emb or len(emb) != len(qn):
             continue
-        scored.append((_cosine(qvec, emb), m))
+        nb = math.sqrt(sum(map(_mul, emb, emb)))
+        if nb == 0.0:
+            continue
+        scored.append((sum(map(_mul, qn, emb)) / nb, m))
     scored.sort(key=lambda t: t[0], reverse=True)
     best     = scored[0][0] if scored else 0.0
     relevant = [m for sc, m in scored if sc >= threshold][:top_k]
@@ -919,19 +1226,10 @@ async def _embed_query_for_summaries(text: str) -> list[float] | None:
       なので【流用してはいけない】。embed は generateContent と別クォータなので _rate_record しない。
     """
     try:
-        resp = await asyncio.to_thread(
-            gemini_client.models.embed_content,
-            model="models/gemini-embedding-001",
-            contents=(text or "")[:1500],
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=3072,
-            ),
+        return await _gemini_embed(
+            "models/gemini-embedding-001", (text or "")[:1500],
+            task_type="RETRIEVAL_QUERY", output_dim=3072,
         )
-        if getattr(resp, "embeddings", None):
-            return list(resp.embeddings[0].values)
-        if getattr(resp, "embedding", None):       # 旧形状フォールバック
-            return list(resp.embedding.values)
     except Exception as e:
         print(f"[WARN] summary query embedding: {e}")
     return None
@@ -943,14 +1241,21 @@ SUMMARY_SIM_THRESHOLD = float(os.environ.get("SUMMARY_SIM_THRESHOLD", "0.45"))
 # この embedding 空間は全docが高cosineに密集し絶対閾値が選別にならない（実測: 全969件が0.45超）。
 # そこで意味採用は「best からこの差以内」の相対gapを併用＝際立って似たdocだけ拾う。env調整可。
 SUMMARY_SEM_REL_GAP   = float(os.environ.get("SUMMARY_SEM_REL_GAP", "0.05"))
-# 1回の検索で読む summaries の上限（現状 ~970 件。将来大幅に増えたらキャッシュ/索引へ移行）。
-SUMMARY_SCAN_LIMIT    = 3000
+# プロセス内に常駐させる summaries の上限（2026-08-16実測で1242件・約19MB）。
+# 日報は2hに1本増えるので年+4400件。上限に当たると古い方から想起対象外になる。
+SUMMARY_SCAN_LIMIT    = int(os.environ.get("SUMMARY_SCAN_LIMIT") or 3000)
 # トリガー語が無くても、際立って強い意味一致ならRAG発火（自然な想起質問を拾う）。
 # 空間が密集し baseline~0.45 なので、それより明確に高いこの値を「際立った一致」の目安に。ログの best= で調整。
 SUMMARY_STANDOUT_THRESHOLD = float(os.environ.get("SUMMARY_STANDOUT_THRESHOLD", "0.62"))
 # summaries の embedding を毎回970件Mongoから読むのは重い（M0で~12MB/回）。プロセス内にキャッシュし
 # TTLで更新（日報は4h毎更新なので30分キャッシュで十分新鮮）。gate撤廃で毎応答検索しても安いようにする。
 _SUMMARY_CACHE_TTL_SEC = 1800
+# 全件読み直しの間隔。差分更新では拾えない変化（古いdocへのembedding後付け＝
+# embed_summaries.py / retro_backfill.py、docの削除）を定期的に取り込むための保険。
+_SUMMARY_FULL_RELOAD_SEC = int(os.environ.get("SUMMARY_FULL_RELOAD_SEC") or 6 * 3600)
+# キャッシュ対象の条件（差分判定でも同じ条件を使うこと）
+_SUMMARY_FILTER = {"embedding": {"$exists": True, "$ne": []}}
+_SUMMARY_PROJ   = {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1}
 
 # 過去日報検索の発火トリガー。memories(個人記憶)用とは別系統にし、サーバーの歴史・過去メンバー
 # 想起に寄せて拡張（dense embedding は固有名詞に弱いので、人の出入り系の語で確実に発火させる）。
@@ -1050,46 +1355,100 @@ def _date_prefix_hit(doc: dict, prefixes: list[str]) -> bool:
     return False
 
 
-_summary_embed_cache: list[dict] = []
-_summary_embed_cache_at = None
+_summary_embed_cache: list[dict] = []      # created_at 降順（先頭が最新）
+_summary_embed_cache_at = None             # 最後に鮮度確認した時刻
+_summary_embed_full_at  = None             # 最後に全件読み直した時刻
+
+
+def _summary_absorb(d: dict) -> dict:
+    """Mongoの生doc（embedding=list[float]）をキャッシュ用の軽量docへ畳む。
+    生の list[float] は呼び出し直後に回収されるので、常駐するのは array('f') だけ。"""
+    d["embedding"] = _norm_vec(d["embedding"])
+    return d
 
 
 async def _load_summary_docs() -> list[dict]:
-    """embedding付き summaries をプロセス内キャッシュから返す（TTL切れ時のみMongo再読込）。
+    """embedding付き summaries をプロセス内キャッシュから返す。
 
-    MEM: 旧実装は to_list() で全970件の生docを一度に materialize していた。生docの
-    embedding は list[float]（32B/要素）なので約92MBあり、しかも更新時は「新リストを
-    作り終えるまで旧キャッシュも保持」＝瞬間ピーク約185MB。Renderのメモリ上限超過→
-    自動再起動の主因がこれ。今は cursor を1件ずつ流しながら即 array('f') に畳むため、
-    常駐は約12MB・更新時ピークもその程度に収まる（生docはループ内で都度回収される）。
+    MEM(1): 旧々実装は to_list() で全件の生docを一度に materialize していた。生docの
+    embedding は list[float]（32B/要素）なので約92MBあり、更新時は旧キャッシュも同時に
+    保持＝瞬間ピーク約185MB。今は cursor を1件ずつ流して即 array('f') に畳むので
+    常駐は約19MB（1242件・2026-08-16実測）。
+
+    MEM(2): それでも「全件読み直し」自体が高い。1242件のBSONデコードは float オブジェクトを
+    380万個作って捨てる処理で、実測で RSS が1回の再読込につき +59MB／2回目でさらに +28MB
+    押し上がった（アロケータの断片化。中身は19MBしかない）。30分TTLで1日48回これをやれば
+    512MB枠に届くのは当然で、これが「たまにメモリ上限を超える」の正体。
+    そこで通常は**差分だけ**取り込む: 件数が変わっていなければ1バイトも転送せず、
+    増えていれば増えた分だけ取って先頭に足す。全件読み直しは6時間に1回の保険に落とす
+    （古いdocへのembedding後付け＝embed_summaries.py/retro_backfill.py や削除の取り込み用）。
     """
-    global _summary_embed_cache, _summary_embed_cache_at
+    global _summary_embed_cache, _summary_embed_cache_at, _summary_embed_full_at
     now = datetime.datetime.now(datetime.timezone.utc)
     if (_summary_embed_cache and _summary_embed_cache_at
             and (now - _summary_embed_cache_at).total_seconds() < _SUMMARY_CACHE_TTL_SEC):
         return _summary_embed_cache
+
     try:
-        cursor = summaries_col.find(
-            {"embedding": {"$exists": True, "$ne": []}},
-            {"summary": 1, "embedding": 1, "created_at": 1, "retro_date": 1},
-        )
+        need_full = (not _summary_embed_cache or not _summary_embed_full_at
+                     or (now - _summary_embed_full_at).total_seconds() >= _SUMMARY_FULL_RELOAD_SEC)
+
+        # ---- 差分更新（通常はこちら。ほとんどの回は転送ゼロで終わる）----
+        if not need_full:
+            cached = len(_summary_embed_cache)
+            total  = await summaries_col.count_documents(_SUMMARY_FILTER)
+            if total == cached:
+                _summary_embed_cache_at = now      # 変化なし＝読み直さない
+                return _summary_embed_cache
+            newest = _summary_embed_cache[0].get("created_at")
+            if total > cached and newest and cached < SUMMARY_SCAN_LIMIT:
+                added = []
+                cursor = summaries_col.find(
+                    {**_SUMMARY_FILTER, "created_at": {"$gt": newest}}, _SUMMARY_PROJ,
+                ).sort("created_at", -1).limit(total - cached)
+                async for d in cursor:
+                    if d.get("embedding"):
+                        added.append(_summary_absorb(d))
+                if len(added) == total - cached:
+                    # 増分が全部「最新より新しいdoc」で説明できた＝追記のみ。差分で確定。
+                    _summary_embed_cache    = (added + _summary_embed_cache)[:SUMMARY_SCAN_LIMIT]
+                    _summary_embed_cache_at = now
+                    print(f"[summary] 差分取り込み: +{len(added)}件 → {len(_summary_embed_cache)}件")
+                    return _summary_embed_cache
+                # 説明できない差分＝古いdocへの後付け等。全件読み直しへ落とす。
+            need_full = True
+
+        # ---- 全件読み直し（初回・6時間ごと・差分で説明できない変化があった時）----
+        # 新しい順に取る。旧実装は natural order（≒挿入順）だったため、日報が
+        # SUMMARY_SCAN_LIMIT を超えて増えた時点で「古い方を上限まで積んで打ち切り」＝
+        # 最近の日報がキャッシュから丸ごと落ちる。打ち切るなら古い方から捨てる。
+        # created_at の降順インデックスに乗るので追加コストは無い。
+        cursor = summaries_col.find(_SUMMARY_FILTER, _SUMMARY_PROJ) \
+                              .sort("created_at", -1).limit(SUMMARY_SCAN_LIMIT)
         compact: list[dict] = []
         async for d in cursor:
-            emb = d.get("embedding")
-            if not emb:
+            if not d.get("embedding"):
                 continue
-            # 生の list[float] はこの1件分だけ生存し、次のループで回収される
-            d["embedding"] = _norm_vec(emb)
-            compact.append(d)
-            if len(compact) >= SUMMARY_SCAN_LIMIT:
-                break
+            compact.append(_summary_absorb(d))
         _summary_embed_cache    = compact
         _summary_embed_cache_at = now
-        # 旧キャッシュと取り込み中のBSONゴミをこの場で回収（30分に1回だけなので安い）
+        _summary_embed_full_at  = now
+        # 旧キャッシュと取り込み中のBSONゴミをこの場で回収。gc.collect() だけでは
+        # Python側で解放されるだけでRSSは下がらないので、glibcのarenaもOSへ返す
+        # （この関数が全処理中で最大の一時確保をする）。
         gc.collect()
-        print(f"[summary] embeddingキャッシュ更新: {len(compact)}件")
+        _malloc_trim()
+        # 1件あたり約16KB常駐（embedding 12KB＋本文4KB）。件数を出しておけば
+        # 「いつRAMが足りなくなるか」をログだけで見積もれる。
+        print(f"[summary] embeddingキャッシュ全件更新: {len(compact)}件 "
+              f"(約{len(compact) * 16 / 1024:.0f}MB)")
+        if len(compact) >= SUMMARY_SCAN_LIMIT:
+            print(f"[summary] ⚠ 上限{SUMMARY_SCAN_LIMIT}件で打ち切り＝これより古い日報は"
+                  f"想起対象外。SUMMARY_SCAN_LIMIT の見直しか本文の遅延読込が必要。")
     except Exception as e:
         print(f"[summary] キャッシュ読込失敗: {e}")
+        # 失敗しても古いキャッシュで応答は続ける。ただし次回すぐ再試行させるため
+        # 鮮度時刻は進めない（＝ここで return する _summary_embed_cache は前回の内容）。
     return _summary_embed_cache
 
 
@@ -1889,33 +2248,21 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
         # 300では思考だけで枯れて本文ゼロ（finish_reason=MAX_TOKENS）になる。
         # 主力の flash-lite 3.1 は短文返信なので従来どおり 300（コスト最小）。
         max_tokens = 300 if model == MODEL_BOOSTER else 2048
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        ),
-    )
+    response = await _gemini_generate(model, prompt, max_tokens, temperature)
     # 実トークン計測: max_output_tokens を正しく決めるための実データ。
     # out(=thoughts+answer) が cap に張り付いていたら枠不足（thinking系で本文が出ず MAX_TOKENS になる）。
-    um = getattr(response, "usage_metadata", None)
+    um = response.get("usage")
     if um:
-        th  = um.thoughts_token_count or 0       # 思考トークン（非thinking系は0/None）
-        ans = um.candidates_token_count or 0      # 本文トークン
+        th, ans = um["thoughts"], um["answer"]    # 思考トークン / 本文トークン
         print(f"[tokens] {model.split('/')[-1]} cap={max_tokens} "
-              f"prompt={um.prompt_token_count or 0} thoughts={th} answer={ans} "
-              f"out={th + ans} total={um.total_token_count or 0}")
-    text = response.text
-    if not (text and text.strip()):
+              f"prompt={um['prompt']} thoughts={th} answer={ans} "
+              f"out={th + ans} total={um['total']}")
+    text = response.get("text") or ""
+    if not text.strip():
         # 空レスポンスの原因（MAX_TOKENS / SAFETY 等）を可視化
-        try:
-            fr = response.candidates[0].finish_reason if response.candidates else None
-        except Exception:
-            fr = None
-        pf = getattr(response, "prompt_feedback", None)
-        print(f"[WARN] _call_model 空レスポンス: model={model} finish_reason={fr} prompt_feedback={pf}")
+        print(f"[WARN] _call_model 空レスポンス: model={model} "
+              f"finish_reason={response.get('finish_reason')} "
+              f"prompt_feedback={response.get('prompt_feedback')}")
         return ""
     return text.strip()
 
@@ -2337,6 +2684,8 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         async for m in message.channel.history(limit=12, before=message):
             if m.author.bot:
                 continue
+            if not tos_allows(m.author.id):   # 未同意者の発言はプロンプトに載せない
+                continue
             author_str = m.author.display_name
             text       = re.sub(r"<@!?\d+>", "", m.content).strip()
             if text:
@@ -2358,7 +2707,9 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
 
     # 動的レート待機: 上限に近いほど typing() を長く見せて自然に吸収
     rate_wait = _rate_get_wait_seconds()
-    base_delay = _typing_delay(await asyncio.to_thread(lambda: ""))  # 0秒（後で上書き）
+    # 旧: base_delay = _typing_delay(await asyncio.to_thread(lambda: "")) — 空文字を返すだけの
+    # ラムダのためにスレッドを1本起こし、結果はどこでも使われていなかった（下の total_delay が
+    # 実際の遅延）。スレッド生成はglibcのarenaを増やす＝断片化の種なので削除。
     ai_text = await _run_ai_booster(prompt)
 
     if ai_text:
@@ -2581,6 +2932,18 @@ class MyBot(discord.Client):
         await interaction_dedup_col.create_index(
             "ts", name="ttl_1h", expireAfterSeconds=3600, background=True
         )
+        # summaries は1docに3072次元の embedding を抱える（約12KB/件・2026-08時点で1242件）。
+        # get_latest_summary() と _load_summary_docs() が created_at 降順ソートを使うため、
+        # インデックスが無いと Atlas が全件（十数MB）を読んでメモリ内ソートし、32MBの
+        # ソート上限に届いた時点でクエリごと失敗する。
+        # ★2026-08-16 実測: 既に created_at_-1 が存在する。ここは「無い環境で作る」保険。
+        #   名前を明示すると既存indexと同キー別名で IndexOptionsConflict になるため
+        #   既定名(created_at_-1)のまま作る＝存在すれば完全な no-op。
+        #   万一失敗しても bot 起動を止めないよう握り潰す（indexが無くても動作はする）。
+        try:
+            await summaries_col.create_index([("created_at", -1)], background=True)
+        except Exception as e:
+            print(f"[WARN] summaries created_at index 作成スキップ: {e}")
         # ギルドsync（即時反映）: グローバルsyncは最大1時間かかるためギルド指定に変更
         guild = discord.Object(id=HOME_GUILD_ID)
         # sync失敗で bot 全体が落ちないよう保護（1コマンドの不正名等で全機能停止を防ぐ）。
@@ -2630,13 +2993,10 @@ async def init_invite_snapshot(bot: discord.Client):
         except Exception as e:
             print(f"[WARN] 招待スナップショット取得失敗: {e}")
     try:
-        def _list_models():
-            return list(gemini_client.models.list())
-        models = await asyncio.to_thread(_list_models)
+        models = await _gemini_list_models()
         print("[INFO] ===== 利用可能なGeminiモデル一覧 =====")
-        for m in models:
-            if hasattr(m, 'name'):
-                print(f"[MODEL] {m.name}")
+        for name in models:
+            print(f"[MODEL] {name}")
         print("[INFO] =========================================")
     except Exception as e:
         print(f"[ERROR] モデル一覧取得失敗: {e}")
@@ -2834,9 +3194,12 @@ async def on_message(message: discord.Message):
         # === 規約同意ゲート（記録側の保険）===
         # 権限ロックは「喋れなくする」だけで、明示allowを持つロールには効かない（allowがdenyに勝つ）。
         # 実際に守るべきは「同意していない人のデータを取らない」ことなので、記録の手前でも止める。
-        # ここで return するので XP・メイド応答・要約対象からも自動的に外れる。
+        # ここで return するので XP・メイド応答・messages への記録から外れる。
         # 管理者も例外にしない（権限上は喋れるが、同意するまで記録はしない）。
-        if _tos_gate.get("enabled") and message.author.id not in _tos_agreed_ids:
+        # ★ここが塞ぐのは messages 経路だけ。日報/focus/retro の要約は Discord REST から
+        #   生ログを直接読むため素通りする。その除外は batch/consent_util.py で別途行う
+        #   （2026-08-16 追加）。要約系にログ取得コードを足すときは必ず consent_util を通すこと。
+        if not tos_allows(message.author.id):
             return
 
         # === Phase 1: messages コレクションに記録 ===
@@ -4779,6 +5142,16 @@ async def mimic_cmd(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("このコマンドはブースター専用です。", ephemeral=True)
         return
 
+    # 規約同意ゲート: 未同意者は物真似の対象にしない。
+    # ゲート有効化後の発言は on_message で弾かれるが、それ以前に溜まった messages/profile が
+    # 残っているため、ここで止めないと未同意者の過去発言を LLM へ送ってしまう。
+    if not tos_allows(member.id):
+        await interaction.response.send_message(
+            f"**{member.display_name}** はまだ利用規約に同意していないため、ミミックの対象にできません。",
+            ephemeral=True,
+        )
+        return
+
     # 対象者のデータ確認
     target_uid = str(member.id)
     doc        = await users_col.find_one({"_id": target_uid}) or {}
@@ -4925,6 +5298,8 @@ async def _recent_channel_text(channel, before=None, limit: int = 10) -> str:
     try:
         async for m in channel.history(limit=limit + 4, before=before):
             if m.author.bot:
+                continue
+            if not tos_allows(m.author.id):   # 未同意者の発言はプロンプトに載せない
                 continue
             text = re.sub(r"<@!?\d+>", "", m.content).strip()
             if text:
@@ -5760,6 +6135,19 @@ _TOS_SEND_PERMS = ("send_messages", "send_messages_in_threads",
 
 _tos_gate: dict = {"enabled": False, "role_id": 0, "channel_id": 0, "locked": False}
 _tos_agreed_ids: set[int] = set()   # 同意済み user_id。毎メッセージの DB 読みを避けるため in-memory
+
+
+def tos_allows(user_id: int) -> bool:
+    """この user_id の発言を記録・LLM送信の対象にしてよいか。
+
+    ゲート未導入（enabled=False）なら従来どおり全員 True。
+    `on_message` の記録ガードのほか、**チャンネル履歴を読んでプロンプトに入れる箇所**
+    （メイド応答の会話文脈・弁護・レスバ）でも必ず通すこと。権限ロックには
+    「明示allowを持つロールに負ける」穴があり、未同意者が喋れてしまう場合があるため。
+    要約バッチ側の同等品は batch/consent_util.py。"""
+    if not _tos_gate.get("enabled"):
+        return True
+    return user_id in _tos_agreed_ids
 
 
 async def _load_tos_gate():
@@ -6694,10 +7082,7 @@ async def listmodels_cmd(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        lines = []
-        for m in gemini_client.models.list():
-            if hasattr(m, 'name'):
-                lines.append(f"`{m.name}`")
+        lines = [f"`{name}`" for name in await _gemini_list_models()]
         if not lines:
             await interaction.followup.send("利用可能なモデルが見つかりませんでした。", ephemeral=True)
             return
@@ -8831,6 +9216,9 @@ async def _main():
     await start_web_server()
     print("[web] Webサーバー起動完了")
 
+    # メモリ監視はDiscord接続と独立に回す（429バックオフ中も記録が続く）
+    asyncio.create_task(_mem_watch_task())
+
     retry = 0
     # client は起動時に一度だけ生成済み（グローバル）。
     # 再生成すると @client.tree.command で登録したコマンドが消えるため、
@@ -8861,6 +9249,14 @@ async def _main():
                     await client.close()
             except Exception:
                 pass
+            # Gemini用の共有セッションも畳む（次ループで自動的に張り直される）
+            global _gemini_session
+            try:
+                if _gemini_session is not None and not _gemini_session.closed:
+                    await _gemini_session.close()
+            except Exception:
+                pass
+            _gemini_session = None
 
 if __name__ == "__main__":
     asyncio.run(_main())
