@@ -39,7 +39,7 @@
 | 責務 | 主要ハンドラ | 実装 |
 |------|------------|-----|
 | XP 加算・連続参加ボーナス | `on_message` | `calculate_xp_gain`, `STREAK_BONUSES` |
-| ロール自動付与（19段階ランク） | `on_message` → `update_member_role` | `RANK_STAGES` |
+| ロール自動付与（24段階ランク） | `on_message` → `update_member_role` | `RANK_STAGES` |
 | Bump 検知（6 Bot 対応） | `on_message`, `on_raw_message_edit`, **`on_interaction`** | `BOT_CONFIG`, `check_bump*` |
 | AI メイド応答（6人格） | `on_message`（メンション）/ `/maid` | `_maid_queue_worker` + `_run_ai_booster` |
 | 長期記憶・プロフィール蓄積 | バックグラウンドタスク | `extract_and_save_profile`, `_extract_claims_and_memories` |
