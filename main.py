@@ -1478,8 +1478,10 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
     記憶検索（毎回 in-Python cosine）
     ① 8文字未満 → スキップ
     ② クエリをembedding化し、保存済み記憶とのcosine類似度を全件計算
-    ③ 閾値以上の上位top_kを返す。該当なし → 最近の記憶でフォールバック
+    ③ 閾値以上の上位top_kを返す。該当なし／embedding失敗 → [] （記憶を注入しない）
     （記憶トリガー語が含まれる場合は「思い出して」の意図が強いので閾値を緩める）
+    ★旧仕様は該当なしでも「最近の記憶」を返しており、_build_prompt が無関係な記憶を
+      「さりげなく活かせ」と渡す＝今回の発言と関係ない昔の話題を蒸し返す原因になっていた。
 
     MEM: 1ユーザー40件 × 3072次元 = 約4MB を返信ごとに読む。返り値に embedding を
     載せたままだと、その4MBが後続の（数秒かかる）LLM呼び出しの間ずっと生き残り、
@@ -1498,7 +1500,8 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
 
     qvec = await _get_embedding(query)
     if not qvec:
-        return _slim(memories[:top_k])  # embedding失敗 → 最近の記憶
+        print(f"[memory] embedding失敗: {uid} → 記憶なしで応答")
+        return []  # embedding失敗 → 無関係な記憶を混ぜないため注入しない
     threshold = MEMORY_SIM_THRESHOLD
     if any(w in query for w in MEMORY_TRIGGER_WORDS):
         threshold -= 0.10  # 明示的に思い出させる意図 → より積極的に想起
@@ -1524,8 +1527,8 @@ async def search_memories(uid: str, query: str, top_k: int = 3) -> list[dict]:
         # best= は閾値チューニング用（この値以下なら拾われない）
         print(f"[memory] cosine hit: {uid} best={best:.3f} thr={threshold:.2f} ({len(relevant)}件)")
         return _slim(relevant)
-    print(f"[memory] cosine miss: {uid} best={best:.3f} thr={threshold:.2f} → 最近の記憶")
-    return _slim(memories[:top_k])  # 関連記憶なし → 最近の記憶
+    print(f"[memory] cosine miss: {uid} best={best:.3f} thr={threshold:.2f} → 記憶なし")
+    return []  # 関連記憶なし → 注入しない（旧: 最近の記憶でフォールバック＝蒸し返しの原因）
 
 
 async def _embed_query_for_summaries(text: str) -> list[float] | None:
@@ -2046,7 +2049,10 @@ async def save_butler_history(user_id: str, role: str, content: str, persona: st
     """会話履歴を保存。assistant発言にはその時の実効人格(persona)を必ずタグ付けする
     （人格を切替えても前人格の口調が履歴経由で混線するのを防ぐため・format_historyで使用）。"""
     history = await get_butler_history(user_id)
-    entry = {"role": role, "content": content}
+    # ts(UTC ISO)は「この発言がいつのものか」をformat_historyで見せるため。これが無いと、数日前の
+    # 会話も直前の会話もモデルからは区別がつかず、今回の発言を無視して昔の話題を続けてしまう。
+    entry = {"role": role, "content": content,
+             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     if persona:
         entry["persona"] = persona
     history.append(entry)
@@ -2516,14 +2522,51 @@ def _is_emotionally_significant(text: str) -> bool:
     return any(m in text for m in markers)
 
 
-def format_history(history: list[dict], current_persona: str | None = None) -> str:
+# 履歴の「話の切れ目」とみなす間隔。これを超えて空いた前後は別の会話として区切り線を入れる。
+HISTORY_GAP_HOURS = 6
+
+
+def _hist_ts(h: dict) -> datetime.datetime | None:
+    """履歴エントリの ts（UTC ISO）を aware datetime に。無い/壊れている（=ts導入前のレガシー）は None。"""
+    ts = h.get("ts")
+    if not ts:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(ts))
+    except Exception:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def _span_ja(sec: float) -> str:
+    """経過秒を「3日」「2時間」「15分」に（「前」「ぶり」は呼び出し側で付ける）。"""
+    sec = max(0.0, sec)
+    if sec >= 86400:
+        return f"{int(sec // 86400)}日"
+    if sec >= 3600:
+        return f"{int(sec // 3600)}時間"
+    return f"{max(1, int(sec // 60))}分"
+
+
+def _ago_ja(sec: float) -> str:
+    return "さっき" if sec < 600 else f"{_span_ja(sec)}前"
+
+
+def format_history(history: list[dict], current_persona: str | None = None,
+                   now: datetime.datetime | None = None) -> str:
     """会話履歴を整形。感情的に重要な発言には★マークを付与してAIが優先的に参照できるようにする。
     人格混線対策: 現在の人格(current_persona)で生成されたと確認できるメイド発言だけ口調をそのまま見せ、
     それ以外（別人格の発言＋人格タグの無い修正前=レガシー発言）は中立プレースホルダに置換する。
     こうしないと、過疎で履歴が入れ替わらない場合に古い「ざぁ〜こ♡」等が居座って口調が混線する。
-    （主人側の発言は全て保持・内容はmemories/profileに残るので文脈は失われない）"""
+    （主人側の発言は全て保持・内容はmemories/profileに残るので文脈は失われない）
+    時刻: ts を持つエントリは主人の発言に相対時刻（「3日前」）を付け、HISTORY_GAP_HOURS 超の空白には
+    区切り線を入れ、最後の会話が古ければ「今回とは別の話題の可能性が高い」と明示する。
+    ★これが無いと「昨日の相談の続き」と「今の雑談」が地続きに見え、今回の発言を無視して昔の話を蒸し返す。
+    ts の無いレガシーエントリには時刻を一切付けない（推測で作らない）。"""
     if not history:
         return "（初めてのご挨拶）"
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    gap_sec = HISTORY_GAP_HOURS * 3600
     # 直近 BUTLER_HISTORY_FULL 往復（=*2 エントリ）は全文、それ以前は BUTLER_HISTORY_TRUNC 字に
     # 切り詰めて見せる。往復数を増やしても古い発言でプロンプトが肥大しないようにするため。
     full_from = max(0, len(history) - BUTLER_HISTORY_FULL * 2)
@@ -2534,16 +2577,27 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
         return text[:BUTLER_HISTORY_TRUNC] + "…"
 
     lines = []
-    for i, h in enumerate(history):
+    prev_dt = None
+    for i, h in enumerate(history):   # ★i は元リストの添字のまま（区切り線を足しても _clip の判定をずらさない）
+        dt = _hist_ts(h)
+        if dt is not None and prev_dt is not None and (dt - prev_dt).total_seconds() > gap_sec:
+            lines.append(f"―― ここから{_span_ja((dt - prev_dt).total_seconds())}ぶりの会話 ――")
+        if dt is not None:
+            prev_dt = dt
         if h["role"] == "user":
             mark = "★" if _is_emotionally_significant(h["content"]) else ""
-            lines.append(f"{mark}主人: {_clip(h['content'], i)}")
+            when = f"（{_ago_ja((now - dt).total_seconds())}）" if dt is not None else ""
+            lines.append(f"{mark}主人{when}: {_clip(h['content'], i)}")
         else:
             # 現人格タグと一致する発言のみ口調を見せる。タグ無し(レガシー)・別人格は中立化。
             if current_persona and h.get("persona") != current_persona:
                 lines.append("メイド: （別の人格で応答）")
             else:
                 lines.append(f"メイド: {_clip(h['content'], i)}")
+    last_dt = _hist_ts(history[-1])
+    if last_dt is not None and (now - last_dt).total_seconds() > gap_sec:
+        lines.append(f"（前回の会話は{_span_ja((now - last_dt).total_seconds())}前。"
+                     "今回の発言とは別の話題の可能性が高い）")
     return "\n".join(lines)
 
 
@@ -2625,8 +2679,9 @@ async def _maid_queue_worker():
             except asyncio.TimeoutError:
                 break
             try:
-                message = item
-                await _maid_respond_inner(message)
+                # item は (message, spontaneous)。旧形式（素の message）も念のため受ける。
+                message, spontaneous = item if isinstance(item, tuple) else (item, False)
+                await _maid_respond_inner(message, spontaneous=spontaneous)
                 # 人間らしい間：次の返答まで1〜4秒ランダムに待機（レートリミッターで自動調整済みのため短め）
                 await asyncio.sleep(random.uniform(0.5, 1.5))
             except Exception as e:
@@ -2645,8 +2700,10 @@ async def _maid_queue_worker():
         print("[INFO] queue_worker stopped")
 
 
-async def maid_respond_queued(message: discord.Message, is_booster: bool = False):
-    """キューに追加して順番待ちで処理（is_booosterは後方互換のため残すが内部では使わない）"""
+async def maid_respond_queued(message: discord.Message, is_booster: bool = False,
+                              spontaneous: bool = False):
+    """キューに追加して順番待ちで処理（is_booosterは後方互換のため残すが内部では使わない）。
+    spontaneous=True は on_message のランダム自発割り込み（話しかけられていない）＝プロンプトに注記が付く。"""
     global _maid_queue_processing
 
     qsize = _maid_queue.qsize()
@@ -2654,13 +2711,15 @@ async def maid_respond_queued(message: discord.Message, is_booster: bool = False
         # 旧: 無言drop＝話しかけた人には無視されたように見えた。
         # 生成LLMは呼ばず、リアクション1個(API1回)だけ付けて「混雑中で後回し」を伝える。
         print(f"[WARN] maid_queue full, dropping: {message.author.display_name}")
+        if spontaneous:
+            return   # 自発割り込みは誰も待っていない＝⏳を付けると「呼んでないのに混雑中」で意味不明
         try:
             await message.add_reaction("⏳")
         except Exception:
             pass
         return
 
-    await _maid_queue.put(message)
+    await _maid_queue.put((message, spontaneous))
 
     if not _maid_queue_processing:
         asyncio.create_task(_maid_queue_worker())
@@ -2827,8 +2886,19 @@ async def _analyze_nonbooster_realtime(uid: str, name: str):
         print(f"[ERROR] _analyze_nonbooster_realtime({name}): {e}")
 
 
-async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "", extra_context: str = "") -> tuple[str, dict]:
-    """プロンプトとpersonalityを返す。全ユーザー共通でブースター品質のプロンプトを使用。"""
+# 自発割り込み（on_message のランダム発火）用の注記。メンション応答と同じ _build_prompt を通すので
+# その人の butler_history も見えてしまう＝「話しかけられていないのに前回の個別会話の続きをする」原因。
+# 履歴自体は口調・関係性の文脈として残し、話題だけ蒸し返さないよう明示する。
+SPONTANEOUS_NOTE = ("（これはあなたが自分から会話に割り込む場面。主人はあなたに話しかけていない。"
+                    "チャンネルの直前の会話と今回の発言にだけ反応し、過去の個別会話の話題は持ち出すな）")
+
+
+async def _build_prompt(uid: str, display_name: str, content: str, channel_context: str = "",
+                        extra_context: str = "", reply_context: str = "",
+                        spontaneous: bool = False) -> tuple[str, dict, str]:
+    """(prompt, personality, personality_key) を返す。全ユーザー共通でブースター品質のプロンプトを使用。
+    reply_context: 主人が返信している元発言（_maid_respond_inner が同意フィルタ済みで渡す）。
+    spontaneous: メイドが自分から割り込む場面（主人は話しかけていない）。"""
     # ユーザー情報を先に取得（専属メイド人格などランク連動パークを人格決定に使うため）。
     # memories.embedding は重い(各3072次元)＆ここでは使わないので射影で除外。関連記憶は search_memories() が別途取得する。
     try:
@@ -2852,9 +2922,16 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
 
     # 全ユーザー共通: butler_historyを使用（旧nonbooster_historyからのマイグレーション済み）
     history = await get_butler_history(uid)
+    # 返信元・自発割り込みの注記は {history} スロットの末尾に足す。全人格テンプレートで {history} の直後が
+    # 「主人の発言」なので、テンプレートを触らずに“今回の発言の直前”へ置ける（recency で効かせる位置）。
+    history_slot = format_history(history, personality_key)
+    if reply_context:
+        history_slot += "\n\n" + reply_context
+    if spontaneous:
+        history_slot += "\n\n" + SPONTANEOUS_NOTE
     base_prompt = personality["booster_prompt"].format(
         name=display_name,
-        history=format_history(history, personality_key),
+        history=history_slot,
         content=content,
     )
     # profileはブースター由来の詳細情報。なければsimple_profileで補完
@@ -2901,10 +2978,11 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     )
     parts.append(
         "【応答時の情報優先度】\n"
-        "① 直近の話題・感情の波（最優先）\n"
-        "② このユーザーの性格・口調\n"
-        "③ 会話履歴の★マーク付き発言（印象的な瞬間）\n"
-        "④ その他のサーバー情報"
+        "① 今回の主人の発言そのもの（最優先。これに直接答えよ）\n"
+        "② 直近の話題・感情の波\n"
+        "③ このユーザーの性格・口調\n"
+        "④ 会話履歴の★マーク付き発言（印象的な瞬間）\n"
+        "⑤ その他のサーバー情報"
     )
     if nick_map:
         nick_lines = "\n".join(f"  {k} = {v}" for k, v in nick_map.items())
@@ -2984,33 +3062,67 @@ async def _build_prompt(uid: str, display_name: str, content: str, channel_conte
     if extra_context:
         parts.append(extra_context)
 
-    # 人格プロンプトの直後（生成に最も近い位置＝recency で最優先）に置く誠実さルール。
-    # 小型モデルでも効くよう、日付と反ハルシネーションは末尾でも再掲する。
+    # 誠実さルール。旧: 人格プロンプト（＝主人の発言）の“後ろ”に置いていたため、モデルが最後に読むのが
+    # 今回の発言ではなく鉄則になり、今回の発言より履歴側に引っ張られる一因になっていた。
+    # ★今回の発言は必ずプロンプトの最後。鉄則はその手前（人格ルール・履歴の前）に置く。
     honesty = (
         "【応答の鉄則（人格設定より優先）】\n"
         f"- 今日は{now_jst.strftime('%Y年%m月%d日')}"
         f"（{_WEEKDAY_JA[now_jst.weekday()]}曜日・JST）。年・日付の話題は必ずこれを基準にせよ。"
         "聞かれてもいない年を勝手に持ち出すな。"
         "過去の日付の曜日は、資料に書いてあるか自力で確実に計算できる場合以外は口にするな。\n"
-        "- 上に挙げた資料（直前の会話・会話履歴・過去の記憶・サーバー要約）に無い固有名詞・"
+        "- 提示された資料（直前の会話・会話履歴・過去の記憶・サーバー要約）に無い固有名詞・"
         "出来事・数字を、事実であるかのように断定するな。確証がなければ創作せず、"
         "「正確には分かりません／覚えていません」と述べよ。\n"
         "- 全期間の集計・網羅的な総括（年間/月間のまとめ）はできない。「全部抽出します」"
         "「総括します」と約束するな。総括を求められたら手元の情報の範囲で答え、"
         "「正確な総括は /report（特定の日は /retroreport）をご利用ください」と案内せよ。"
-        "ただし上に【関連する過去の記録】が提示されていれば、それは参照して具体的に答えてよい"
+        "ただし【関連する過去の記録】が提示されていれば、それは参照して具体的に答えてよい"
         "（提示が無い事柄を在るように作るのは禁止）。\n"
         "- 間違いを指摘されても大げさに謝罪せず、簡潔に訂正してそのまま会話を続けよ。\n"
+        "- 会話履歴は過去のやり取り。今回の発言と話題が違えば、過去の話題を蒸し返さず今回の発言に答えよ。\n"
         "- 【口調の固定】今のあなたの人格の口調だけで話せ。これまでの会話や履歴に"
         "別の人格の口調・決め台詞・語尾が混ざっていても、絶対に真似たり引きずられたりするな。"
     )
-    prompt = "\n\n".join(parts) + "\n\n---\n" + base_prompt + "\n\n" + honesty
+    prompt = "\n\n".join(parts) + "\n\n" + honesty + "\n\n---\n" + base_prompt
     return prompt, personality, personality_key
 
 
-async def _maid_respond_inner(message: discord.Message, is_booster: bool = False, extra_context: str = ""):
+async def _reply_reference_context(message: discord.Message) -> str:
+    """主人が「返信」している元発言を1行で返す（無ければ ""）。
+    旧: message.reference を一切見ておらず、メイドの発言や他人の発言に返信しても何への返事か分からない
+    ＝今回の発言を取り違えて履歴の話題に流れる一因だった。
+    取得は resolved（キャッシュ）優先、無ければ fetch_message 1回だけ（失敗は握り潰す）。
+    ★同意フィルタは channel_context と同じ: 未同意者・他botの発言はプロンプトに載せない（メイド自身は可）。"""
+    ref = message.reference
+    if ref is None or not ref.message_id:
+        return ""
+    src = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+    if src is None:
+        if isinstance(ref.resolved, discord.DeletedReferencedMessage):
+            return ""
+        if ref.channel_id and ref.channel_id != message.channel.id:
+            return ""   # 別チャンネルへの返信（転送等）は追わない
+        try:
+            src = await message.channel.fetch_message(ref.message_id)
+        except Exception as e:
+            print(f"[WARN] 返信元取得失敗: {type(e).__name__}: {e}")
+            return ""
+    is_self = client.user is not None and src.author.id == client.user.id
+    if not is_self and (src.author.bot or not tos_allows(src.author.id)):
+        return ""
+    text = re.sub(r"<@!?\d+>", "", src.content or "").strip()
+    if not text:
+        return ""
+    who = "あなた（メイド）" if is_self else src.author.display_name
+    return f"【主人が返信している元の発言】{who}: {text[:300]}"
+
+
+async def _maid_respond_inner(message: discord.Message, is_booster: bool = False, extra_context: str = "",
+                              spontaneous: bool = False):
     """on_message（discord.Message）からの応答（内部処理）。全ユーザー共通品質。
-    extra_context: おかえり等、この応答だけの追加状況指示（_build_promptに渡す）。"""
+    extra_context: おかえり等、この応答だけの追加状況指示（_build_promptに渡す）。
+    spontaneous: ランダム自発割り込み（_build_prompt に「話しかけられていない」注記を足す。保存は従来どおり）。"""
     uid = str(message.author.id)
     raw_content = re.sub(r"<@!?\d+>", "", message.content).strip() or "こんにちは"
 
@@ -3036,7 +3148,15 @@ async def _maid_respond_inner(message: discord.Message, is_booster: bool = False
         print(f"[WARN] channel_context取得失敗: {ce}")
 
     try:
-        prompt, personality, personality_key = await _build_prompt(uid, message.author.display_name, raw_content, channel_context, extra_context)
+        reply_context = await _reply_reference_context(message)
+    except Exception as re_e:
+        print(f"[WARN] reply_context取得失敗: {re_e}")
+        reply_context = ""
+
+    try:
+        prompt, personality, personality_key = await _build_prompt(
+            uid, message.author.display_name, raw_content, channel_context, extra_context,
+            reply_context=reply_context, spontaneous=spontaneous)
     except Exception as e:
         print(f"[ERROR] _build_prompt: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         await message.reply("（メイドは今、混乱しております…）")
@@ -3755,7 +3875,8 @@ async def on_message(message: discord.Message):
             has_topic = any(w in message.content for w in TOPIC_TRIGGER_WORDS)
             nb_chance = NB_TALK_CHANCE_TOPIC if has_topic else NB_TALK_CHANCE
             if random.random() < nb_chance:
-                asyncio.create_task(maid_respond_queued(message))
+                # spontaneous=True: 話しかけられていない割り込み。その人の前回の個別会話を蒸し返さない注記が付く
+                asyncio.create_task(maid_respond_queued(message, spontaneous=True))
 
         # 自動弁護: 武装中のみ。管理者が非管理者メンバーを一方的に責める対立を保守的に検知して割り込む。
         # （cheap な in-memory フラグで判定し、ほとんどのメッセージでは即抜ける）
@@ -9265,10 +9386,17 @@ async def post_weekly_ranking():
 _last_idle_post: datetime.datetime | None = None  # 前回の時間ベース自発投稿（UTC）
 
 
-async def _generate_idle_opener() -> tuple[str, dict] | None:
-    """場が静かなときの自発的な一言を、現在のサーバー人格の口調で生成する。"""
+async def _generate_idle_opener(channel=None) -> tuple[str, dict] | None:
+    """場が静かなときの自発的な一言を、現在のサーバー人格の口調で生成する。
+    channel: 投稿先。直近の会話をそこから取る（None なら要約だけ＝旧挙動）。
+    ★旧: 2時間おきの日報要約だけを材料にしていた＝最大2時間＋α遅れた話題に触れる「ちょっと古い」投稿になっていた。
+      投稿先チャンネルの直近の会話を最優先材料にし、要約は補足に格下げする。"""
     personality_key = await get_server_personality()
     personality = PERSONALITIES.get(personality_key, PERSONALITIES[DEFAULT_PERSONALITY])
+    recent = ""
+    if channel is not None:
+        # 非bot・同意者のみ・メンション除去・古い順（_maid_respond_inner の channel_context と同じ規約）
+        recent = await _recent_channel_text(channel, limit=15)
     try:
         raw_summary   = await get_latest_summary()
         smart_summary = build_smart_summary(raw_summary) if raw_summary else ""
@@ -9277,7 +9405,8 @@ async def _generate_idle_opener() -> tuple[str, dict] | None:
         smart_summary = ""
     directive = (
         "（これは誰かへの返信ではありません。いまチャンネルが少し静かなので、あなたから場に投げる"
-        "『最初の一言』を作ってください。下の『サーバーの最新状況』にある実際の話題・流れに触れて、"
+        "『最初の一言』を作ってください。上の『このチャンネルの直近の会話』の流れに触れて"
+        "（それが無ければ『サーバー全体の少し前の状況』の話題に触れて）、"
         "会話が再開するきっかけになる軽い一言を。特定個人を責めたり質問攻めにしたりしない。"
         "前置きや「メイド:」等のラベル無しで本文のみ・1〜2文）"
     )
@@ -9286,10 +9415,13 @@ async def _generate_idle_opener() -> tuple[str, dict] | None:
         history="（直近のメイドとの個別会話履歴はなし。場全体への語りかけです）",
         content=directive,
     )
+    blocks = []
+    if recent:
+        blocks.append("【このチャンネルの直近の会話（最優先・この流れに触れよ）】\n" + recent)
     if smart_summary:
-        prompt = "【サーバーの最新状況（ここにある話題に触れよ）】\n" + smart_summary + "\n\n---\n" + base
-    else:
-        prompt = base
+        blocks.append("【サーバー全体の少し前の状況（補足。直近の会話と食い違えば直近を優先）】\n"
+                      + smart_summary)
+    prompt = ("\n\n".join(blocks) + "\n\n---\n" + base) if blocks else base
     text = await _run_ai_booster(prompt)
     if not text or text.startswith("（メイド"):
         return None
@@ -9329,7 +9461,7 @@ async def idle_chatter_task():
                         gap = (now_utc - ensure_utc(last_human.created_at)).total_seconds()
                         # 「静か(QUIET_MIN以上)」かつ「過疎でない(RECENT_HRS以内)」という谷間だけ狙う
                         if IDLE_QUIET_MIN * 60 <= gap <= IDLE_RECENT_HRS * 3600 and random.random() < IDLE_POST_CHANCE:
-                            result = await _generate_idle_opener()
+                            result = await _generate_idle_opener(ch)
                             if result:
                                 text, personality = result
                                 _idle_text = f"{personality['icon']} {text}"
