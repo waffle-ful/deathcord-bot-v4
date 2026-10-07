@@ -16,6 +16,12 @@
 | `PORT` | ○ | L26 | aiohttp ヘルスサーバー用。デフォルト `10000`。Render が自動設定 |
 | `GITHUB_TOKEN` | ○ | L2611, L2672 | `/retroreport` `/focus` で workflow dispatch 用 |
 | `GITHUB_REPO` | ○ | L2612, L2673 | 同上。`owner/repo` 形式 |
+| `ANTHROPIC_API_KEY` | ○ | Claude セクション | 設定すると会話・裏処理チェーンの先頭に Claude が入る。**未設定なら Claude は完全不活性**（Gemini のみ） |
+| `ANTHROPIC_API_BASE` | ○ | 同上 | 既定 `https://api.anthropic.com`。`/v1` は付けない |
+| `CLAUDE_MODEL` | ○ | 同上 | 既定 `claude-haiku-5-5`。変えたら単価定数 `CLAUDE_PRICE_*` も更新 |
+| `CLAUDE_DISABLED` | ○ | 同上 | `1` でキーを残したまま Claude を緊急停止 |
+| `CLAUDE_EFFORT_CHAT` / `CLAUDE_EFFORT_BG` | ○ | 同上 | effort。既定 `low` / `medium` |
+| `CLAUDE_BUDGET_SOFT_USD` | ○ | 同上 | 月次ソフト上限(UTC暦月)。既定 `80`。到達で当月は Gemini のみ。Console のハード上限($90)より下に保つ |
 
 ### batch/*.py（GitHub Actions）
 

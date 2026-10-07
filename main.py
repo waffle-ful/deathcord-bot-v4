@@ -343,6 +343,293 @@ async def _gemini_list_models(max_pages: int = 5) -> list[str]:
 
 
 # =============================================================================
+# Claude クライアント（aiohttp直REST。anthropic SDK非依存）
+# =============================================================================
+# 会話・裏処理チェーンの「先頭」に Claude を差し込む。ただし env ANTHROPIC_API_KEY が
+# 立つまでは完全に不活性（チェーンにも入らない＝1リクエストも飛ばない）。Gemini は後段の
+# フォールバックとしてそのまま残す。
+# MEM: anthropic SDK も google-genai と同じく import だけで数十MB（httpx+pydantic）を食うため
+#   使わない。叩くのは POST /v1/messages の1本だけなので、上の _gemini_http() の共有セッションを
+#   そのまま使い回す（★名前は gemini だが Claude と共用。セッションを2本にするとバッファも2倍）。
+# ★例外文字列の形は Gemini と同じく load-bearing: str(e) == "<HTTP status> <error.type>: <message>"。
+#   _is_503（529/overloaded_error を一時障害とみなす）がこの部分一致で動く。
+# ★送ってはいけないもの: temperature / top_p / top_k（Haiku 5.5 は既定値以外を 400 で弾く）、
+#   thinking（adaptive が既定）、assistant の prefill。_call_model の temperature 引数は黙って無視する。
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY") or ""
+ANTHROPIC_API_BASE = (os.environ.get("ANTHROPIC_API_BASE") or "https://api.anthropic.com").rstrip("/")
+ANTHROPIC_VERSION  = "2023-06-01"
+# env CLAUDE_DISABLED=1 でキーを残したまま緊急停止できる（Render の env 変更→再起動で効く）
+CLAUDE_DISABLED = (os.environ.get("CLAUDE_DISABLED", "").strip().lower()
+                   in ("1", "true", "yes", "on"))
+# effort: 会話は速度優先で low、裏処理は速度不問なので medium
+CLAUDE_EFFORT_CHAT = os.environ.get("CLAUDE_EFFORT_CHAT") or "low"
+CLAUDE_EFFORT_BG   = os.environ.get("CLAUDE_EFFORT_BG") or "medium"
+
+# ---- 月次予算ガード ----------------------------------------------------------
+# 単価（USD / 100万トークン）。2026-10-07 時点の Haiku 5.5 料金ページより。
+# ★モデルを変えたら必ず更新すること（ここがズレると予算ガードが黙って甘くなる/厳しくなる）。
+# 段階は「そのリクエストの入力合計（キャッシュ読み/書き込み）」が 100k を超えるかで決まる。
+# 注: キャッシュ書き込みは 5分TTL の単価。このbotはプロンプトキャッシュを使っていない
+#   （cache_control を送らない）ので通常 0 だが、来たときに過小計上しないよう計算には入れる。
+CLAUDE_TIER_THRESHOLD = 100_000
+CLAUDE_PRICE_LE_100K = {"input": 0.10, "output": 0.50, "cache_read": 0.01, "cache_write": 0.125}
+CLAUDE_PRICE_GT_100K = {"input": 0.50, "output": 2.50, "cache_read": 0.05, "cache_write": 0.625}
+# ソフト上限。到達したらその月の残りは Claude をチェーンから外す（Gemini だけで動く）。
+# ★カレンダー月(UTC)と Max の請求サイクルはずれる。Console 側のハード上限 $90 が最終防衛線、
+#   $10差はそのずれ吸収用。ここを $90 以上に上げるとハード上限に先に当たって API がエラーを返し続ける。
+CLAUDE_BUDGET_SOFT_USD = float(os.environ.get("CLAUDE_BUDGET_SOFT_USD") or 80)
+
+# Mongo（db["claude_usage"], _id="YYYY-MM"）のメモリ上ミラー。_claude_available() を
+# 毎回 O(1) にするため、Mongo は月初め/起動時に1回読むだけで、以後は $inc を投げっぱなしにする。
+_claude_budget: dict = {
+    "month":    None,    # "YYYY-MM"（UTC）
+    "usd":      0.0,
+    "calls":    0,
+    "loaded":   False,   # 当月分を Mongo から読み込んだか
+    "next_try": 0.0,     # 読込失敗時の再試行可能時刻（time.monotonic）
+    "warned":   None,    # ソフト上限WARNを出した月（月1回だけ出す）
+}
+_claude_bg_tasks: set = set()   # 投げっぱなし $inc タスクの参照保持（GCで消されないように）
+# キー無効(401/403)・残高/請求エラー(402, "credit balance")は「待っても直らない」失敗。
+# 毎返信で Claude を叩いて往復1回ぶん遅れるのを防ぐため、一定時間チェーンから外す。
+CLAUDE_AUTH_COOLDOWN_SEC = 600
+_claude_cooldown_until: float = 0.0   # time.monotonic()。この時刻までは Claude を外す
+
+
+class ClaudeAPIError(Exception):
+    """Anthropic REST のエラー。str() は "529 overloaded_error: ..." の形になる
+    （GeminiAPIError と同じ __init__ / str 形。フォールバック判定が str(e) 部分一致のため）。"""
+    def __init__(self, code, status: str, message: str):
+        self.code    = code
+        self.status  = status or ""
+        self.message = message or ""
+        super().__init__(f"{code} {self.status}: {self.message}".strip())
+
+
+def _claude_error_from(http_status: int, raw: str) -> ClaudeAPIError:
+    """エラー応答 {"type":"error","error":{"type":..,"message":..}} を ClaudeAPIError に写す。
+    本文がJSONでない（プロキシのHTML等）場合も HTTP ステータスだけは必ず先頭に残す。"""
+    etype, msg = "http_error", (raw or "")[:400]
+    try:
+        err = ((json.loads(raw) or {}).get("error") or {})
+        if isinstance(err, dict):
+            etype = err.get("type") or etype
+            msg   = err.get("message") or msg
+    except Exception:
+        pass
+    return ClaudeAPIError(http_status, etype, msg)
+
+
+def _claude_parse_response(data: dict) -> dict:
+    """Messages API の応答を _gemini_generate と同じ形
+    {text, finish_reason, prompt_feedback, usage} に正規化する。
+    ★content[0] を決め打ちしない: adaptive thinking だと thinking ブロックが先に来る。
+      type=="text" のブロックだけを連結する。
+    ★usage.answer は output_tokens（Claude は思考トークンも output に含めて返すので thoughts=0 扱い）。"""
+    blocks = data.get("content") or []
+    text = "".join((b.get("text") or "") for b in blocks
+                   if isinstance(b, dict) and b.get("type") == "text")
+    stop = data.get("stop_reason")
+    if stop == "refusal":
+        # 拒否は本文を使わない→空で返してチェーンを Gemini へ落とす
+        print(f"[WARN] claude refusal: stop_details={data.get('stop_details')}")
+        text = ""
+    elif stop == "max_tokens" and not text.strip():
+        # 思考で枠を使い切って本文ゼロ。max_tokens が小さすぎる兆候
+        print(f"[WARN] claude max_tokens で本文ゼロ（思考で枠が枯渇）: model={data.get('model')}")
+        text = ""
+    u   = data.get("usage") or {}
+    inp = int(u.get("input_tokens") or 0)
+    cr  = int(u.get("cache_read_input_tokens") or 0)
+    cw  = int(u.get("cache_creation_input_tokens") or 0)
+    out = int(u.get("output_tokens") or 0)
+    return {
+        "text": text,
+        "finish_reason": stop,
+        "prompt_feedback": None,
+        "usage": {
+            "prompt":      inp + cr + cw,
+            "thoughts":    0,
+            "answer":      out,
+            "total":       inp + cr + cw + out,
+            "cache_read":  cr,
+            "cache_write": cw,
+        } if u else None,
+    }
+
+
+def _claude_cost_usd(usage: dict | None) -> float:
+    """Anthropic の生 usage から1リクエストの費用(USD)を出す。段階は入力合計(キャッシュ込み)で判定。"""
+    if not usage:
+        return 0.0
+    inp = int(usage.get("input_tokens") or 0)
+    cr  = int(usage.get("cache_read_input_tokens") or 0)
+    cw  = int(usage.get("cache_creation_input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    p = CLAUDE_PRICE_GT_100K if (inp + cr + cw) > CLAUDE_TIER_THRESHOLD else CLAUDE_PRICE_LE_100K
+    return (inp * p["input"] + out * p["output"]
+            + cr * p["cache_read"] + cw * p["cache_write"]) / 1_000_000
+
+
+def _claude_month_key(now: datetime.datetime | None = None) -> str:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return now.astimezone(datetime.timezone.utc).strftime("%Y-%m")
+
+
+def _claude_budget_roll(now: datetime.datetime | None = None) -> None:
+    """月が変わっていたらミラーを0に戻し、当月分の再読込を要求する。"""
+    month = _claude_month_key(now)
+    b = _claude_budget
+    if b["month"] != month:
+        b["month"], b["usd"], b["calls"] = month, 0.0, 0
+        b["loaded"], b["next_try"] = False, 0.0
+
+
+def _claude_disabled_reason(now: datetime.datetime | None = None) -> str | None:
+    """Claude を使えない理由。使えるなら None。毎回呼ばれるので Mongo には触らない（O(1)）。"""
+    if not ANTHROPIC_API_KEY:
+        return "ANTHROPIC_API_KEY 未設定"
+    if CLAUDE_DISABLED:
+        return "CLAUDE_DISABLED=1"
+    if time.monotonic() < _claude_cooldown_until:
+        return "キー/残高エラーで一時停止中"
+    _claude_budget_roll(now)
+    b = _claude_budget
+    if b["usd"] >= CLAUDE_BUDGET_SOFT_USD:
+        if b["warned"] != b["month"]:
+            b["warned"] = b["month"]
+            print(f"[WARN] claude 月次ソフト上限到達: {b['month']} ${b['usd']:.2f} >= "
+                  f"${CLAUDE_BUDGET_SOFT_USD:.2f} → 今月の残りは Gemini 連鎖のみ")
+        return f"月次予算到達 {b['month']} ${b['usd']:.2f}/${CLAUDE_BUDGET_SOFT_USD:.2f}"
+    return None
+
+
+def _claude_available() -> bool:
+    return _claude_disabled_reason() is None
+
+
+async def _claude_budget_ensure_loaded() -> None:
+    """当月の累計を Mongo から1回だけ読んでミラーに反映する（起動時＋月替わり後の初回）。
+    失敗しても返信は止めない（60秒後に再試行）。読込前に記録された分と二重/欠落にならないよう
+    max() で合わせる＝安全側（多めに見積もる）に倒す。"""
+    _claude_budget_roll()
+    b = _claude_budget
+    if b["loaded"] or time.monotonic() < b["next_try"]:
+        return
+    month = b["month"]
+    try:
+        doc = await asyncio.wait_for(claude_usage_col.find_one({"_id": month}), timeout=5)
+    except Exception as e:
+        b["next_try"] = time.monotonic() + 60
+        print(f"[WARN] claude 予算の読込失敗（60秒後に再試行）: {type(e).__name__}: {e}")
+        return
+    if b["month"] != month:   # await 中に月を跨いだ
+        return
+    doc = doc or {}
+    b["usd"]    = max(b["usd"], float(doc.get("usd") or 0.0))
+    b["calls"]  = max(b["calls"], int(doc.get("calls") or 0))
+    b["loaded"] = True
+
+
+async def _claude_budget_flush(month: str, inc: dict) -> None:
+    try:
+        await claude_usage_col.update_one(
+            {"_id": month},
+            {"$inc": inc,
+             "$set": {"updated_at": datetime.datetime.now(datetime.timezone.utc)}},
+            upsert=True)
+    except Exception as e:
+        # ★Mongo 障害で返信を止めない。ミラーには加算済みなのでこのプロセス内のガードは効き続ける
+        print(f"[WARN] claude 使用量の記録失敗: {type(e).__name__}: {e}")
+
+
+def _claude_budget_add(usage: dict | None) -> float:
+    """1リクエスト分をミラーへ即加算し、Mongo へは $inc を投げっぱなしにする。"""
+    cost = _claude_cost_usd(usage)
+    _claude_budget_roll()
+    b = _claude_budget
+    b["usd"]   += cost
+    b["calls"] += 1
+    u = usage or {}
+    inc = {
+        "usd":   cost,
+        "calls": 1,
+        # input_tokens はキャッシュ読み書きも含めた入力合計で記録する
+        "input_tokens": int(u.get("input_tokens") or 0)
+                        + int(u.get("cache_read_input_tokens") or 0)
+                        + int(u.get("cache_creation_input_tokens") or 0),
+        "output_tokens": int(u.get("output_tokens") or 0),
+    }
+    try:
+        t = asyncio.get_running_loop().create_task(_claude_budget_flush(b["month"], inc))
+        _claude_bg_tasks.add(t)
+        t.add_done_callback(_claude_bg_tasks.discard)
+    except Exception as e:
+        print(f"[WARN] claude 使用量の記録タスク生成失敗: {type(e).__name__}: {e}")
+    return cost
+
+
+def _claude_is_fatal(err: ClaudeAPIError) -> bool:
+    """待っても直らない失敗か（キー無効・権限・残高/請求）。429/529 等の一時障害は含めない。"""
+    return (err.code in (401, 402, 403)
+            or err.status in ("authentication_error", "permission_error", "billing_error")
+            or "credit balance" in err.message.lower())
+
+
+async def _claude_generate(model: str, prompt: str, max_tokens: int,
+                           effort: str) -> dict:
+    """POST /v1/messages。返り値は _gemini_generate と同じ形に正規化。"""
+    if not ANTHROPIC_API_KEY:
+        raise ClaudeAPIError(0, "NO_API_KEY", "ANTHROPIC_API_KEY が未設定")
+    sess = await _gemini_http()   # ★Gemini と共用のセッション（意図的）
+    url  = f"{ANTHROPIC_API_BASE}/v1/messages"
+    # キーはヘッダのみ。URL/ログ/例外文には絶対に出さない
+    headers = {"x-api-key": ANTHROPIC_API_KEY,
+               "anthropic-version": ANTHROPIC_VERSION,
+               "content-type": "application/json"}
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+        "output_config": {"effort": effort},
+    }
+    async with sess.post(url, json=payload, headers=headers) as resp:
+        raw = await resp.text()
+        if resp.status >= 400:
+            err = _claude_error_from(resp.status, raw)
+            if _claude_is_fatal(err):
+                global _claude_cooldown_until
+                _claude_cooldown_until = time.monotonic() + CLAUDE_AUTH_COOLDOWN_SEC
+                print(f"[WARN] claude キー/残高エラー → {CLAUDE_AUTH_COOLDOWN_SEC}秒 Claude を外す: {err}")
+            raise err
+        try:
+            data = json.loads(raw) or {}
+        except Exception as e:
+            raise ClaudeAPIError(resp.status, "bad_json", f"{e}: {raw[:200]}")
+    # 課金は成功応答に乗った usage で確定する（拒否/本文ゼロでもトークンは消費済みなので計上）
+    _claude_budget_add(data.get("usage"))
+    return _claude_parse_response(data)
+
+
+async def _claude_startup_report() -> None:
+    """起動時に1行だけ Claude の有効/無効と理由を出す。"""
+    try:
+        if ANTHROPIC_API_KEY and not CLAUDE_DISABLED:
+            await _claude_budget_ensure_loaded()
+        reason = _claude_disabled_reason()
+        if reason is None:
+            b = _claude_budget
+            print(f"[claude] 有効: model={MODEL_CLAUDE} effort(会話/裏)={CLAUDE_EFFORT_CHAT}/"
+                  f"{CLAUDE_EFFORT_BG} 今月({b['month']}) ${b['usd']:.2f}/"
+                  f"${CLAUDE_BUDGET_SOFT_USD:.2f} calls={b['calls']}"
+                  f"{'' if b['loaded'] else '（※Mongo未読込・暫定0）'}")
+        else:
+            print(f"[claude] 無効（{reason}）→ Gemini 連鎖のみで動作")
+    except Exception as e:
+        print(f"[WARN] claude 起動チェック失敗: {type(e).__name__}: {e}")
+
+
+# =============================================================================
 # メモリ監視（Render無料枠は512MB。超えると強制再起動される）
 # =============================================================================
 # 「たまに上限を超える」は瞬間ピークの問題で、平均値を見ていても捕まらない。
@@ -471,6 +758,24 @@ BACKGROUND_CHAIN: list[tuple[str, int]] = [
 # 空応答が頻発し、80トークンの返信に1800〜3000トークン消費＝非効率。レスバも標準 MODEL_CHAIN
 # （flash-lite主）に戻した（2026-06-27）。gemma 自体はその後 2026-08-03 に完全撤去。
 print(f"[INFO] モデル設定完了: main={MODEL_BOOSTER}, fallback={MODEL_FALLBACK}")
+
+# ---- Claude（チェーン先頭・条件付き）-------------------------------------------
+# MODEL_CHAIN / BACKGROUND_CHAIN は「Gemini だけ」の定義のまま残し、Claude は実行時に
+# _chat_chain() / _background_chain() が先頭へ足す。キー未設定・CLAUDE_DISABLED=1・月次予算到達の
+# いずれかなら足さない＝「チェーンに入れておいて毎回 NO_API_KEY で落ちる」黙った失敗にしない。
+# ★max_tokens は思考トークン込み。会話でも 300 では adaptive thinking だけで枯れて空応答になるため 1536。
+# ★MODEL_BOOSTER 直指定の _call_model 呼び出し（チェーン外）は Gemini 固定のまま。
+MODEL_CLAUDE = os.environ.get("CLAUDE_MODEL") or "claude-haiku-5-5"
+CLAUDE_CHAT_ENTRY: tuple[str, int] = (MODEL_CLAUDE, 1536)
+CLAUDE_BG_ENTRY:   tuple[str, int] = (MODEL_CLAUDE, 4000)
+
+
+def _chat_chain() -> list[tuple[str, int]]:
+    return ([CLAUDE_CHAT_ENTRY] + MODEL_CHAIN) if _claude_available() else MODEL_CHAIN
+
+
+def _background_chain() -> list[tuple[str, int]]:
+    return ([CLAUDE_BG_ENTRY] + BACKGROUND_CHAIN) if _claude_available() else BACKGROUND_CHAIN
 
 # --- ランク・ロール設定 ---
 REMOVE_OLD_ROLES = True
@@ -2243,19 +2548,31 @@ def format_history(history: list[dict], current_persona: str | None = None) -> s
 
 
 async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
-                      temperature: float = 0.8, record_rate: bool = True) -> str:
+                      temperature: float = 0.8, record_rate: bool = True,
+                      effort: str | None = None) -> str:
     """単一モデルへのリクエスト。失敗時は例外をそのまま投げる。
     max_tokens 未指定時はモデル名から自動判定（thinking系は枠を大きめに）。
     temperature を上げたい呼び出し（例: ミミックの本音生成=0.85）は引数で渡す。
-    record_rate=False は「従来からRPM計数に含めていなかった裏処理」用（体感速度を変えないため）。"""
+    record_rate=False は「従来からRPM計数に含めていなかった裏処理」用（体感速度を変えないため）。
+    model が "claude-" で始まれば Anthropic へ。その場合 temperature は無視（Haiku 5.5 は
+    既定値以外を 400 で弾く）、effort 未指定は会話用（CLAUDE_EFFORT_CHAT）。"""
     if record_rate:
+        # ★Claude 呼び出しも同じく計数する（意図的）。Claude 側の RPM 上限は Gemini 無料枠より
+        #   ずっと緩いが、ここは「技術的上限」ではなく混雑時に返信を遅らせて人間らしい間を作る
+        #   行動的レート制御なので、プロバイダが変わっても体感ペースは変えない。
         _rate_record()  # レートリミッター記録
+    is_claude = model.startswith("claude-")
     if max_tokens is None:
         # thinking 系（gemini-3.5/3.6/2.5-flash 等）は思考トークンを出力枠から消費するため、
         # 300では思考だけで枯れて本文ゼロ（finish_reason=MAX_TOKENS）になる。
         # 主力の flash-lite 3.1 は短文返信なので従来どおり 300（コスト最小）。
+        # Claude も adaptive thinking が max_tokens を食うので 2048。
         max_tokens = 300 if model == MODEL_BOOSTER else 2048
-    response = await _gemini_generate(model, prompt, max_tokens, temperature)
+    if is_claude:
+        response = await _claude_generate(model, prompt, max_tokens,
+                                          effort or CLAUDE_EFFORT_CHAT)
+    else:
+        response = await _gemini_generate(model, prompt, max_tokens, temperature)
     # 実トークン計測: max_output_tokens を正しく決めるための実データ。
     # out(=thoughts+answer) が cap に張り付いていたら枠不足（thinking系で本文が出ず MAX_TOKENS になる）。
     um = response.get("usage")
@@ -2263,7 +2580,10 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
         th, ans = um["thoughts"], um["answer"]    # 思考トークン / 本文トークン
         print(f"[tokens] {model.split('/')[-1]} cap={max_tokens} "
               f"prompt={um['prompt']} thoughts={th} answer={ans} "
-              f"out={th + ans} total={um['total']}")
+              f"out={th + ans} total={um['total']}"
+              # Claude のみ: キャッシュ読み書きが発生したときだけ追記（Gemini のログ形は不変）
+              + (f" cache_read={um['cache_read']} cache_write={um['cache_write']}"
+                 if (um.get("cache_read") or um.get("cache_write")) else ""))
     text = response.get("text") or ""
     if not text.strip():
         # 空レスポンスの原因（MAX_TOKENS / SAFETY 等）を可視化
@@ -2276,7 +2596,9 @@ async def _call_model(model: str, prompt: str, max_tokens: int | None = None,
 
 def _is_503(e: Exception) -> bool:
     s = str(e)
-    return "503" in s or "UNAVAILABLE" in s or "high demand" in s.lower()
+    # 529 overloaded_error は Anthropic の「混雑」。Gemini の 503 と同じく一瞬粘る価値がある
+    return ("503" in s or "UNAVAILABLE" in s or "high demand" in s.lower()
+            or s.startswith("529 ") or "overloaded_error" in s)
 
 def _is_location_error(e: Exception) -> bool:
     s = str(e)
@@ -2354,10 +2676,13 @@ def _typing_delay(text: str) -> float:
 
 async def _run_ai_booster(prompt: str) -> str:
     """会話用AI呼び出し。MODEL_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
-    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。"""
-    for model, max_tokens in MODEL_CHAIN:
+    容量429/混雑時は別quotaの次モデルへ即フェイルオーバー（同一モデルへの粘りは503の一瞬だけ）。
+    Claude が使える時（_claude_available）だけ先頭に Claude（effort=low）が入る。"""
+    if ANTHROPIC_API_KEY and not CLAUDE_DISABLED:
+        await _claude_budget_ensure_loaded()   # 読込済みなら即return（O(1)）
+    for model, max_tokens in _chat_chain():
         try:
-            text = await _call_model(model, prompt, max_tokens)
+            text = await _call_model(model, prompt, max_tokens, effort=CLAUDE_EFFORT_CHAT)
             if text:
                 return text
             # 空（MAX_TOKENS/SAFETY等）＝このモデルでは生成できなかった→次モデルへ
@@ -2371,7 +2696,8 @@ async def _run_ai_booster(prompt: str) -> str:
                 # 瞬間的な高負荷の可能性。同モデルを1回だけ短く粘ってから次へ。
                 await asyncio.sleep(3)
                 try:
-                    text = await _call_model(model, prompt, max_tokens)
+                    text = await _call_model(model, prompt, max_tokens,
+                                             effort=CLAUDE_EFFORT_CHAT)
                     if text:
                         return text
                 except Exception as e2:
@@ -2394,11 +2720,15 @@ async def _run_ai_background(prompt: str, temperature: float = 0.1,
     """裏処理（プロフィール/記憶抽出・トーン分析等）用のAI呼び出し。
     BACKGROUND_CHAIN を上から順に試し、最初に本文が返ったモデルを採用する。
     速度不問なので粘らず、429/空応答は即座に別quotaの次モデルへ。全滅時は空文字を返す
-    （呼び出し側は従来どおり try/except または falsy チェックで握り潰す）。"""
-    for model, max_tokens in BACKGROUND_CHAIN:
+    （呼び出し側は従来どおり try/except または falsy チェックで握り潰す）。
+    Claude が使える時だけ先頭に Claude（effort=medium）が入る。"""
+    if ANTHROPIC_API_KEY and not CLAUDE_DISABLED:
+        await _claude_budget_ensure_loaded()
+    for model, max_tokens in _background_chain():
         try:
             text = await _call_model(model, prompt, max_tokens,
-                                     temperature=temperature, record_rate=record_rate)
+                                     temperature=temperature, record_rate=record_rate,
+                                     effort=CLAUDE_EFFORT_BG)
             if text:
                 return text
             print(f"[WARN] bg-chain {model}: 空レスポンス→次モデルへ")
@@ -2880,6 +3210,9 @@ killswitch_col = db["killswitch_snapshots"]   # キルスイッチ復旧スナ�
 guard_events_col = db["guard_events"]         # モデレーション・ガードのban/kick検知履歴
 interaction_dedup_col = db["interaction_dedup"]  # スラッシュコマンドの二重応答防止（インスタンス跨ぎ）
 invincible_col = db["invincible_users"]       # 無敵ユーザーの動的リスト（_id: str(user_id)）
+# Claude 月次使用量（_id: "YYYY-MM" UTC, $inc usd/calls/input_tokens/output_tokens）。
+# 参照する _claude_budget_* 関数は上の方で定義済みだが、グローバル名を呼び出し時に引くので順序は問題ない
+claude_usage_col = db["claude_usage"]
 
 
 class DedupCommandTree(app_commands.CommandTree):
@@ -9230,6 +9563,8 @@ async def _main():
 
     # メモリ監視はDiscord接続と独立に回す（429バックオフ中も記録が続く）
     asyncio.create_task(_mem_watch_task())
+    # Claude の有効/無効を起動ログに1行出す（キー有り時は当月予算を Mongo から先読み）
+    asyncio.create_task(_claude_startup_report())
 
     retry = 0
     # client は起動時に一度だけ生成済み（グローバル）。
