@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from claude_util import call_claude   # 連鎖の先頭に Claude（ANTHROPIC_API_KEY 未設定なら不活性）
 from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
 from consent_util import get_consent_filter  # 規約未同意ユーザーの発言をLLMへ送らない
 
@@ -238,6 +239,12 @@ def generate_summary(client_ai: genai.Client, log_text: str, context: str) -> st
     if context:
         user_prompt += f"【前後の文脈】\n{context}\n\n---\n\n"
     user_prompt += f"【対象日のログ】\n{log_text}"
+
+    # 先頭は Claude（散文なので schema 無し）。None なら従来の Gemini 連鎖へ
+    text = call_claude(user_prompt, output_tokens(5500), label="retro")
+    if text:
+        print(f"[retro] Claude 成功 ({len(text)}文字)")
+        return text.strip()
 
     for model, label in HEAVY_MODEL_CHAIN:
         for attempt in range(ATTEMPTS_PER_MODEL):

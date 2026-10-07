@@ -14,6 +14,14 @@ gemma-4（31b / 26b-a4b）は「TPM 実質無制限」を理由に重い処理�
 3.5-flash（新しく速い・枠が別）を主にし、実績のある 2.5 系を中段、最後に 3.6-flash。
 上から順に試し、最初に本文が返ったモデルを採用する。
 
+■ 2026-10-08: 連鎖の「前」に Claude（claude-haiku-5-5）を1回だけ挟む
+各スクリプトの呼び出しループは、この連鎖に入る前に batch/claude_util.py の call_claude() を叩く。
+env ANTHROPIC_API_KEY 未設定・CLAUDE_DISABLED=1・Mongo 不通・月次予算(CLAUDE_BUDGET_SOFT_USD,
+Render と共有の claude_usage)到達・キー/残高エラーのいずれかなら Claude は1リクエストも飛ばさず
+None を返し、ここの Gemini 連鎖がそのまま走る。429/529/5xx・拒否・空応答も待たずにここへ落ちる。
+Claude は「別プロバイダ」なので HEAVY_MODEL_CHAIN には入れていない（SDK も quota も別物のため）。
+JSON を返す処理は claude_util.py の *_SCHEMA で structured outputs を使う（Gemini 側は従来どおり）。
+
 ★モデルIDは /listmodels（= client.models.list()）で実在確認してから触ること。
   無効名は例外で黙ってスキップされ「容量が増えた気がするだけで実際ゼロ」になる。
   現行4件は 2026-08-03 に models.list で実在確認済み。

@@ -29,6 +29,8 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from claude_util import (call_claude, PERSONALITY_TONE_SCHEMA,   # 連鎖の先頭に Claude（キー未設定なら不活性）
+                         PERSONALITY_CONTEXT_SCHEMA, PERSONALITY_BIGFIVE_SCHEMA)
 from consent_util import get_consent_filter  # 規約未同意者を分析母集団から外す
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -171,9 +173,14 @@ def _extract_retry_wait(err: str) -> float:
     return float(m.group(1)) + 2.0 if m else 60.0
 
 
-def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 1500) -> str | None:
-    # 関数名は歴史的経緯（旧 gemma 主体）。中身は HEAVY_MODEL_CHAIN の Gemini flash 連鎖。
+def call_gemma(client: genai.Client, prompt: str, max_tokens: int = 1500,
+               schema: dict | None = None) -> str | None:
+    # 関数名は歴史的経緯（旧 gemma 主体）。中身は Claude（あれば）→ HEAVY_MODEL_CHAIN の Gemini flash 連鎖。
+    # schema は Claude の structured outputs 専用（Gemini 側には送らない）。
     max_tokens = output_tokens(max_tokens)   # thinking 系の空応答対策（下限を効かせる）
+    text = call_claude(prompt, max_tokens, schema=schema, label="personality")
+    if text:
+        return text.strip()
     for model, label in HEAVY_MODEL_CHAIN:
         for attempt in range(ATTEMPTS_PER_MODEL):
             try:
@@ -527,7 +534,8 @@ def infer_bigfive(client: genai.Client, name: str, utterances: list[str]) -> dic
         signals=signals_to_text(signals),
         utterances="\n".join(f"- {u}" for u in utterances),
     )
-    raw = call_gemma(client, prompt, max_tokens=3000)   # 10項目JSON＋thinking予算の余裕
+    raw = call_gemma(client, prompt, max_tokens=3000,   # 10項目JSON＋thinking予算の余裕
+                     schema=PERSONALITY_BIGFIVE_SCHEMA)
     parsed = parse_json(raw, name)
     if not parsed or "items" not in parsed:
         return None
@@ -542,7 +550,8 @@ def analyze_tone(client: genai.Client, name: str, utterances: list[str]) -> dict
     if not utterances:
         return None
     text = "\n".join(f"- {u}" for u in utterances)
-    raw = call_gemma(client, TONE_PROMPT.format(name=name, utterances=text), max_tokens=1500)
+    raw = call_gemma(client, TONE_PROMPT.format(name=name, utterances=text), max_tokens=1500,
+                     schema=PERSONALITY_TONE_SCHEMA)
     return parse_json(raw, name)
 
 
@@ -553,6 +562,7 @@ def analyze_context(client: genai.Client, name: str, summaries_text: str) -> dic
         client,
         CONTEXT_PROMPT.format(name=name, days=SUMMARY_DAYS, summaries=summaries_text),
         max_tokens=2000,
+        schema=PERSONALITY_CONTEXT_SCHEMA,
     )
     return parse_json(raw, name)
 

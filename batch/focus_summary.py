@@ -24,6 +24,7 @@ from google.genai import types
 from embed_util import embed_query, cosine   # Tier3: keyword 意味検索（summaries embedding 規約）
 from consent_util import get_consent_filter  # 規約未同意ユーザーの発言をLLMへ送らない
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from claude_util import call_claude, FOCUS_PROFILE_SCHEMA, MEMORIES_SCHEMA   # 連鎖の先頭に Claude（キー未設定なら不活性）
 from discord_post import split_for_field, pack_fields_into_embeds, post_embeds
 
 FOCUS_TYPE    = os.environ["FOCUS_TYPE"]    # "member" or "keyword"
@@ -759,8 +760,12 @@ def _extract_retry_wait(err: str) -> float:
 
 
 def call_ai(client_ai: genai.Client, prompt: str, max_tokens: int = 2000,
-            temperature: float = 0.3) -> str | None:
+            temperature: float = 0.3, schema: dict | None = None) -> str | None:
+    # temperature は Gemini 専用（Claude Haiku 5.5 は送ると 400）。schema は Claude の structured outputs 専用。
     max_tokens = output_tokens(max_tokens)   # thinking 系の空応答対策（下限を効かせる）
+    text = call_claude(prompt, max_tokens, schema=schema, label="focus")
+    if text:
+        return text.strip()
     for model, label in HEAVY_MODEL_CHAIN:
         for attempt in range(ATTEMPTS_PER_MODEL):
             try:
@@ -853,7 +858,7 @@ def extract_profile(client_ai: genai.Client, report: str) -> dict | None:
     # レポートは分量要件で6000字超になる。4000字で切ると後半の「時系列」「総合評価」を
     # 丸ごと捨ててプロフィールを抽出することになるため、全文が入る余裕を取る。
     prompt = PROFILE_UPDATE_PROMPT.format(name=FOCUS_NAME, report=report[:12000])
-    raw    = call_ai(client_ai, prompt, max_tokens=2000)
+    raw    = call_ai(client_ai, prompt, max_tokens=2000, schema=FOCUS_PROFILE_SCHEMA)
     if not raw:
         return None
     try:
@@ -909,7 +914,7 @@ def save_memories_from_focus(client_ai: genai.Client, users_col, report: str):
 
     # call_ai 経由で HEAVY_MODEL_CHAIN のリトライ/フォールバックに乗せる
     # （旧実装は models/gemma-3-27b-it 直書きで 404 NOT_FOUND になり常に失敗していた）
-    raw = call_ai(client_ai, prompt, max_tokens=2000, temperature=0.1)
+    raw = call_ai(client_ai, prompt, max_tokens=2000, temperature=0.1, schema=MEMORIES_SCHEMA)
     if not raw:
         print("[WARN] focus memories extract: 空/失敗（スキップ）")
         return

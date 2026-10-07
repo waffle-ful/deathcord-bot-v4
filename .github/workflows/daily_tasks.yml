@@ -21,6 +21,7 @@ jobs:
       - name: 性格分析（Big Five/TIPI-J・全メンバー対象・1回最大25人ローテーション）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/analyze_personality.py
 
@@ -38,6 +39,7 @@ jobs:
       - name: 非ブースター簡易分析（要約ログから発言パターン抽出・1回最大20人）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/analyze_nonbooster.py
 
@@ -55,6 +57,7 @@ jobs:
       - name: claims・memories補完（retroreportから長期記憶を補充）
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/enrich_memories.py
 

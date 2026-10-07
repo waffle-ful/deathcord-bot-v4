@@ -18,6 +18,7 @@ from google.genai import types
 
 from embed_util import embed_document   # focus Tier3: summaries 意味検索用 embedding 規約
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from claude_util import call_claude   # 連鎖の先頭に Claude（ANTHROPIC_API_KEY 未設定なら不活性）
 
 GEMINI_API_KEY         = os.environ["GEMINI_API_KEY"]
 # 要約生成モデルは batch/model_chain.py に集約（gemma-4 は TPM 無制限枠の撤廃により 2026-08-03 に撤去）
@@ -85,18 +86,23 @@ def format_messages_for_prompt(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _user_text(log_text: str) -> str:
+    """Gemini / Claude 共通のユーザー発話（system は SUMMARY_SYSTEM_PROMPT）。"""
+    return (
+        "以下のDiscordチャットログの観察メモを書いてください。\n"
+        "【重要】前置きや導入文は一切書かないこと。各セクションの見出しから即座に本文を始めること。\n"
+        "各セクションは具体的に（箇条書き指定のセクションは最低3項目）書くこと。\n\n"
+        f"{log_text}"
+    )
+
+
 def _generate_with_model(client: genai.Client, model: str, log_text: str) -> str:
     response = client.models.generate_content(
         model=model,
         contents=[
             types.Content(
                 role="user",
-                parts=[types.Part(text=(
-                    "以下のDiscordチャットログの観察メモを書いてください。\n"
-                    "【重要】前置きや導入文は一切書かないこと。各セクションの見出しから即座に本文を始めること。\n"
-                    "各セクションは具体的に（箇条書き指定のセクションは最低3項目）書くこと。\n\n"
-                    f"{log_text}"
-                ))]
+                parts=[types.Part(text=_user_text(log_text))]
             )
         ],
         config=types.GenerateContentConfig(
@@ -109,6 +115,13 @@ def _generate_with_model(client: genai.Client, model: str, log_text: str) -> str
 
 
 def generate_summary(client: genai.Client, log_text: str) -> str:
+    # 先頭は Claude（不活性・失敗・拒否なら None → 従来の Gemini 連鎖へ）。散文なので schema 無し
+    summary = call_claude(_user_text(log_text), output_tokens(5500),
+                          system=SUMMARY_SYSTEM_PROMPT, label="summarize")
+    if summary:
+        print(f"[summarize] 完了 ({len(summary)} chars) - Claude")
+        return summary.strip()
+
     for model, label in HEAVY_MODEL_CHAIN:
         for attempt in range(ATTEMPTS_PER_MODEL):
             try:

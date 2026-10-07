@@ -38,6 +38,9 @@
 | `FOCUS_TYPE` | ✅ | focus_summary | workflow_dispatch input（`member` or `keyword`） |
 | `FOCUS_TARGET` | ✅ | focus_summary | メンバー ID or キーワード文字列 |
 | `FOCUS_NAME` | ✅ | focus_summary | 表示名 |
+| `ANTHROPIC_API_KEY` | ○ | summarize, analyze_*, enrich_memories, retro_summarize(+backfill), focus_summary | 設定すると各バッチの呼び出しループ先頭で Claude（`batch/claude_util.py`）を1回試し、駄目なら Gemini 連鎖へ。**未設定(secret 未登録=空)なら完全不活性**。`CLAUDE_MODEL` / `CLAUDE_DISABLED` / `ANTHROPIC_API_BASE` も main.py と同じ意味で効く |
+| `CLAUDE_EFFORT_BATCH` | ○ | 同上 | effort。既定 `medium` |
+| `CLAUDE_BUDGET_SOFT_USD` | ○ | 同上 | 月次ソフト上限(UTC暦月)。既定 `80`。**Render と同じ Mongo `claude_usage` を共有**（batch 分は `batch_calls` にも計上）。Mongo に繋がらない run は Claude を使わない（安全側）ので、上記バッチには `MONGODB_URI` も必要 |
 
 ### market_report.py
 

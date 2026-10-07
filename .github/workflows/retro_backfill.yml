@@ -51,6 +51,7 @@ jobs:
           DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
           EXCLUDE_CHANNEL_IDS: ${{ secrets.EXCLUDE_CHANNEL_IDS }}
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
           MONGODB_URI:         ${{ secrets.MONGODB_URI }}
           SUMMARY_CHANNEL_ID:  ${{ secrets.SUMMARY_CHANNEL_ID }}
         run: python batch/retro_backfill.py

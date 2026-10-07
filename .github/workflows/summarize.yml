@@ -38,6 +38,8 @@ jobs:
       - name: Summarize
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MONGODB_URI:    ${{ secrets.MONGODB_URI }}
         run: python batch/summarize.py
 
       - name: Update MongoDB

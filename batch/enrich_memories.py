@@ -24,6 +24,7 @@ from google import genai
 from google.genai import types
 
 from model_chain import HEAVY_MODEL_CHAIN, ATTEMPTS_PER_MODEL, output_tokens
+from claude_util import call_claude, MEMORIES_SCHEMA   # 連鎖の先頭に Claude（キー未設定なら不活性）
 from consent_util import get_consent_filter  # 規約未同意者を抽出対象から外す
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -117,6 +118,10 @@ def _extract_retry_wait(err: str) -> float:
 
 
 def call_ai(client: genai.Client, prompt: str) -> str | None:
+    # 先頭は Claude（structured outputs）。None なら従来の Gemini 連鎖へ
+    text = call_claude(prompt, output_tokens(1500), schema=MEMORIES_SCHEMA, label="enrich")
+    if text:
+        return text.strip()
     for model, label in HEAVY_MODEL_CHAIN:
         for attempt in range(ATTEMPTS_PER_MODEL):
             try:
