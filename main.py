@@ -1,3 +1,12 @@
+import sys
+# Render はログを pipe で受けるため、Python の stdout は既定でブロックバッファ（数KB 溜まるまで出ない）。
+# 「返答はあるのにログが出ない／数分後にまとめて出る」の正体。行バッファにして print を即時に流す。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 import discord
 from discord import app_commands
 import datetime
@@ -810,12 +819,26 @@ CLAUDE_CHAT_ENTRY: tuple[str, int] = (MODEL_CLAUDE, 1536)
 CLAUDE_BG_ENTRY:   tuple[str, int] = (MODEL_CLAUDE, 4000)
 
 
+_claude_skip_logged: str | None = None   # 直前にログに出した除外理由（変わった時だけ出す）
+
+
+def _claude_chain_head() -> bool:
+    """Claude を連鎖の先頭に入れるか。除外理由が変わった時だけ1行ログに出す
+    （以前は黙って Gemini だけの連鎖になり、ログからは「Claude が使われない理由」が分からなかった）。"""
+    global _claude_skip_logged
+    reason = _claude_disabled_reason()
+    if reason != _claude_skip_logged:
+        print(f"[claude] 連鎖から除外: {reason}" if reason else "[claude] 連鎖の先頭に復帰")
+        _claude_skip_logged = reason
+    return reason is None
+
+
 def _chat_chain() -> list[tuple[str, int]]:
-    return ([CLAUDE_CHAT_ENTRY] + MODEL_CHAIN) if _claude_available() else MODEL_CHAIN
+    return ([CLAUDE_CHAT_ENTRY] + MODEL_CHAIN) if _claude_chain_head() else MODEL_CHAIN
 
 
 def _background_chain() -> list[tuple[str, int]]:
-    return ([CLAUDE_BG_ENTRY] + BACKGROUND_CHAIN) if _claude_available() else BACKGROUND_CHAIN
+    return ([CLAUDE_BG_ENTRY] + BACKGROUND_CHAIN) if _claude_chain_head() else BACKGROUND_CHAIN
 
 # --- ランク・ロール設定 ---
 REMOVE_OLD_ROLES = True
