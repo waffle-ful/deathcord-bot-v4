@@ -388,6 +388,11 @@ CLAUDE_DISABLED = (os.environ.get("CLAUDE_DISABLED", "").strip().lower()
 # effort: 会話は速度優先で low、裏処理は速度不問なので medium
 CLAUDE_EFFORT_CHAT = os.environ.get("CLAUDE_EFFORT_CHAT") or "low"
 CLAUDE_EFFORT_BG   = os.environ.get("CLAUDE_EFFORT_BG") or "medium"
+# 規約ゲートとの連動（2026-10-08）: Anthropic への送信を利用規約に明記したのは規約 v2 から。
+# ゲートが有効で、Mongo 上の規約版（_tos_gate["version"]）が v2 未満なら Claude を使わない。
+# ＝ 旧版コードが動いている Render にキーだけ先に入っても、v1 同意者のデータが Claude へ流れない保険。
+# batch 側の同等品は batch/claude_util.py の CLAUDE_MIN_TOS_VERSION。両方を同じ値に保つこと。
+CLAUDE_MIN_TOS_VERSION = 2
 
 # ---- 月次予算ガード ----------------------------------------------------------
 # 単価（USD / 100万トークン）。2026-10-07 時点の Haiku 5.5 料金ページより。
@@ -515,6 +520,9 @@ def _claude_disabled_reason(now: datetime.datetime | None = None) -> str | None:
         return "ANTHROPIC_API_KEY 未設定"
     if CLAUDE_DISABLED:
         return "CLAUDE_DISABLED=1"
+    if _tos_gate.get("enabled") and int(_tos_gate.get("version") or 0) < CLAUDE_MIN_TOS_VERSION:
+        return (f"規約ゲートが v{int(_tos_gate.get('version') or 0)}"
+                f"（Claude 送信は規約 v{CLAUDE_MIN_TOS_VERSION} 以降の同意が必要）")
     if time.monotonic() < _claude_cooldown_until:
         return "キー/残高エラーで一時停止中"
     _claude_budget_roll(now)
@@ -6692,7 +6700,12 @@ async def quiz_teardown_cmd(interaction: discord.Interaction):
 #   権限だけに頼らず on_message 側でも未同意者の記録を止める（二重の保険）。
 # =============================================================================
 
-TOS_VERSION      = 1              # 規約の版。改定して上げた場合は再同意を求める（強制はv2で）
+# 規約の版。上げると _load_tos_gate() の `$gte` により旧版同意者は全員「未同意」に戻る
+# （ロールは剥がさないので発言はできるが、bot は記録も LLM 送信もしない）。改定時の手順:
+#   doc/terms-and-privacy.md 改定 → ここを上げる → deploy → /規約パネル再掲 → (必要なら) キー投入
+# v1: 2026-08-16 Gemini 無料枠の学習利用を明記
+# v2: 2026-10-08 Anthropic Claude API を主たるAIとして追加（学習利用なし・30日削除）。Gemini は予備＋ベクトル化
+TOS_VERSION      = 2
 TOS_CHANNEL_NAME = "利用規約"
 TOS_DOC_URL      = os.environ.get("TOS_DOC_URL") or ""   # 規約全文の掲載先（任意）
 
@@ -6700,7 +6713,8 @@ TOS_DOC_URL      = os.environ.get("TOS_DOC_URL") or ""   # 規約全文の掲載
 _TOS_SEND_PERMS = ("send_messages", "send_messages_in_threads",
                    "create_public_threads", "create_private_threads")
 
-_tos_gate: dict = {"enabled": False, "role_id": 0, "channel_id": 0, "locked": False}
+_tos_gate: dict = {"enabled": False, "role_id": 0, "channel_id": 0, "locked": False,
+                   "version": 0}   # version = Mongo 上の規約版（batch/consent_util.py が読む唯一の真実）
 _tos_agreed_ids: set[int] = set()   # 同意済み user_id。毎メッセージの DB 読みを避けるため in-memory
 
 
@@ -6720,27 +6734,43 @@ def tos_allows(user_id: int) -> bool:
 async def _load_tos_gate():
     """起動時に規約ゲート設定と同意済みリストを読み込む。
     読込に失敗したときは「誰も同意していない」状態に倒す＝記録を止める側（fail-closed）。
-    プライバシー機構なので、疑わしいときは取らない方向に倒すのが正しい。"""
-    try:
-        doc = await system_col.find_one({"_id": "tos_gate"}) or {}
-        _tos_gate["enabled"]    = bool(doc.get("enabled", False))
-        _tos_gate["role_id"]    = int(doc.get("role_id", 0) or 0)
-        _tos_gate["channel_id"] = int(doc.get("channel_id", 0) or 0)
-        _tos_gate["locked"]     = bool(doc.get("locked", False))
-        _tos_agreed_ids.clear()
-        async for d in users_col.find({"tos_agreed.version": {"$gte": TOS_VERSION}}, {"_id": 1}):
-            try:
-                _tos_agreed_ids.add(int(d["_id"]))
-            except (ValueError, KeyError):
-                continue
-        print(f"[tos] 規約ゲート: enabled={_tos_gate['enabled']} locked={_tos_gate['locked']} "
-              f"role={_tos_gate['role_id']} ch={_tos_gate['channel_id']} "
-              f"同意済み={len(_tos_agreed_ids)}人 (v{TOS_VERSION})")
-    except Exception as e:
-        print(f"[tos] ★設定読込失敗（未同意扱いで継続＝記録を止める側に倒す）: {e}")
+    プライバシー機構なので、疑わしいときは取らない方向に倒すのが正しい。
+    ★2026-10-08 まで、失敗時は enabled=False のまま＝ tos_allows() が全員 True を返す fail-open だった。
+      いまは enabled=True・同意者ゼロに倒し、60秒おきに読み直す。"""
+    while True:
+        try:
+            doc = await system_col.find_one({"_id": "tos_gate"}) or {}
+            _tos_gate["enabled"]    = bool(doc.get("enabled", False))
+            _tos_gate["role_id"]    = int(doc.get("role_id", 0) or 0)
+            _tos_gate["channel_id"] = int(doc.get("channel_id", 0) or 0)
+            _tos_gate["locked"]     = bool(doc.get("locked", False))
+            _tos_gate["version"]    = int(doc.get("version", 0) or 0)
+            _tos_agreed_ids.clear()
+            async for d in users_col.find({"tos_agreed.version": {"$gte": TOS_VERSION}}, {"_id": 1}):
+                try:
+                    _tos_agreed_ids.add(int(d["_id"]))
+                except (ValueError, KeyError):
+                    continue
+            # 版の自動同期: batch/consent_util.py は Mongo の version を唯一の真実として読む。
+            # TOS_VERSION を上げてデプロイしただけだと batch 側が旧版のまま走る穴があった
+            # （2026-10-08 に判明）。ゲート設置済み（doc あり）で版が違えばここで書き戻す。
+            if doc and _tos_gate["version"] != TOS_VERSION:
+                old = _tos_gate["version"]
+                await _save_tos_gate()
+                print(f"[tos] 規約版を Mongo に同期: v{old} → v{TOS_VERSION}（batch 側もこの版で判定）")
+            print(f"[tos] 規約ゲート: enabled={_tos_gate['enabled']} locked={_tos_gate['locked']} "
+                  f"role={_tos_gate['role_id']} ch={_tos_gate['channel_id']} "
+                  f"同意済み={len(_tos_agreed_ids)}人 (v{TOS_VERSION})")
+            return
+        except Exception as e:
+            _tos_gate["enabled"] = True      # 判定不能 → 誰も同意していない扱い（記録・LLM送信を止める）
+            _tos_agreed_ids.clear()
+            print(f"[tos] ★設定読込失敗（未同意扱い＝記録を止める側に倒す。60秒後に再試行）: {e}")
+            await asyncio.sleep(60)
 
 
 async def _save_tos_gate():
+    _tos_gate["version"] = TOS_VERSION
     await system_col.update_one({"_id": "tos_gate"}, {"$set": {
         "enabled":    _tos_gate["enabled"],
         "role_id":    _tos_gate["role_id"],
@@ -6768,9 +6798,13 @@ def _tos_embed() -> discord.Embed:
         inline=False)
     e.add_field(
         name="② 外部AIサービスへ送られます（重要）",
-        value=("発言は Google の Gemini API へ送信されます。**現在は無料枠で運用しているため、"
-               "Googleの規約により、送信内容はGoogleの製品改善・機械学習に利用され、"
-               "人間のレビュアーが読む可能性があります。**\n"
+        value=("発言は次の2社のAIへ送信されます。\n"
+               "**Anthropic（Claude API）＝主に使用**: 有料APIのため、送信内容は**AIの学習には使われず、"
+               "原則30日で自動削除**されます（規約違反の疑いを自動検知された場合のみ最長2年保持）。\n"
+               "**Google（Gemini API・無料枠）**: ①Claudeが使えない時の代替 ②**メイドへのあなたの発言は、"
+               "記憶検索のため毎回Geminiでベクトル化（数値変換）されます** ③`/mimic`・`/相性`のコメント・"
+               "昇格メッセージは引き続きGeminiが生成。**無料枠のため、送信内容はGoogleの"
+               "製品改善・機械学習に利用され、人間のレビュアーが読む可能性があります。**\n"
                "→ **本名・住所・連絡先・秘密・健康や信条などの機微な情報は書き込まないでください。**"),
         inline=False)
     e.add_field(
@@ -6793,10 +6827,28 @@ def _tos_embed() -> discord.Embed:
         value=("`/privacy` AI性格推定の停止 ／ `/myprofile` 保存内容の確認 ／ "
                "`/clearmaid` 会話履歴の消去 ／ 運営へDMで照会・削除請求"),
         inline=False)
+    e.add_field(
+        name="⑥ 以前の版（v1）に同意済みの方へ",
+        value=("今回の変更点は **Anthropic（Claude）の追加** です。学習に使われないサービスが主になるため、"
+               "取扱いは以前より安全側になります。他の項目は変わりません。\n"
+               "**もう一度「同意して参加する」を押すまで、botはあなたの発言を記録・処理しません**"
+               "（発言自体はできます）。"),
+        inline=False)
     if TOS_DOC_URL:
         e.add_field(name="規約全文", value=TOS_DOC_URL, inline=False)
     e.set_footer(text=f"規約バージョン v{TOS_VERSION} ・ 同意した日時が記録されます")
     return e
+
+
+# /規約パネル再掲 の既定告知文。改定のたびに書き換える（@everyone は付けない。付けるなら管理者が別途）
+_TOS_REVISION_NOTICE = (
+    f"📢 **利用規約を改定しました（v{TOS_VERSION}・2026-10-08）**\n"
+    "変更点: AIサービスに **Anthropic の Claude API** を追加し、主に使用します。"
+    "Claude は送信内容を学習に使わず、原則30日で削除します。"
+    "Google Gemini（無料枠）は予備と検索用のベクトル化に引き続き使います。\n"
+    "**すでに同意済みの方も、下のパネルでもう一度「同意して参加する」を押してください。**"
+    "押すまでの間は、発言はできますが bot はあなたの発言を記録・処理しません。"
+)
 
 
 class TosConsentView(discord.ui.View):
@@ -6890,6 +6942,12 @@ async def tos_setup_cmd(interaction: discord.Interaction, role: discord.Role):
         return
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    already = bool(_tos_gate.get("role_id"))
+    if already and _tos_gate.get("role_id") != role.id and _tos_gate.get("locked"):
+        await interaction.followup.send(
+            "⚠️ ロック適用中に同意済みロールを変えることはできません。先に `/規約ロック解除` してください。",
+            ephemeral=True)
+        return
 
     # ① 利用規約ch（全員が閲覧できるが発言はできない）
     ch = discord.utils.get(guild.text_channels, name=TOS_CHANNEL_NAME)
@@ -6916,12 +6974,22 @@ async def tos_setup_cmd(interaction: discord.Interaction, role: discord.Role):
     await ch.send(embed=_tos_embed(), view=TosConsentView())
 
     # ③ 設定保存（ロックはまだ掛けない＝この時点では誰も締め出さない）
+    #   ★すでに設置済み（role_id あり）なら enabled/locked は触らない。改定時にこのコマンドを
+    #     叩き直すと記録ガードが OFF に戻ってしまう穴があった（2026-10-08）。改定の再掲は /規約パネル再掲 を使う。
     _tos_gate["role_id"]    = role.id
     _tos_gate["channel_id"] = ch.id
-    _tos_gate["enabled"]    = False
-    _tos_gate["locked"]     = False
+    if not already:
+        _tos_gate["enabled"] = False
+        _tos_gate["locked"]  = False
     await _save_tos_gate()
 
+    if already:
+        await interaction.followup.send(
+            f"✅ 設定を更新し、パネルを再掲しました（ゲート状態は変更していません: "
+            f"記録ガード={'ON' if _tos_gate['enabled'] else 'OFF'} / ロック={'適用中' if _tos_gate['locked'] else '未適用'}）。\n"
+            f"規約ch: {ch.mention}\n同意済みロール: {role.mention}\n"
+            f"※規約改定の告知を兼ねるなら `/規約パネル再掲` の方が告知文つきで再掲できます。", ephemeral=True)
+        return
     await interaction.followup.send(
         f"✅ 設置しました。\n規約ch: {ch.mention}\n同意済みロール: {role.mention}\n\n"
         f"まだ**誰も締め出していません**。次の手順で進めてね:\n"
@@ -7102,6 +7170,53 @@ async def tos_unlock_cmd(interaction: discord.Interaction):
         f"🔓 復元しました（{restored}ch）。ゲートはOFF＝全員が元どおり喋れます。\n"
         f"同意記録自体は消えていないので、再ロックすれば同意済みの人はそのまま解放されます。{fail_txt}",
         ephemeral=True)
+
+
+@client.tree.command(name="規約パネル再掲",
+                     description="【管理者】規約改定時: 告知文＋新しい版の同意パネルを #利用規約 に再掲（ゲート状態は変えない）")
+@app_commands.describe(notice="告知文（省略時は既定の改定告知）", ping_everyone="告知で @everyone を鳴らす")
+@app_commands.default_permissions(administrator=True)
+async def tos_repost_cmd(interaction: discord.Interaction, notice: str | None = None,
+                         ping_everyone: bool = False):
+    if not await check_home_guild(interaction):
+        return
+    if not _tos_is_admin(interaction):
+        await interaction.response.send_message("管理者専用だよ。", ephemeral=True)
+        return
+    guild = interaction.guild
+    ch = guild.get_channel(_tos_gate.get("channel_id", 0) or 0) \
+        or discord.utils.get(guild.text_channels, name=TOS_CHANNEL_NAME)
+    if ch is None:
+        await interaction.response.send_message(
+            "規約chが見つかりません。先に `/規約ゲート設定` を実行してください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    text = (notice or _TOS_REVISION_NOTICE).strip()
+    if ping_everyone:
+        text = "@everyone\n" + text
+    try:
+        msg = await ch.send(
+            content=text, embed=_tos_embed(), view=TosConsentView(),
+            allowed_mentions=discord.AllowedMentions(everyone=ping_everyone, users=False, roles=False))
+    except Exception as e:
+        await interaction.followup.send(f"❌ 再掲に失敗: {e}", ephemeral=True)
+        return
+    try:
+        await msg.pin(reason=f"利用規約 v{TOS_VERSION} 再掲")
+    except Exception as e:
+        print(f"[tos] ピン留め失敗（権限不足?）: {e}")
+    # Mongo 側の版を確実に最新へ（_load_tos_gate でも同期するが、手動の保険）
+    if _tos_gate.get("version") != TOS_VERSION:
+        await _save_tos_gate()
+    humans  = [m for m in guild.members if not m.bot]
+    pending = [m for m in humans if m.id not in _tos_agreed_ids]
+    await interaction.followup.send(
+        f"📢 再掲しました → {msg.jump_url}\n"
+        f"・規約 v{TOS_VERSION} 同意済み: **{len(humans) - len(pending)}人** / "
+        f"未同意（旧版のみ同意も含む）: **{len(pending)}人**\n"
+        f"・ゲート状態は変更していません（記録ガード={'ON' if _tos_gate.get('enabled') else 'OFF'} / "
+        f"ロック={'適用中' if _tos_gate.get('locked') else '未適用'}）。\n"
+        f"・旧版のみ同意の人は、再同意するまで発言はできますが bot には見えません。", ephemeral=True)
 
 
 @client.tree.command(name="規約ゲート状態", description="【管理者】同意状況と未同意メンバーを確認")

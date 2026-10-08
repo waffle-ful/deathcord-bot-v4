@@ -33,6 +33,20 @@
 | 添付・画像の中身は保存も送信もしない | `attachments` の参照は `main.py:3231-3232` の1箇所のみ（無敵機能の再投稿用にURLをメモリ保持）。Geminiへ画像を送る経路（`inline_data`/`mime_type`/`from_bytes`）は0件＝テキストのみ送信 |
 | DMも記録対象 | `on_message`（`main.py:2817-2847`）にホームギルド判定が無く、`message.guild is None` を許容して `guild_id: ""` で保存している＝DMも `messages` に入る |
 
+## 規約 v2（2026-10-08）: Anthropic Claude API の追加
+
+| 規約の記述 | 根拠（file:行は 2026-10-08 時点） |
+|---|---|
+| §4-1 Claude を主として利用（会話・裏処理・batch） | `main.py` `_chat_chain()` / `_background_chain()`（`ANTHROPIC_API_KEY` があれば連鎖の先頭に `CLAUDE_CHAT_ENTRY` / `CLAUDE_BG_ENTRY`）、`_claude_generate`。batch は `batch/claude_util.py call_claude()`（summarize / focus / retro / personality / nonbooster / enrich の6本が import） |
+| §4-1 学習利用なし・30日削除・違反検知時は最長2年 | Anthropic Privacy Center「Is my data used for model training?」「How long do you store my data?」（`doc/claude-api-notes.md` §2 に引用） |
+| §4-2 Claude 不可時は Gemini が代替 | `_chat_chain()` が Claude の後ろに `MODEL_CHAIN` を続ける。`call_claude()` が None を返すと `HEAVY_MODEL_CHAIN` |
+| §4-2 **発言そのものを毎回 Gemini でベクトル化** | `search_memories`（`main.py:1541` `_get_embedding(query)`）と日報RAG（`main.py:1830` `_embed_query_for_summaries(query)`）が、メイド応答ごとに**受信メッセージ本文**を埋め込む。保存側は `main.py:1438`（記憶）と `batch/embed_util.py`（要約） |
+| §4-2 mimic・/相性コメント・昇格メッセージは Gemini が主 | `_call_model(MODEL_BOOSTER, ...)` 直指定4箇所: `_run_mimic_session`（`main.py:1326`）、`_mimic_react`（`:1353`）、`_aisho_comment`（`:2427`）、`_generate_rankup_message`（`:3655`）。`_chat_chain()` を通らないので Claude は使われない |
+| 規約 v2 未満の同意では Claude に送らない | `main.py` `CLAUDE_MIN_TOS_VERSION=2` を `_claude_disabled_reason` で判定（`_tos_gate["version"]`＝Mongo `system.tos_gate.version`）。batch は `claude_util._tos_ok()`（同じ doc を読む・読めなければ不活性） |
+| 版の真実は Mongo の `tos_gate.version` | `_load_tos_gate()` が起動時に `TOS_VERSION` と違えば `_save_tos_gate()` で書き戻す（以前は `/規約ゲート設定` の再実行が必要だった） |
+| 版を上げても発言は止めない（bot から見えなくなるだけ） | `_load_tos_gate()` の `$gte TOS_VERSION` で `_tos_agreed_ids` から外れる。ロールを剥がす処理は無い。パネル⑥と `/規約パネル再掲` の告知文に明記 |
+| 改定の再掲は `/規約パネル再掲` | `tos_repost_cmd`。`tos_setup_cmd` は設置済みなら `enabled`/`locked` を触らない（以前は再実行で OFF に潰れた） |
+
 ## 規約同意ゲート（2026-08-16 実装／実機未検証）
 
 `main.py` に allow-list 方式の同意ゲートを実装。**実装済みだが、まだ一度も実行していない。**

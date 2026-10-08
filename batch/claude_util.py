@@ -69,6 +69,10 @@ CLAUDE_MAX_PROMPT_CHARS = int(os.environ.get("CLAUDE_MAX_PROMPT_CHARS") or 60000
 MONGODB_URI = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URL")   # consent_util と同じ解決順
 DB_NAME     = "discord_bot_db"
 USAGE_COL   = "claude_usage"
+SYSTEM_COL  = "system"       # 規約ゲート設定（_id="tos_gate"）。consent_util.py と同じ真実を読む
+# Anthropic への送信を利用規約に明記したのは規約 v2 から（main.py の CLAUDE_MIN_TOS_VERSION と同値に保つ）。
+# ゲートが有効で Mongo 上の version がこれ未満なら、このプロセスでは Claude を使わない。
+CLAUDE_MIN_TOS_VERSION = 2
 
 # ---- 月次予算ガード ----------------------------------------------------------
 # ★main.py と同じ値に保つこと（main.py「Claude クライアント」節の CLAUDE_TIER_THRESHOLD /
@@ -89,6 +93,7 @@ _state: dict = {
     "read_at":  0.0,     # 最後に Mongo から読んだ time.monotonic()
     "schema_ok": True,   # structured outputs を送るか（schema 400 で False）
     "announced": False,  # 有効化ログを1回だけ出す
+    "tos_checked": False, # 規約版ガードを確認済みか（プロセスで1回）
 }
 
 
@@ -193,8 +198,29 @@ def _get_col():
     return _state["col"]
 
 
+def _tos_ok() -> bool:
+    """規約ゲートが有効なら、Mongo の規約版が CLAUDE_MIN_TOS_VERSION 以上であること（プロセスで1回だけ確認）。
+    main.py で TOS_VERSION を上げる前に Actions secret にキーだけ入ってしまった場合の保険。
+    読めなければ False（fail closed）。ゲート未導入（doc 無し / enabled=False）なら従来どおり通す。"""
+    if _state["tos_checked"]:
+        return _state["disabled"] is None
+    _state["tos_checked"] = True
+    try:
+        doc = _get_col().database[SYSTEM_COL].find_one({"_id": "tos_gate"}) or {}
+    except Exception as e:
+        print(f"[WARN] claude 規約ゲートの読込失敗 → Claude を使わない（安全側）: {type(e).__name__}: {e}")
+        _disable("規約ゲートが読めない（Mongo 不通）")
+        return False
+    if doc.get("enabled") and int(doc.get("version") or 0) < CLAUDE_MIN_TOS_VERSION:
+        _disable(f"規約ゲートが v{int(doc.get('version') or 0)}（Claude 送信は v{CLAUDE_MIN_TOS_VERSION} 以降の同意が必要）")
+        return False
+    return True
+
+
 def _budget_ok() -> bool:
     """当月累計がソフト上限未満か。Mongo が読めなければ False（fail closed）。"""
+    if not _tos_ok():
+        return False
     month = _month_key()
     need_read = (_state["month"] != month
                  or time.monotonic() - _state["read_at"] >= BUDGET_REFRESH_SEC)
