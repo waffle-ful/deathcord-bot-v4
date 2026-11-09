@@ -24,6 +24,7 @@ import array
 from operator import mul as _mul
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
+import tora_wiki
 # MEM: google-genai SDK は「importしただけ」で約78MB常駐する（実測: SDK本体 +56MB /
 # httpx +12MB / pydantic +10MB。types.py が起動時に数千のpydanticモデルを構築するため）。
 # Render無料枠512MBの約15%をこれ1つが占めていた。このbotがSDKに求める機能は
@@ -41,6 +42,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get("/", _health_handler)
     app.router.add_post("/panic", _panic_web_handler)
+    tora_wiki.register_routes(app)   # Tora MOD Wiki の API (/api/*)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -3843,6 +3845,8 @@ class MyBot(discord.Client):
             self.add_view(NotifyConsentView())
             self.add_view(QuizStartView())
             self.add_view(TosConsentView())
+            for _v in tora_wiki.persistent_views():
+                self.add_view(_v)
             print("[INFO] mod-guard/modpanel/通知同意/入場クイズ/規約同意 永続UI登録完了")
         except Exception as e:
             print(f"[WARN] mod-guard/modpanel 永続UI登録失敗: {e}")
@@ -3883,6 +3887,7 @@ async def init_invite_snapshot(bot: discord.Client):
         print(f"[ERROR] モデル一覧取得失敗: {e}")
 
 client = MyBot()
+tora_wiki.setup(client, db, HOME_GUILD_ID, _malloc_trim)
 
 # =============================================================================
 # ロール管理
